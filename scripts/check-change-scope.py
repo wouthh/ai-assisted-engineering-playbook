@@ -50,6 +50,9 @@ GIT_LOCAL_ENVIRONMENT = (
     "GIT_PREFIX",
     "GIT_SHALLOW_FILE",
     "GIT_COMMON_DIR",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_NOSYSTEM",
+    "GIT_CONFIG_SYSTEM",
 )
 
 
@@ -60,6 +63,8 @@ def git_environment() -> dict[str, str]:
     environment["GIT_OPTIONAL_LOCKS"] = "0"
     environment["GIT_NO_LAZY_FETCH"] = "1"
     environment["GIT_GRAFT_FILE"] = os.devnull
+    environment["GIT_CONFIG_NOSYSTEM"] = "1"
+    environment["GIT_CONFIG_GLOBAL"] = os.devnull
     return environment
 
 
@@ -184,12 +189,18 @@ def hidden_index_path_count(repository: Path) -> int:
 def load_rules(path: Path) -> list[str]:
     rules = []
     for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if line and not line.startswith("#"):
-            candidate = PurePosixPath(line)
-            if candidate.is_absolute() or ".." in candidate.parts:
-                raise ValueError(f"unsafe allowlist rule: {line}")
-            rules.append(line)
+        if raw_line == "" or raw_line.startswith("#"):
+            continue
+        if raw_line.startswith('"'):
+            line = json.loads(raw_line)
+            if not isinstance(line, str):
+                raise ValueError("JSON allowlist rule must be a string")
+        else:
+            line = raw_line
+        candidate = PurePosixPath(line)
+        if not line or candidate.is_absolute() or ".." in candidate.parts:
+            raise ValueError(f"unsafe allowlist rule: {json.dumps(line, ensure_ascii=True)}")
+        rules.append(line)
     if not rules:
         raise ValueError("allowlist contains no rules")
     return rules

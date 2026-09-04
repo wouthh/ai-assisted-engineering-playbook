@@ -62,7 +62,7 @@ python3 scripts/check-change-scope.py \
   --allowlist approved-paths.txt
 ```
 
-Compares `BASE...HEAD` plus local changes and untracked files against newline-delimited path or glob rules. A single `*` stays within one path segment; use `**` as its own segment for intentional recursive approval. Renames inspect both source and destination, and index flags that could hide changes fail closed. Repositories or initialized submodules with configured clean/process filters also fail closed rather than executing those filters. The utility reports JSON-quoted path names and exits non-zero when anything is outside the approved scope.
+Compares `BASE...HEAD` plus local changes and untracked files against newline-delimited path or glob rules. Empty lines are ignored; a `#` in column one starts a comment. All other whitespace is path-significant. A rule that begins with `#` or contains a line break can be written as a JSON string, keeping comment and path syntax unambiguous. A single `*` stays within one path segment; use `**` as its own segment for intentional recursive approval. Renames inspect both source and destination, and index flags that could hide changes fail closed. Repository-local clean/process filters also fail closed rather than executing, while ambient system and user Git configuration is isolated. The utility reports JSON-quoted path names and exits non-zero when anything is outside the approved scope.
 
 ### Report-redaction check
 

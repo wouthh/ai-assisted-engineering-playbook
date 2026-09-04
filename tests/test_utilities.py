@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -296,6 +297,19 @@ class PreflightTests(RepositoryFixture):
         self.assertIn("clean/process filters", result.stderr)
         self.assertFalse(marker.exists())
 
+    def test_ambient_content_filter_does_not_reject_repository(self) -> None:
+        global_config = self.root / "global-git-config"
+        global_config.write_text(
+            '[filter "ambient"]\n\tclean = false\n\tprocess = false\n',
+            encoding="utf-8",
+        )
+
+        with mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(global_config)}):
+            result = run(str(ROOT / "scripts/repo-preflight.sh"), str(self.repository))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("working_tree\tclean", result.stdout)
+
     def test_symlink_type_change_cannot_be_hidden(self) -> None:
         link = self.repository / "link"
         link.symlink_to("synthetic-target")
@@ -498,6 +512,76 @@ class ScopeTests(RepositoryFixture):
         self.assertEqual(result.returncode, 2)
         self.assertIn("clean/process filters", result.stderr)
         self.assertFalse(marker.exists())
+
+    def test_ambient_content_filter_does_not_reject_repository(self) -> None:
+        global_config = self.root / "global-git-config"
+        global_config.write_text(
+            '[filter "ambient"]\n\tclean = false\n\tprocess = false\n',
+            encoding="utf-8",
+        )
+        allowlist = self.root / "allowlist.txt"
+        allowlist.write_text("README.md\n", encoding="utf-8")
+
+        with mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(global_config)}):
+            result = run(
+                sys.executable,
+                str(ROOT / "scripts/check-change-scope.py"),
+                "--repository",
+                str(self.repository),
+                "--base",
+                "main",
+                "--allowlist",
+                str(allowlist),
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_allowlist_preserves_leading_and_trailing_whitespace(self) -> None:
+        spaced_paths = {" leading.txt", "trailing.txt "}
+        unspaced_paths = {"leading.txt", "trailing.txt"}
+        for path in spaced_paths | unspaced_paths:
+            (self.repository / path).write_text("synthetic\n", encoding="utf-8")
+        allowlist = self.root / "allowlist.txt"
+        allowlist.write_text(" leading.txt\ntrailing.txt \n", encoding="utf-8")
+
+        result = run(
+            sys.executable,
+            str(ROOT / "scripts/check-change-scope.py"),
+            "--repository",
+            str(self.repository),
+            "--base",
+            "main",
+            "--allowlist",
+            str(allowlist),
+        )
+
+        self.assertEqual(result.returncode, 1)
+        for path in spaced_paths:
+            self.assertIn(f'allowed\t"{path}"', result.stdout)
+        for path in unspaced_paths:
+            self.assertIn(f'unexpected\t"{path}"', result.stdout)
+
+    def test_allowlist_json_encodes_literal_leading_hash(self) -> None:
+        (self.repository / "#approved.txt").write_text("synthetic\n", encoding="utf-8")
+        allowlist = self.root / "allowlist.txt"
+        allowlist.write_text(
+            f"# comment\n{json.dumps('#approved.txt')}\n",
+            encoding="utf-8",
+        )
+
+        result = run(
+            sys.executable,
+            str(ROOT / "scripts/check-change-scope.py"),
+            "--repository",
+            str(self.repository),
+            "--base",
+            "main",
+            "--allowlist",
+            str(allowlist),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('allowed\t"#approved.txt"', result.stdout)
 
     def test_symlink_type_change_cannot_be_hidden(self) -> None:
         link = self.repository / "link"
@@ -967,6 +1051,65 @@ class RedactionTests(unittest.TestCase):
             self.assertIn("anchored", result.stdout)
             self.assertIn("line:2", result.stdout)
             self.assertNotIn("SECRET=synthetic", result.stdout + result.stderr)
+
+    def test_line_start_anchor_recognizes_lone_carriage_return(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            patterns = root / "patterns.tsv"
+            report = root / "report.txt"
+            patterns.write_text("anchored\t^SECRET=\n", encoding="utf-8")
+            report.write_bytes(b"first\rSECRET=synthetic\r")
+
+            result = run(
+                sys.executable,
+                str(ROOT / "scripts/check-report-redaction.py"),
+                "--patterns",
+                str(patterns),
+                str(report),
+            )
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("line:2", result.stdout)
+            self.assertNotIn("SECRET=synthetic", result.stdout + result.stderr)
+
+    def test_line_end_anchor_recognizes_crlf(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            patterns = root / "patterns.tsv"
+            report = root / "report.txt"
+            patterns.write_text("anchored\tSECRET$\n", encoding="utf-8")
+            report.write_bytes(b"first\r\nSECRET\r\n")
+
+            result = run(
+                sys.executable,
+                str(ROOT / "scripts/check-report-redaction.py"),
+                "--patterns",
+                str(patterns),
+                str(report),
+            )
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("line:2", result.stdout)
+
+    def test_unreadable_report_path_is_escaped(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            patterns = root / "patterns.tsv"
+            report = root / "missing\nredaction-check: 1 file(s) clear"
+            patterns.write_text("synthetic-token\tSECRET\n", encoding="utf-8")
+
+            result = run(
+                sys.executable,
+                str(ROOT / "scripts/check-report-redaction.py"),
+                "--patterns",
+                str(patterns),
+                str(report),
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(len(result.stderr.splitlines()), 1)
+            self.assertIn("\\nredaction-check", result.stderr)
+            self.assertNotIn("\nredaction-check", result.stderr)
 
 
 if __name__ == "__main__":

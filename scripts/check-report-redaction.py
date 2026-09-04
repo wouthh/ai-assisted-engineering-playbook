@@ -11,6 +11,46 @@ import sys
 from pathlib import Path
 
 
+LINE_START = r"(?:\A|(?<=\n)|(?<=\r)(?!\n))"
+LINE_END = r"(?:\Z|(?=\r\n)|(?=\r(?!\n))|(?=(?<!\r)\n))"
+
+
+def portable_line_anchors(expression: str) -> str:
+    """Expand unescaped line anchors to recognize LF, CRLF, and lone CR."""
+    transformed = []
+    in_class = False
+    class_can_close = False
+    index = 0
+    while index < len(expression):
+        character = expression[index]
+        if character == "\\" and index + 1 < len(expression):
+            transformed.append(expression[index : index + 2])
+            if in_class:
+                class_can_close = True
+            index += 2
+            continue
+        if in_class:
+            transformed.append(character)
+            if character == "]" and class_can_close:
+                in_class = False
+            elif character == "]":
+                class_can_close = True
+            elif character != "^" or class_can_close:
+                class_can_close = True
+        elif character == "[":
+            transformed.append(character)
+            in_class = True
+            class_can_close = False
+        elif character == "^":
+            transformed.append(LINE_START)
+        elif character == "$":
+            transformed.append(LINE_END)
+        else:
+            transformed.append(character)
+        index += 1
+    return "".join(transformed)
+
+
 def load_patterns(path: Path) -> list[tuple[str, re.Pattern[str]]]:
     patterns = []
     for number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
@@ -22,7 +62,7 @@ def load_patterns(path: Path) -> list[tuple[str, re.Pattern[str]]]:
             raise ValueError(f"invalid pattern row {number}") from error
         if not name.strip() or not expression:
             raise ValueError(f"invalid pattern row {number}")
-        patterns.append((name.strip(), re.compile(expression, re.MULTILINE)))
+        patterns.append((name.strip(), re.compile(portable_line_anchors(expression))))
     if not patterns:
         raise ValueError("pattern file contains no rules")
     return patterns
@@ -46,7 +86,11 @@ def main() -> int:
             with path.open("r", encoding="utf-8", newline="") as stream:
                 report = stream.read()
         except (OSError, UnicodeError) as error:
-            print(f"redaction-check: cannot read {path}: {error}", file=sys.stderr)
+            escaped_path = json.dumps(str(path), ensure_ascii=True)
+            print(
+                f"redaction-check: cannot read {escaped_path} ({type(error).__name__})",
+                file=sys.stderr,
+            )
             return 2
         newline_offsets = []
         index = 0
