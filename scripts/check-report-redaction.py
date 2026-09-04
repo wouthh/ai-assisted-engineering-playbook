@@ -20,6 +20,7 @@ def portable_line_anchors(expression: str) -> str:
     transformed = []
     in_class = False
     class_can_close = False
+    class_leading = False
     index = 0
     while index < len(expression):
         character = expression[index]
@@ -27,6 +28,7 @@ def portable_line_anchors(expression: str) -> str:
             transformed.append(expression[index : index + 2])
             if in_class:
                 class_can_close = True
+                class_leading = False
             index += 2
             continue
         if not in_class and expression.startswith("(?#", index):
@@ -48,12 +50,17 @@ def portable_line_anchors(expression: str) -> str:
                 in_class = False
             elif character == "]":
                 class_can_close = True
-            elif character != "^" or class_can_close:
+                class_leading = False
+            elif character != "^" or not class_leading:
                 class_can_close = True
+                class_leading = False
+            else:
+                class_leading = False
         elif character == "[":
             transformed.append(character)
             in_class = True
             class_can_close = False
+            class_leading = True
         elif character == "^":
             transformed.append(LINE_START)
         elif character == "$":

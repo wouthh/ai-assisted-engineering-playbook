@@ -1286,6 +1286,25 @@ class RedactionTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
             self.assertIn("commented-anchor", result.stdout)
 
+    def test_anchor_text_inside_character_class_is_not_transformed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            patterns = root / "patterns.tsv"
+            report = root / "report.txt"
+            patterns.write_text("class-anchors\t[^^][$]\n", encoding="utf-8")
+            report.write_text("x$\n", encoding="utf-8")
+
+            result = run(
+                sys.executable,
+                str(ROOT / "scripts/check-report-redaction.py"),
+                "--patterns",
+                str(patterns),
+                str(report),
+            )
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("class-anchors", result.stdout)
+
     def test_unreadable_report_path_is_escaped(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
