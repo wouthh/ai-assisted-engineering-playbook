@@ -7,18 +7,52 @@ import argparse
 import fnmatch
 from functools import lru_cache
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path, PurePosixPath
 
 
-GIT_READ_ONLY = ["git", "--no-optional-locks", "-c", "core.fsmonitor=false"]
+GIT_READ_ONLY = [
+    "git",
+    "--no-optional-locks",
+    "--no-replace-objects",
+    "-c",
+    "core.fsmonitor=false",
+]
+GIT_LOCAL_ENVIRONMENT = (
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR",
+)
+
+
+def git_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    for name in GIT_LOCAL_ENVIRONMENT:
+        environment.pop(name, None)
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
+    environment["GIT_NO_LAZY_FETCH"] = "1"
+    return environment
 
 
 def git_paths(repository: Path, *arguments: str) -> set[str]:
     result = subprocess.run(
         [*GIT_READ_ONLY, "-C", str(repository), *arguments],
         check=True,
+        env=git_environment(),
         stdout=subprocess.PIPE,
     )
     return {item.decode("utf-8", "surrogateescape") for item in result.stdout.split(b"\0") if item}
@@ -28,6 +62,7 @@ def repository_root(repository: Path) -> Path:
     result = subprocess.run(
         [*GIT_READ_ONLY, "-C", str(repository), "rev-parse", "--show-toplevel"],
         check=True,
+        env=git_environment(),
         stdout=subprocess.PIPE,
         text=True,
         encoding="utf-8",
@@ -38,8 +73,17 @@ def repository_root(repository: Path) -> Path:
 
 def hidden_index_path_count(repository: Path) -> int:
     result = subprocess.run(
-        [*GIT_READ_ONLY, "-C", str(repository), "ls-files", "-v", "-z"],
+        [
+            *GIT_READ_ONLY,
+            "-C",
+            str(repository),
+            "ls-files",
+            "--recurse-submodules",
+            "-v",
+            "-z",
+        ],
         check=True,
+        env=git_environment(),
         stdout=subprocess.PIPE,
     )
     count = 0

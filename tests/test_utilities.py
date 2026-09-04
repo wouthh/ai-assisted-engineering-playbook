@@ -51,7 +51,7 @@ def run(*arguments: str, cwd: Path | None = None) -> subprocess.CompletedProcess
     return subprocess.run(arguments, cwd=cwd, text=True, capture_output=True)
 
 
-def git(repository: Path, *arguments: str) -> None:
+def git_output(repository: Path, *arguments: str) -> str:
     environment = git_environment()
     environment.update(
         {
@@ -61,12 +61,18 @@ def git(repository: Path, *arguments: str) -> None:
             "GIT_COMMITTER_EMAIL": "author@example.invalid",
         }
     )
-    subprocess.run(
+    result = subprocess.run(
         [*GIT_BASE, "-C", str(repository), *arguments],
         check=True,
         env=environment,
         capture_output=True,
+        text=True,
     )
+    return result.stdout.strip()
+
+
+def git(repository: Path, *arguments: str) -> None:
+    git_output(repository, *arguments)
 
 
 class RepositoryFixture(unittest.TestCase):
@@ -138,7 +144,7 @@ class PreflightTests(RepositoryFixture):
         result = run(str(ROOT / "scripts/repo-preflight.sh"), str(self.repository))
 
         self.assertEqual(result.returncode, 6)
-        self.assertIn("unable to determine", result.stderr)
+        self.assertIn("unable to inspect tracked-path index flags", result.stderr)
         self.assertNotIn("working_tree\tclean", result.stdout)
 
     def test_in_progress_merge_is_not_reported_as_clean(self) -> None:
@@ -159,6 +165,26 @@ class PreflightTests(RepositoryFixture):
 
         with mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(hostile_config)}):
             git(self.repository, "commit", "--allow-empty", "-m", "unsigned synthetic commit")
+
+    def test_assume_unchanged_path_fails_closed(self) -> None:
+        git(self.repository, "update-index", "--assume-unchanged", "README.md")
+        (self.repository / "README.md").write_text("concealed\n", encoding="utf-8")
+
+        result = run(str(ROOT / "scripts/repo-preflight.sh"), str(self.repository))
+
+        self.assertEqual(result.returncode, 8)
+        self.assertIn("assume-unchanged or skip-worktree", result.stderr)
+        self.assertNotIn("README.md", result.stdout + result.stderr)
+
+    def test_skip_worktree_path_fails_closed(self) -> None:
+        git(self.repository, "update-index", "--skip-worktree", "README.md")
+        (self.repository / "README.md").write_text("concealed\n", encoding="utf-8")
+
+        result = run(str(ROOT / "scripts/repo-preflight.sh"), str(self.repository))
+
+        self.assertEqual(result.returncode, 8)
+        self.assertIn("assume-unchanged or skip-worktree", result.stderr)
+        self.assertNotIn("README.md", result.stdout + result.stderr)
 
 
 class ScopeTests(RepositoryFixture):
@@ -326,6 +352,50 @@ class ScopeTests(RepositoryFixture):
         self.assertEqual(result.returncode, 1)
         self.assertIn('unexpected\t"vendor/sample"', result.stdout)
 
+    def test_submodule_index_flag_cannot_hide_scope_change(self) -> None:
+        source = self.root / "submodule-source"
+        raw_git("init", "-b", "main", str(source))
+        (source / "tracked.txt").write_text("original\n", encoding="utf-8")
+        git(source, "add", "tracked.txt")
+        git(source, "commit", "-m", "add synthetic submodule content")
+        subprocess.run(
+            [
+                *GIT_BASE,
+                "-C",
+                str(self.repository),
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                str(source),
+                "vendor/sample",
+            ],
+            check=True,
+            env=git_environment(),
+            capture_output=True,
+        )
+        git(self.repository, "add", ".gitmodules", "vendor/sample")
+        git(self.repository, "commit", "-m", "add synthetic submodule")
+        submodule = self.repository / "vendor/sample"
+        git(submodule, "update-index", "--assume-unchanged", "tracked.txt")
+        (submodule / "tracked.txt").write_text("concealed\n", encoding="utf-8")
+        allowlist = self.root / "allowlist.txt"
+        allowlist.write_text("README.md\n", encoding="utf-8")
+
+        result = run(
+            sys.executable,
+            str(ROOT / "scripts/check-change-scope.py"),
+            "--repository",
+            str(self.repository),
+            "--base",
+            "main",
+            "--allowlist",
+            str(allowlist),
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("assume-unchanged or skip-worktree", result.stderr)
+
     def test_nested_repository_argument_still_scans_repository_root(self) -> None:
         nested = self.repository / "sub"
         nested.mkdir()
@@ -371,6 +441,69 @@ class ScopeTests(RepositoryFixture):
 
         self.assertEqual(result.returncode, 2)
         self.assertIn("assume-unchanged or skip-worktree", result.stderr)
+
+    def test_ambient_repository_environment_cannot_redirect_scope_check(self) -> None:
+        other = self.root / "other"
+        raw_git("init", "-b", "main", str(other))
+        (other / "README.md").write_text("# Other synthetic repository\n", encoding="utf-8")
+        git(other, "add", "README.md")
+        git(other, "commit", "-m", "initial other commit")
+        (self.repository / "unexpected.txt").write_text("synthetic\n", encoding="utf-8")
+        allowlist = self.root / "allowlist.txt"
+        allowlist.write_text("README.md\n", encoding="utf-8")
+
+        with mock.patch.dict(
+            os.environ,
+            {"GIT_DIR": str(other / ".git"), "GIT_WORK_TREE": str(other)},
+        ):
+            result = run(
+                sys.executable,
+                str(ROOT / "scripts/check-change-scope.py"),
+                "--repository",
+                str(self.repository),
+                "--base",
+                "main",
+                "--allowlist",
+                str(allowlist),
+            )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('unexpected\t"unexpected.txt"', result.stdout)
+
+    def test_replacement_object_cannot_hide_committed_change(self) -> None:
+        git(self.repository, "switch", "-c", "feature")
+        (self.repository / "protected.txt").write_text("synthetic\n", encoding="utf-8")
+        git(self.repository, "add", "protected.txt")
+        git(self.repository, "commit", "-m", "add protected path")
+        feature_head = git_output(self.repository, "rev-parse", "HEAD")
+        base = git_output(self.repository, "rev-parse", "main")
+        base_tree = git_output(self.repository, "rev-parse", "main^{tree}")
+        replacement = git_output(
+            self.repository,
+            "commit-tree",
+            base_tree,
+            "-p",
+            base,
+            "-m",
+            "synthetic replacement",
+        )
+        git(self.repository, "replace", feature_head, replacement)
+        allowlist = self.root / "allowlist.txt"
+        allowlist.write_text("README.md\n", encoding="utf-8")
+
+        result = run(
+            sys.executable,
+            str(ROOT / "scripts/check-change-scope.py"),
+            "--repository",
+            str(self.repository),
+            "--base",
+            "main",
+            "--allowlist",
+            str(allowlist),
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('unexpected\t"protected.txt"', result.stdout)
 
     def test_reported_paths_escape_control_characters(self) -> None:
         strange = self.repository / "unsafe\nallowed\tapproved.py"

@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
 
 set -eu
+unset GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_CONFIG GIT_CONFIG_PARAMETERS \
+  GIT_CONFIG_COUNT GIT_OBJECT_DIRECTORY GIT_DIR GIT_WORK_TREE \
+  GIT_IMPLICIT_WORK_TREE GIT_GRAFT_FILE GIT_INDEX_FILE \
+  GIT_NO_REPLACE_OBJECTS GIT_REPLACE_REF_BASE GIT_PREFIX GIT_SHALLOW_FILE \
+  GIT_COMMON_DIR 2>/dev/null || :
 export GIT_OPTIONAL_LOCKS=0
+export GIT_NO_LAZY_FETCH=1
 
 git_read() {
-  git --no-optional-locks -c core.fsmonitor=false "$@"
+  git --no-optional-locks --no-replace-objects -c core.fsmonitor=false "$@"
 }
 
 repository=${1:-.}
@@ -39,6 +45,16 @@ for operation_marker in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-merge reb
     exit 7
   fi
 done
+
+if ! index_state=$(git_read -C "$root" ls-files --recurse-submodules -v 2>/dev/null); then
+  printf 'preflight: unable to inspect tracked-path index flags\n' >&2
+  exit 6
+fi
+
+if printf '%s\n' "$index_state" | LC_ALL=C grep -Eq '^[a-zS] '; then
+  printf 'preflight: tracked paths use assume-unchanged or skip-worktree\n' >&2
+  exit 8
+fi
 
 printf 'root\t%s\n' "$root"
 printf 'branch\t%s\n' "$branch"
