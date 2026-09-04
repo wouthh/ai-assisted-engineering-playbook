@@ -6,8 +6,10 @@ from __future__ import annotations
 import argparse
 import fnmatch
 from functools import lru_cache
+import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
 from pathlib import Path, PurePosixPath
@@ -138,6 +140,12 @@ def configured_content_filter_count(repository: Path) -> int:
 
 def submodule_content_filter_count(repository: Path) -> int:
     command = r'''
+      actual=$(pwd -P && printf '.') || exit 1
+      configured=$(git --no-optional-locks --no-replace-objects rev-parse --show-toplevel && printf '.') || exit 1
+      if [ "$actual" != "$configured" ]; then
+        printf 'submodule worktree is redirected\n' >&2
+        exit 1
+      fi
       if ! names=$(git --no-optional-locks --no-replace-objects config --name-only --list); then
         exit 1
       fi
@@ -214,7 +222,61 @@ def hidden_index_path_count(repository: Path) -> int:
     return count
 
 
-def repository_state(repository: Path) -> tuple[str, bytes, bytes]:
+def worktree_contents(repository: Path) -> tuple:
+    """Compare file bytes privately, without filters or following symlinks."""
+    gitlinks = {
+        entry.split(b"\t", 1)[1].decode("utf-8", "surrogateescape")
+        for entry in git_bytes(repository, "ls-files", "--stage", "-z").split(b"\0")
+        if entry.startswith(b"160000 ")
+    }
+    records = []
+    for name in sorted(git_paths(
+        repository, "ls-files", "--cached", "--others", "--exclude-standard", "-z"
+    )):
+        path = repository / name
+        # Never follow a replaced parent directory outside the inspected tree.
+        for parent in path.relative_to(repository).parents:
+            if (repository / parent).is_symlink():
+                raise ValueError("working-tree parent is a symlink")
+        try:
+            before = path.lstat()
+        except FileNotFoundError:
+            records.append((name, "absent"))
+            continue
+        if stat.S_ISLNK(before.st_mode):
+            content = os.readlink(path)
+        elif stat.S_ISREG(before.st_mode):
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(descriptor, "rb") as stream:
+                opened = os.fstat(stream.fileno())
+                if not stat.S_ISREG(opened.st_mode) or (
+                    opened.st_dev, opened.st_ino
+                ) != (before.st_dev, before.st_ino):
+                    raise ValueError("working-tree file changed during inspection")
+                digest = hashlib.sha256()
+                while chunk := stream.read(1024 * 1024):
+                    digest.update(chunk)
+                content = digest.digest()
+        elif name in gitlinks and stat.S_ISDIR(before.st_mode):
+            if (path / ".git").exists():
+                if repository_root(path).resolve() != path.resolve():
+                    raise ValueError("submodule worktree is redirected")
+                content = repository_state(path)
+            else:
+                content = "uninitialized-submodule"
+        else:
+            raise ValueError("unsupported working-tree file type")
+        after = path.lstat()
+        if before != after:
+            # Access time may change merely because this check read the file.
+            fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+            if any(getattr(before, field) != getattr(after, field) for field in fields):
+                raise ValueError("working-tree file changed during inspection")
+        records.append((name, before.st_mode, content))
+    return tuple(records)
+
+
+def repository_state(repository: Path) -> tuple:
     return (
         resolve_commit(repository, "HEAD"),
         git_bytes(repository, "ls-files", "--stage", "-v", "-z", "--recurse-submodules"),
@@ -226,6 +288,7 @@ def repository_state(repository: Path) -> tuple[str, bytes, bytes]:
             "--untracked-files=all",
             "--ignore-submodules=none",
         ),
+        worktree_contents(repository),
     )
 
 

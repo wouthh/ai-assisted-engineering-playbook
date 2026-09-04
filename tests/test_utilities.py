@@ -416,6 +416,80 @@ class PreflightTests(RepositoryFixture):
 
 
 class ScopeTests(RepositoryFixture):
+    def test_dirty_and_untracked_content_drift_fails_closed(self) -> None:
+        allowlist = self.root / "allowlist.txt"
+        allowlist.write_text("README.md\nnew.txt\n", encoding="utf-8")
+        real_git = shutil.which("git")
+        wrapper_directory = self.root / "content-drift-bin"
+        wrapper_directory.mkdir()
+        wrapper = wrapper_directory / "git"
+        wrapper.write_text(
+            "#!/usr/bin/env bash\nset -eu\n"
+            f"real_git={shlex.quote(real_git or '')}\n"
+            '"$real_git" "$@"\n'
+            'is_diff=false\nfor argument in "$@"; do\n'
+            '  if [ "$argument" = diff ]; then is_diff=true; fi\n'
+            'done\n'
+            'for argument in "$@"; do\n'
+            '  if [ "$is_diff" = true ] && [ "$argument" = "--cached" ] && [ ! -e "$DRIFT_MARKER" ]; then\n'
+            '    printf "changed again\\n" > "$DRIFT_FILE"\n'
+            '    : > "$DRIFT_MARKER"\n'
+            '  fi\n'
+            'done\n', encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+        for name in ("README.md", "new.txt"):
+            with self.subTest(name=name):
+                path = self.repository / name
+                path.write_text("already dirty\n", encoding="utf-8")
+                environment = os.environ.copy()
+                environment.update({
+                    "PATH": f"{wrapper_directory}:{environment['PATH']}",
+                    "DRIFT_FILE": str(path),
+                    "DRIFT_MARKER": str(self.root / f"marker-{name}"),
+                })
+                result = run(
+                    sys.executable, str(ROOT / "scripts/check-change-scope.py"),
+                    "--repository", str(self.repository), "--base", "main",
+                    "--allowlist", str(allowlist), env=environment,
+                )
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("changed during inspection", result.stderr)
+                self.assertNotIn("changed again", result.stdout + result.stderr)
+
+    def test_submodule_worktree_redirection_is_rejected_by_both_tools(self) -> None:
+        source = self.root / "module-source"
+        raw_git("init", "-b", "main", str(source))
+        (source / "tracked.txt").write_text("original\n", encoding="utf-8")
+        git(source, "add", "tracked.txt")
+        git(source, "commit", "-m", "synthetic module")
+        raw_git("-C", str(self.repository), "-c", "protocol.file.allow=always",
+                "submodule", "add", str(source), "vendor/sample")
+        git(self.repository, "commit", "-am", "add synthetic module")
+        allowlist = self.root / "allowlist.txt"
+        allowlist.write_text("README.md\n", encoding="utf-8")
+        commands = (
+            (str(ROOT / "scripts/repo-preflight.sh"), str(self.repository)),
+            (sys.executable, str(ROOT / "scripts/check-change-scope.py"),
+             "--repository", str(self.repository), "--base", "HEAD",
+             "--allowlist", str(allowlist)),
+        )
+        # Git's normal relative core.worktree entry remains supported.
+        for command in commands:
+            result = run(*command)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        submodule = self.repository / "vendor/sample"
+        redirected = self.root / "redirected-module"
+        redirected.mkdir()
+        (redirected / "tracked.txt").write_text("original\n", encoding="utf-8")
+        git(submodule, "config", "core.worktree", str(redirected))
+        (submodule / "tracked.txt").write_text("uninspected change\n", encoding="utf-8")
+        for command in commands:
+            result = run(*command)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn("working_tree\tclean", result.stdout)
+            self.assertNotIn("changed path(s) allowed", result.stdout)
+
     def test_allowed_committed_change_passes(self) -> None:
         git(self.repository, "switch", "-c", "feature")
         (self.repository / "README.md").write_text("# Updated synthetic repository\n", encoding="utf-8")

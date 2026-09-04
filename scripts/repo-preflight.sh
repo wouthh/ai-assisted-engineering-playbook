@@ -67,6 +67,11 @@ else
 fi
 
 if ! submodule_filter_state=$(git_read -C "$root" submodule foreach --quiet --recursive '
+  actual=$(pwd -P && printf ".") || exit 1
+  configured=$(git --no-optional-locks --no-replace-objects rev-parse --show-toplevel && printf ".") || exit 1
+  if [ "$actual" != "$configured" ]; then
+    exit 1
+  fi
   if ! names=$(git --no-optional-locks --no-replace-objects config --name-only --list 2>/dev/null); then
     exit 1
   fi
@@ -78,7 +83,7 @@ if ! submodule_filter_state=$(git_read -C "$root" submodule foreach --quiet --re
 $names
 EOF
 ' 2>/dev/null); then
-  printf 'preflight: unable to inspect submodule content-filter configuration\n' >&2
+  printf 'preflight: unable to inspect submodule configuration or worktree is redirected\n' >&2
   exit 6
 fi
 
