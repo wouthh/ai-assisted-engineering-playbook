@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -48,8 +50,12 @@ def raw_git(*arguments: str) -> subprocess.CompletedProcess[bytes]:
     )
 
 
-def run(*arguments: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(arguments, cwd=cwd, text=True, capture_output=True)
+def run(
+    *arguments: str,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(arguments, cwd=cwd, env=env, text=True, capture_output=True)
 
 
 def git_output(repository: Path, *arguments: str) -> str:
@@ -93,6 +99,47 @@ class RepositoryFixture(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def drifting_git_environment(self, trigger: str) -> dict[str, str]:
+        real_git = shutil.which("git")
+        self.assertIsNotNone(real_git)
+        wrapper_directory = self.root / "wrapper-bin"
+        wrapper_directory.mkdir()
+        wrapper = wrapper_directory / "git"
+        marker = self.root / "drift-triggered"
+        wrapper.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -eu\n"
+            f"real_git={shlex.quote(real_git or '')}\n"
+            '"$real_git" "$@"\n'
+            "status=$?\n"
+            'matched=false\nrev_parse=false\nfor argument in "$@"; do\n'
+            '  if [ "$argument" = "$DRIFT_TRIGGER" ]; then matched=true; fi\n'
+            '  if [ "$argument" = "rev-parse" ]; then rev_parse=true; fi\n'
+            "done\n"
+            'if [ "$status" -eq 0 ] && [ "$matched" = true ] && [ "$rev_parse" = true ] '
+            '&& [ ! -e "$DRIFT_MARKER" ]; then\n'
+            '  printf "synthetic drift\\n" > "$DRIFT_REPOSITORY/drift.txt"\n'
+            '  "$real_git" -C "$DRIFT_REPOSITORY" add drift.txt\n'
+            '  "$real_git" -C "$DRIFT_REPOSITORY" -c user.name="Synthetic Author" '
+            '-c user.email="author@example.invalid" -c commit.gpgSign=false '
+            'commit -m "synthetic concurrent drift" >/dev/null\n'
+            '  : > "$DRIFT_MARKER"\n'
+            "fi\n"
+            'exit "$status"\n',
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "PATH": f"{wrapper_directory}:{environment['PATH']}",
+                "DRIFT_TRIGGER": trigger,
+                "DRIFT_MARKER": str(marker),
+                "DRIFT_REPOSITORY": str(self.repository),
+            }
+        )
+        return environment
+
 
 class PreflightTests(RepositoryFixture):
     def test_clean_repository_passes(self) -> None:
@@ -106,6 +153,49 @@ class PreflightTests(RepositoryFixture):
         self.assertEqual(result.returncode, 5)
         self.assertIn("not clean", result.stderr)
         self.assertNotIn("changed", result.stdout + result.stderr)
+
+    def test_configured_worktree_redirection_fails_closed(self) -> None:
+        redirected = self.root / "redirected"
+        raw_git("init", "-b", "main", str(redirected))
+        (redirected / "README.md").write_text("redirected\n", encoding="utf-8")
+        git(redirected, "add", "README.md")
+        git(redirected, "commit", "-m", "redirected synthetic repository")
+        git(self.repository, "config", "core.worktree", str(redirected))
+
+        result = run(str(ROOT / "scripts/repo-preflight.sh"), str(self.repository))
+
+        self.assertEqual(result.returncode, 10)
+        self.assertIn("redirects the worktree", result.stderr)
+
+    def test_head_drift_during_inspection_fails_closed(self) -> None:
+        result = run(
+            str(ROOT / "scripts/repo-preflight.sh"),
+            str(self.repository),
+            env=self.drifting_git_environment("HEAD"),
+        )
+
+        self.assertEqual(result.returncode, 11)
+        self.assertIn("changed during inspection", result.stderr)
+
+    def test_missing_grep_does_not_bypass_index_safety(self) -> None:
+        git(self.repository, "update-index", "--assume-unchanged", "README.md")
+        (self.repository / "README.md").write_text("concealed\n", encoding="utf-8")
+        wrapper_directory = self.root / "missing-grep"
+        wrapper_directory.mkdir()
+        grep = wrapper_directory / "grep"
+        grep.write_text("#!/usr/bin/env bash\nexit 127\n", encoding="utf-8")
+        grep.chmod(0o755)
+        environment = os.environ.copy()
+        environment["PATH"] = f"{wrapper_directory}:{environment['PATH']}"
+
+        result = run(
+            str(ROOT / "scripts/repo-preflight.sh"),
+            str(self.repository),
+            env=environment,
+        )
+
+        self.assertEqual(result.returncode, 8)
+        self.assertIn("assume-unchanged or skip-worktree", result.stderr)
 
     def test_dirty_submodule_cannot_be_hidden_by_repository_config(self) -> None:
         source = self.root / "submodule-source"
@@ -362,6 +452,49 @@ class ScopeTests(RepositoryFixture):
         )
         self.assertEqual(result.returncode, 1)
         self.assertIn('unexpected\t"unexpected.txt"', result.stdout)
+
+    def test_configured_worktree_redirection_fails_closed(self) -> None:
+        redirected = self.root / "redirected"
+        raw_git("init", "-b", "main", str(redirected))
+        (redirected / "README.md").write_text("redirected\n", encoding="utf-8")
+        git(redirected, "add", "README.md")
+        git(redirected, "commit", "-m", "redirected synthetic repository")
+        git(self.repository, "config", "core.worktree", str(redirected))
+        allowlist = self.root / "allowlist.txt"
+        allowlist.write_text("README.md\n", encoding="utf-8")
+
+        result = run(
+            sys.executable,
+            str(ROOT / "scripts/check-change-scope.py"),
+            "--repository",
+            str(self.repository),
+            "--base",
+            "main",
+            "--allowlist",
+            str(allowlist),
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("redirects the worktree", result.stderr)
+
+    def test_head_drift_during_inspection_fails_closed(self) -> None:
+        allowlist = self.root / "allowlist.txt"
+        allowlist.write_text("README.md\n", encoding="utf-8")
+
+        result = run(
+            sys.executable,
+            str(ROOT / "scripts/check-change-scope.py"),
+            "--repository",
+            str(self.repository),
+            "--base",
+            "main",
+            "--allowlist",
+            str(allowlist),
+            env=self.drifting_git_environment("HEAD^{commit}"),
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("changed during inspection", result.stderr)
 
     def test_empty_base_fails_closed(self) -> None:
         allowlist = self.root / "allowlist.txt"
@@ -940,6 +1073,46 @@ class ScopeTests(RepositoryFixture):
 
 
 class RedactionTests(unittest.TestCase):
+    def test_invalid_pattern_content_is_not_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            patterns = root / "patterns.tsv"
+            report = root / "report.txt"
+            patterns.write_text("invalid\tSECRET(unclosed\n", encoding="utf-8")
+            report.write_text("synthetic\n", encoding="utf-8")
+
+            result = run(
+                sys.executable,
+                str(ROOT / "scripts/check-report-redaction.py"),
+                "--patterns",
+                str(patterns),
+                str(report),
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("invalid regular expression row 1", result.stderr)
+            self.assertNotIn("SECRET", result.stdout + result.stderr)
+
+    def test_unreadable_pattern_path_is_escaped(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            patterns = root / "missing\nredaction-check: 1 file(s) clear"
+            report = root / "report.txt"
+            report.write_text("synthetic\n", encoding="utf-8")
+
+            result = run(
+                sys.executable,
+                str(ROOT / "scripts/check-report-redaction.py"),
+                "--patterns",
+                str(patterns),
+                str(report),
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(len(result.stderr.splitlines()), 1)
+            self.assertIn("\\nredaction-check", result.stderr)
+            self.assertNotIn("\nredaction-check", result.stderr)
+
     def test_finding_is_reported_without_matched_content(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1090,6 +1263,28 @@ class RedactionTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 1)
             self.assertIn("line:2", result.stdout)
+
+    def test_anchor_text_inside_regex_comment_is_not_transformed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            patterns = root / "patterns.tsv"
+            report = root / "report.txt"
+            patterns.write_text(
+                "commented-anchor\t(?# mention $ and \\) here)SECRET\n",
+                encoding="utf-8",
+            )
+            report.write_text("SECRET\n", encoding="utf-8")
+
+            result = run(
+                sys.executable,
+                str(ROOT / "scripts/check-report-redaction.py"),
+                "--patterns",
+                str(patterns),
+                str(report),
+            )
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("commented-anchor", result.stdout)
 
     def test_unreadable_report_path_is_escaped(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

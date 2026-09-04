@@ -78,6 +78,30 @@ def git_paths(repository: Path, *arguments: str) -> set[str]:
     return {item.decode("utf-8", "surrogateescape") for item in result.stdout.split(b"\0") if item}
 
 
+def git_bytes(repository: Path, *arguments: str) -> bytes:
+    result = subprocess.run(
+        [*GIT_READ_ONLY, "-C", str(repository), *arguments],
+        check=True,
+        env=git_environment(),
+        stdout=subprocess.PIPE,
+    )
+    return result.stdout
+
+
+def reject_worktree_redirection(repository: Path) -> None:
+    result = subprocess.run(
+        [*GIT_READ_ONLY, "-C", str(repository), "config", "--get", "core.worktree"],
+        check=False,
+        env=git_environment(),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode == 0:
+        raise ValueError("repository config redirects the worktree")
+    if result.returncode != 1:
+        raise subprocess.CalledProcessError(result.returncode, result.args)
+
+
 def repository_root(repository: Path) -> Path:
     result = subprocess.run(
         [*GIT_READ_ONLY, "-C", str(repository), "rev-parse", "--show-toplevel"],
@@ -117,9 +141,13 @@ def submodule_content_filter_count(repository: Path) -> int:
       if ! names=$(git --no-optional-locks --no-replace-objects config --name-only --list); then
         exit 1
       fi
-      if printf '%s\n' "$names" | LC_ALL=C grep -Eiq '^filter\..*\.(clean|process)$'; then
-        printf 'filter\n'
-      fi
+      while IFS= read -r name; do
+        case $name in
+          filter.*.clean|filter.*.process) printf 'filter\n' ;;
+        esac
+      done <<EOF
+$names
+EOF
     '''
     result = subprocess.run(
         [
@@ -186,6 +214,21 @@ def hidden_index_path_count(repository: Path) -> int:
     return count
 
 
+def repository_state(repository: Path) -> tuple[str, bytes, bytes]:
+    return (
+        resolve_commit(repository, "HEAD"),
+        git_bytes(repository, "ls-files", "--stage", "-v", "-z", "--recurse-submodules"),
+        git_bytes(
+            repository,
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ),
+    )
+
+
 def load_rules(path: Path) -> list[str]:
     rules = []
     for raw_line in path.read_text(encoding="utf-8").splitlines():
@@ -240,6 +283,7 @@ def main() -> int:
 
     try:
         rules = load_rules(args.allowlist)
+        reject_worktree_redirection(args.repository)
         root = repository_root(args.repository)
         configured_filters = configured_content_filter_count(root)
         configured_filters += submodule_content_filter_count(root)
@@ -248,6 +292,8 @@ def main() -> int:
                 f"{configured_filters} repository or submodule(s) configure clean/process filters"
             )
         base_commit = resolve_commit(root, args.base)
+        initial_state = repository_state(root)
+        head_commit = initial_state[0]
         hidden_paths = hidden_index_path_count(root)
         if hidden_paths:
             raise ValueError(
@@ -260,7 +306,7 @@ def main() -> int:
             "--ignore-submodules=none",
             "--name-only",
             "-z",
-            f"{base_commit}...HEAD",
+            f"{base_commit}...{head_commit}",
             "--",
         )
         changed |= git_paths(
@@ -281,7 +327,15 @@ def main() -> int:
             "-z",
         )
         changed |= git_paths(root, "ls-files", "--full-name", "--others", "--exclude-standard", "-z")
-    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        if repository_state(root) != initial_state:
+            raise ValueError("repository HEAD, index, or working tree changed during inspection")
+    except OSError as error:
+        print(f"scope-check: filesystem inspection failed ({type(error).__name__})", file=sys.stderr)
+        return 2
+    except subprocess.CalledProcessError as error:
+        print(f"scope-check: Git inspection failed (exit {error.returncode})", file=sys.stderr)
+        return 2
+    except ValueError as error:
         print(f"scope-check: {error}", file=sys.stderr)
         return 2
 

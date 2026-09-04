@@ -11,11 +11,11 @@ git rev-parse --show-toplevel
 git status --short --branch
 git rev-parse HEAD
 git remote
-git remote get-url origin | sed -E 's#^(https?://)[^/@]+@#\1[credentials-redacted]@#'
+git remote get-url origin >/dev/null
 git branch --show-current
 ```
 
-The remote command displays a common HTTPS destination without exposing embedded credentials. Use an equivalent sanitizer for another URL form, and never retain a raw credential-bearing remote URL in a prompt or log. Then read repository guidance and inspect relevant source, tests, and current pull-request state. The included [`repo-preflight.sh`](../scripts/repo-preflight.sh) performs a conservative subset and fails if the working tree is dirty, detached, lacks an upstream, or cannot be inspected reliably.
+The remote command verifies that `origin` resolves without printing a URL that could contain credentials in user information, a query, or a fragment. Confirm repository identity through a trusted host UI or authenticated metadata API when that evidence is required; never retain a raw credential-bearing remote URL in a prompt or log. Then read repository guidance and inspect relevant source, tests, and current pull-request state. The included [`repo-preflight.sh`](../scripts/repo-preflight.sh) performs a conservative subset and fails if the working tree is dirty, detached, lacks an upstream, or cannot be inspected reliably.
 
 ## Existing changes belong to someone
 

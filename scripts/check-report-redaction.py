@@ -29,6 +29,19 @@ def portable_line_anchors(expression: str) -> str:
                 class_can_close = True
             index += 2
             continue
+        if not in_class and expression.startswith("(?#", index):
+            comment_end = index + 3
+            while comment_end < len(expression):
+                if expression[comment_end] == "\\" and comment_end + 1 < len(expression):
+                    comment_end += 2
+                elif expression[comment_end] == ")":
+                    comment_end += 1
+                    break
+                else:
+                    comment_end += 1
+            transformed.append(expression[index:comment_end])
+            index = comment_end
+            continue
         if in_class:
             transformed.append(character)
             if character == "]" and class_can_close:
@@ -62,7 +75,11 @@ def load_patterns(path: Path) -> list[tuple[str, re.Pattern[str]]]:
             raise ValueError(f"invalid pattern row {number}") from error
         if not name.strip() or not expression:
             raise ValueError(f"invalid pattern row {number}")
-        patterns.append((name.strip(), re.compile(portable_line_anchors(expression))))
+        try:
+            compiled = re.compile(portable_line_anchors(expression))
+        except re.error as error:
+            raise ValueError(f"invalid regular expression row {number}") from error
+        patterns.append((name.strip(), compiled))
     if not patterns:
         raise ValueError("pattern file contains no rules")
     return patterns
@@ -76,7 +93,14 @@ def main() -> int:
 
     try:
         patterns = load_patterns(args.patterns)
-    except (OSError, ValueError, re.error) as error:
+    except OSError as error:
+        escaped_path = json.dumps(str(args.patterns), ensure_ascii=True)
+        print(
+            f"redaction-check: cannot read pattern file {escaped_path} ({type(error).__name__})",
+            file=sys.stderr,
+        )
+        return 2
+    except ValueError as error:
         print(f"redaction-check: {error}", file=sys.stderr)
         return 2
 

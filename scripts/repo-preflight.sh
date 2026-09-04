@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-set -eu
+set -euo pipefail
 unset GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_CONFIG GIT_CONFIG_PARAMETERS \
   GIT_CONFIG_COUNT GIT_OBJECT_DIRECTORY GIT_DIR GIT_WORK_TREE \
   GIT_IMPLICIT_WORK_TREE GIT_GRAFT_FILE GIT_INDEX_FILE \
@@ -28,6 +28,17 @@ git_read() {
 
 repository=${1:-.}
 
+if core_worktree=$(git_read -C "$repository" config --get core.worktree 2>/dev/null); then
+  printf 'preflight: repository config redirects the worktree\n' >&2
+  exit 10
+else
+  config_status=$?
+  if [ "$config_status" -ne 1 ]; then
+    printf 'preflight: unable to inspect worktree configuration\n' >&2
+    exit 6
+  fi
+fi
+
 if ! root_record=$(git_read -C "$repository" rev-parse --show-toplevel 2>/dev/null && printf '.'); then
   printf 'preflight: not a Git working tree\n' >&2
   exit 2
@@ -42,10 +53,14 @@ case $root_record in
 esac
 
 if filter_names=$(git_read -C "$root" config --name-only --list 2>/dev/null); then
-  if printf '%s\n' "$filter_names" | LC_ALL=C grep -Eiq '^filter\..*\.(clean|process)$'; then
-    printf 'preflight: repository config contains clean/process filters\n' >&2
-    exit 9
-  fi
+  while IFS= read -r filter_name; do
+    case $filter_name in
+      filter.*.clean|filter.*.process)
+        printf 'preflight: repository config contains clean/process filters\n' >&2
+        exit 9
+        ;;
+    esac
+  done <<< "$filter_names"
 else
   printf 'preflight: unable to inspect content-filter configuration\n' >&2
   exit 6
@@ -55,9 +70,13 @@ if ! submodule_filter_state=$(git_read -C "$root" submodule foreach --quiet --re
   if ! names=$(git --no-optional-locks --no-replace-objects config --name-only --list 2>/dev/null); then
     exit 1
   fi
-  if printf "%s\n" "$names" | LC_ALL=C grep -Eiq "^filter\\..*\\.(clean|process)$"; then
-    printf "filter\n"
-  fi
+  while IFS= read -r name; do
+    case $name in
+      filter.*.clean|filter.*.process) printf "filter\n" ;;
+    esac
+  done <<EOF
+$names
+EOF
 ' 2>/dev/null); then
   printf 'preflight: unable to inspect submodule content-filter configuration\n' >&2
   exit 6
@@ -113,15 +132,29 @@ if [ -n "$submodule_operation_state" ]; then
   exit 7
 fi
 
+if ! initial_index=$(git_read -C "$root" ls-files --stage -v -z --recurse-submodules | git_read -C "$root" hash-object --stdin); then
+  printf 'preflight: unable to snapshot index state\n' >&2
+  exit 6
+fi
+
+if ! initial_worktree=$(git_read -C "$root" status --porcelain=v1 -z --untracked-files=all --ignore-submodules=none | git_read -C "$root" hash-object --stdin); then
+  printf 'preflight: unable to snapshot working-tree state\n' >&2
+  exit 6
+fi
+
 if ! index_state=$(git_read -C "$root" ls-files --recurse-submodules -v 2>/dev/null); then
   printf 'preflight: unable to inspect tracked-path index flags\n' >&2
   exit 6
 fi
 
-if printf '%s\n' "$index_state" | LC_ALL=C grep -Eq '^[a-zS] '; then
-  printf 'preflight: tracked paths use assume-unchanged or skip-worktree\n' >&2
-  exit 8
-fi
+while IFS= read -r index_entry; do
+  case $index_entry in
+    S\ *|[a-z]\ *)
+      printf 'preflight: tracked paths use assume-unchanged or skip-worktree\n' >&2
+      exit 8
+      ;;
+  esac
+done <<< "$index_state"
 
 printf 'root\t%q\n' "$root"
 printf 'branch\t%s\n' "$branch"
@@ -136,6 +169,34 @@ fi
 if [ -n "$working_state" ]; then
   printf 'preflight: working tree is not clean\n' >&2
   exit 5
+fi
+
+if ! final_branch=$(git_read -C "$root" symbolic-ref --quiet --short HEAD); then
+  printf 'preflight: repository state changed during inspection\n' >&2
+  exit 11
+fi
+if ! final_head=$(git_read -C "$root" rev-parse HEAD 2>/dev/null); then
+  printf 'preflight: repository state changed during inspection\n' >&2
+  exit 11
+fi
+if ! final_upstream=$(git_read -C "$root" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null); then
+  printf 'preflight: repository state changed during inspection\n' >&2
+  exit 11
+fi
+if ! final_index=$(git_read -C "$root" ls-files --stage -v -z --recurse-submodules | git_read -C "$root" hash-object --stdin); then
+  printf 'preflight: repository state changed during inspection\n' >&2
+  exit 11
+fi
+if ! final_worktree=$(git_read -C "$root" status --porcelain=v1 -z --untracked-files=all --ignore-submodules=none | git_read -C "$root" hash-object --stdin); then
+  printf 'preflight: repository state changed during inspection\n' >&2
+  exit 11
+fi
+
+if [ "$branch" != "$final_branch" ] || [ "$head_sha" != "$final_head" ] || \
+  [ "$upstream" != "$final_upstream" ] || [ "$initial_index" != "$final_index" ] || \
+  [ "$initial_worktree" != "$final_worktree" ]; then
+  printf 'preflight: repository state changed during inspection\n' >&2
+  exit 11
 fi
 
 printf 'working_tree\tclean\n'
