@@ -42,7 +42,8 @@ def main() -> int:
     findings = 0
     for path in args.paths:
         try:
-            report = path.read_text(encoding="utf-8")
+            with path.open("r", encoding="utf-8", newline="") as stream:
+                report = stream.read()
         except (OSError, UnicodeError) as error:
             print(f"redaction-check: cannot read {path}: {error}", file=sys.stderr)
             return 2

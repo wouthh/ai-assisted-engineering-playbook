@@ -505,6 +505,34 @@ class ScopeTests(RepositoryFixture):
         self.assertEqual(result.returncode, 1)
         self.assertIn('unexpected\t"protected.txt"', result.stdout)
 
+    def test_graft_file_cannot_hide_committed_change(self) -> None:
+        git(self.repository, "switch", "-c", "feature")
+        (self.repository / "protected.txt").write_text("synthetic\n", encoding="utf-8")
+        git(self.repository, "add", "protected.txt")
+        git(self.repository, "commit", "-m", "add protected path")
+        feature_head = git_output(self.repository, "rev-parse", "HEAD")
+        base = git_output(self.repository, "rev-parse", "main")
+        (self.repository / ".git/info/grafts").write_text(
+            f"{base} {feature_head}\n",
+            encoding="ascii",
+        )
+        allowlist = self.root / "allowlist.txt"
+        allowlist.write_text("README.md\n", encoding="utf-8")
+
+        result = run(
+            sys.executable,
+            str(ROOT / "scripts/check-change-scope.py"),
+            "--repository",
+            str(self.repository),
+            "--base",
+            "main",
+            "--allowlist",
+            str(allowlist),
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('unexpected\t"protected.txt"', result.stdout)
+
     def test_reported_paths_escape_control_characters(self) -> None:
         strange = self.repository / "unsafe\nallowed\tapproved.py"
         strange.write_text("synthetic\n", encoding="utf-8")
@@ -579,6 +607,26 @@ class RedactionTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
             self.assertIn("line:2", result.stdout)
             self.assertNotIn("middle", result.stdout + result.stderr)
+
+    def test_crlf_expression_matches_original_newlines(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            patterns = root / "patterns.tsv"
+            report = root / "report.txt"
+            patterns.write_text("synthetic-crlf\tBEGIN\\r\\nEND\n", encoding="utf-8")
+            report.write_bytes(b"prefix\r\nBEGIN\r\nEND\r\n")
+
+            result = run(
+                sys.executable,
+                str(ROOT / "scripts/check-report-redaction.py"),
+                "--patterns",
+                str(patterns),
+                str(report),
+            )
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("synthetic-crlf", result.stdout)
+            self.assertNotIn("BEGIN", result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

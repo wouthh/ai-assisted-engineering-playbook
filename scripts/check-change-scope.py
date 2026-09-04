@@ -45,6 +45,7 @@ def git_environment() -> dict[str, str]:
         environment.pop(name, None)
     environment["GIT_OPTIONAL_LOCKS"] = "0"
     environment["GIT_NO_LAZY_FETCH"] = "1"
+    environment["GIT_GRAFT_FILE"] = os.devnull
     return environment
 
 
@@ -181,7 +182,7 @@ def main() -> int:
         print(f"scope-check: {error}", file=sys.stderr)
         return 2
 
-    unexpected = sorted(path for path in changed if not is_allowed(path, rules))
+    unexpected = {path for path in changed if not is_allowed(path, rules)}
     for path in sorted(changed):
         state = "allowed" if path not in unexpected else "unexpected"
         print(f"{state}\t{json.dumps(path, ensure_ascii=True)}")

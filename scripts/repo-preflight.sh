@@ -8,6 +8,7 @@ unset GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_CONFIG GIT_CONFIG_PARAMETERS \
   GIT_COMMON_DIR 2>/dev/null || :
 export GIT_OPTIONAL_LOCKS=0
 export GIT_NO_LAZY_FETCH=1
+export GIT_GRAFT_FILE=/dev/null
 
 git_read() {
   git --no-optional-locks --no-replace-objects -c core.fsmonitor=false "$@"
