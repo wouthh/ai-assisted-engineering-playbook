@@ -17,6 +17,8 @@ git_read() {
     -c core.checkStat=default \
     -c core.ignoreStat=false \
     -c core.fileMode=true \
+    -c core.ignoreCase=false \
+    -c advice.graftFileDeprecated=false \
     "$@"
 }
 
@@ -82,7 +84,7 @@ if printf '%s\n' "$index_state" | LC_ALL=C grep -Eq '^[a-zS] '; then
   exit 8
 fi
 
-printf 'root\t%s\n' "$root"
+printf 'root\t%q\n' "$root"
 printf 'branch\t%s\n' "$branch"
 printf 'head\t%s\n' "$head_sha"
 printf 'upstream\t%s\n' "$upstream"

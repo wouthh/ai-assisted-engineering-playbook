@@ -27,6 +27,10 @@ GIT_READ_ONLY = [
     "core.ignoreStat=false",
     "-c",
     "core.fileMode=true",
+    "-c",
+    "core.ignoreCase=false",
+    "-c",
+    "advice.graftFileDeprecated=false",
 ]
 GIT_LOCAL_ENVIRONMENT = (
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",

@@ -238,6 +238,29 @@ class PreflightTests(RepositoryFixture):
         self.assertEqual(result.returncode, 5)
         self.assertIn("not clean", result.stderr)
 
+    def test_case_folding_configuration_cannot_hide_distinct_file(self) -> None:
+        (self.repository / "readme").write_text("tracked\n", encoding="utf-8")
+        git(self.repository, "add", "readme")
+        git(self.repository, "commit", "-m", "add lowercase tracked path")
+        git(self.repository, "config", "core.ignoreCase", "true")
+        (self.repository / "README").write_text("untracked\n", encoding="utf-8")
+
+        result = run(str(ROOT / "scripts/repo-preflight.sh"), str(self.repository))
+
+        self.assertEqual(result.returncode, 5)
+        self.assertIn("not clean", result.stderr)
+
+    def test_repository_root_is_shell_escaped(self) -> None:
+        escaped_repository = self.root / "work\nhead\tfake"
+        self.repository.rename(escaped_repository)
+        self.repository = escaped_repository
+
+        result = run(str(ROOT / "scripts/repo-preflight.sh"), str(self.repository))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("\nhead\tfake", result.stdout)
+        self.assertIn("\\nhead\\tfake", result.stdout)
+
 
 class ScopeTests(RepositoryFixture):
     def test_allowed_committed_change_passes(self) -> None:
@@ -346,6 +369,29 @@ class ScopeTests(RepositoryFixture):
 
         self.assertEqual(result.returncode, 1)
         self.assertIn('unexpected\t"protected.txt"', result.stdout)
+
+    def test_case_folding_configuration_cannot_hide_distinct_file(self) -> None:
+        (self.repository / "readme").write_text("tracked\n", encoding="utf-8")
+        git(self.repository, "add", "readme")
+        git(self.repository, "commit", "-m", "add lowercase tracked path")
+        git(self.repository, "config", "core.ignoreCase", "true")
+        (self.repository / "README").write_text("untracked\n", encoding="utf-8")
+        allowlist = self.root / "allowlist.txt"
+        allowlist.write_text("README.md\n", encoding="utf-8")
+
+        result = run(
+            sys.executable,
+            str(ROOT / "scripts/check-change-scope.py"),
+            "--repository",
+            str(self.repository),
+            "--base",
+            "main",
+            "--allowlist",
+            str(allowlist),
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('unexpected\t"README"', result.stdout)
 
     def test_staged_path_outside_allowlist_fails(self) -> None:
         allowlist = self.root / "allowlist.txt"
@@ -654,6 +700,7 @@ class ScopeTests(RepositoryFixture):
 
         self.assertEqual(result.returncode, 1)
         self.assertIn('unexpected\t"protected.txt"', result.stdout)
+        self.assertNotIn("graft", result.stderr.lower())
 
     def test_reported_paths_escape_control_characters(self) -> None:
         strange = self.repository / "unsafe\nallowed\tapproved.py"
