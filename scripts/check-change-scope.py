@@ -20,6 +20,18 @@ def git_paths(repository: Path, *arguments: str) -> set[str]:
     return {item.decode("utf-8", "surrogateescape") for item in result.stdout.split(b"\0") if item}
 
 
+def repository_root(repository: Path) -> Path:
+    result = subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "--show-toplevel"],
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="surrogateescape",
+    )
+    return Path(result.stdout.strip())
+
+
 def load_rules(path: Path) -> list[str]:
     rules = []
     for raw_line in path.read_text(encoding="utf-8").splitlines():
@@ -68,14 +80,34 @@ def main() -> int:
 
     try:
         rules = load_rules(args.allowlist)
+        root = repository_root(args.repository)
         changed = git_paths(
-            args.repository, "diff", "--no-renames", "--name-only", "-z", f"{args.base}...HEAD"
+            root,
+            "diff",
+            "--no-renames",
+            "--ignore-submodules=none",
+            "--name-only",
+            "-z",
+            f"{args.base}...HEAD",
         )
         changed |= git_paths(
-            args.repository, "diff", "--cached", "--no-renames", "--name-only", "-z"
+            root,
+            "diff",
+            "--cached",
+            "--no-renames",
+            "--ignore-submodules=none",
+            "--name-only",
+            "-z",
         )
-        changed |= git_paths(args.repository, "diff", "--no-renames", "--name-only", "-z")
-        changed |= git_paths(args.repository, "ls-files", "--others", "--exclude-standard", "-z")
+        changed |= git_paths(
+            root,
+            "diff",
+            "--no-renames",
+            "--ignore-submodules=none",
+            "--name-only",
+            "-z",
+        )
+        changed |= git_paths(root, "ls-files", "--full-name", "--others", "--exclude-standard", "-z")
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         print(f"scope-check: {error}", file=sys.stderr)
         return 2

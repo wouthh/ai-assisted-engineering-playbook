@@ -25,6 +25,7 @@ python3 -m py_compile scripts/check-change-scope.py scripts/check-report-redacti
 python3 scripts/check-change-scope.py --help
 python3 scripts/check-report-redaction.py --help
 git diff --check
+git diff --cached --check
 ```
 
 Inspect the complete staged diff before committing. Do not add generated reports, local repositories, tokens, or execution logs.

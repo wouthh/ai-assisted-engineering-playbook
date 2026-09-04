@@ -10,11 +10,12 @@ Before mutation, verify:
 git rev-parse --show-toplevel
 git status --short --branch
 git rev-parse HEAD
-git remote -v
+git remote
+git remote get-url origin | sed -E 's#^(https?://)[^/@]+@#\1[credentials-redacted]@#'
 git branch --show-current
 ```
 
-Then read repository guidance and inspect relevant source, tests, and current pull-request state. The included [`repo-preflight.sh`](../scripts/repo-preflight.sh) performs a conservative subset and fails if the working tree is dirty, detached, or lacks an upstream.
+The remote command displays a common HTTPS destination without exposing embedded credentials. Use an equivalent sanitizer for another URL form, and never retain a raw credential-bearing remote URL in a prompt or log. Then read repository guidance and inspect relevant source, tests, and current pull-request state. The included [`repo-preflight.sh`](../scripts/repo-preflight.sh) performs a conservative subset and fails if the working tree is dirty, detached, lacks an upstream, or cannot be inspected reliably.
 
 ## Existing changes belong to someone
 

@@ -46,6 +46,7 @@ Run:
 python3 -m unittest discover -s examples/fictional-order-service/tests -v
 python3 -m py_compile examples/fictional-order-service/src/order_rules.py
 git diff --check
+git diff --cached --check
 ```
 
 Tests cover the values immediately below, at, and above the threshold plus invalid input. They use no real data.

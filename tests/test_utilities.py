@@ -90,6 +90,15 @@ class PreflightTests(RepositoryFixture):
         self.assertEqual(result.returncode, 5)
         self.assertIn("not clean", result.stderr)
 
+    def test_status_failure_is_not_reported_as_clean(self) -> None:
+        (self.repository / ".git/index").write_bytes(b"invalid")
+
+        result = run(str(ROOT / "scripts/repo-preflight.sh"), str(self.repository))
+
+        self.assertEqual(result.returncode, 6)
+        self.assertIn("unable to determine", result.stderr)
+        self.assertNotIn("working_tree\tclean", result.stdout)
+
 
 class ScopeTests(RepositoryFixture):
     def test_allowed_committed_change_passes(self) -> None:
@@ -212,6 +221,71 @@ class ScopeTests(RepositoryFixture):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("allowed\tdocs/private/nested.md", result.stdout)
+
+    def test_submodule_ignore_cannot_hide_scope_change(self) -> None:
+        source = self.root / "submodule-source"
+        subprocess.run(["git", "init", "-b", "main", str(source)], check=True, capture_output=True)
+        (source / "tracked.txt").write_text("original\n", encoding="utf-8")
+        git(source, "add", "tracked.txt")
+        git(source, "commit", "-m", "add synthetic submodule content")
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.repository),
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                str(source),
+                "vendor/sample",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        git(self.repository, "config", "-f", ".gitmodules", "submodule.vendor/sample.ignore", "all")
+        git(self.repository, "add", ".gitmodules", "vendor/sample")
+        git(self.repository, "commit", "-m", "add synthetic submodule")
+        (self.repository / "vendor/sample/tracked.txt").write_text("modified\n", encoding="utf-8")
+        allowlist = self.root / "allowlist.txt"
+        allowlist.write_text("README.md\n", encoding="utf-8")
+
+        result = run(
+            sys.executable,
+            str(ROOT / "scripts/check-change-scope.py"),
+            "--repository",
+            str(self.repository),
+            "--base",
+            "main",
+            "--allowlist",
+            str(allowlist),
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("unexpected\tvendor/sample", result.stdout)
+
+    def test_nested_repository_argument_still_scans_repository_root(self) -> None:
+        nested = self.repository / "sub"
+        nested.mkdir()
+        (nested / "inside.txt").write_text("synthetic\n", encoding="utf-8")
+        (self.repository / "outside.txt").write_text("synthetic\n", encoding="utf-8")
+        allowlist = self.root / "allowlist.txt"
+        allowlist.write_text("sub/inside.txt\n", encoding="utf-8")
+
+        result = run(
+            sys.executable,
+            str(ROOT / "scripts/check-change-scope.py"),
+            "--repository",
+            str(nested),
+            "--base",
+            "main",
+            "--allowlist",
+            str(allowlist),
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("allowed\tsub/inside.txt", result.stdout)
+        self.assertIn("unexpected\toutside.txt", result.stdout)
 
 
 class RedactionTests(unittest.TestCase):
