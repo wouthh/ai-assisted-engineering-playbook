@@ -26,7 +26,7 @@ printf 'branch\t%s\n' "$branch"
 printf 'head\t%s\n' "$head_sha"
 printf 'upstream\t%s\n' "$upstream"
 
-if [ -n "$(git -C "$root" status --porcelain=v1 --untracked-files=all)" ]; then
+if [ -n "$(git -C "$root" status --porcelain=v1 --untracked-files=all --ignore-submodules=none)" ]; then
   printf 'preflight: working tree is not clean\n' >&2
   exit 5
 fi

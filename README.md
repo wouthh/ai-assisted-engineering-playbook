@@ -62,7 +62,7 @@ python3 scripts/check-change-scope.py \
   --allowlist approved-paths.txt
 ```
 
-Compares `BASE...HEAD` plus local changes and untracked files against newline-delimited path or glob rules. It reports only path names and exits non-zero when anything is outside the approved scope.
+Compares `BASE...HEAD` plus local changes and untracked files against newline-delimited path or glob rules. A single `*` stays within one path segment; use `**` as its own segment for intentional recursive approval. Renames inspect both source and destination. The utility reports only path names and exits non-zero when anything is outside the approved scope.
 
 ### Report-redaction check
 

@@ -30,7 +30,7 @@ Acceptance:
 
 ## 2. Preflight
 
-In a real repository, run the repository preflight before editing and record the branch and head. This example is part of the playbook repository, so its changes are validated by the root test suite and change-scope review.
+In a real repository, run the repository preflight before editing and record the branch and head. This example is part of the playbook repository, so its changes are covered by the root validation gate and change-scope review.
 
 ## 3. Implementation
 

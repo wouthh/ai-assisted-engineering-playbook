@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+from functools import lru_cache
 import subprocess
 import sys
 from pathlib import Path, PurePosixPath
@@ -33,8 +34,29 @@ def load_rules(path: Path) -> list[str]:
     return rules
 
 
+def matches_rule(path: str, rule: str) -> bool:
+    path_parts = PurePosixPath(path).parts
+    rule_parts = PurePosixPath(rule).parts
+
+    @lru_cache(maxsize=None)
+    def matches(path_index: int, rule_index: int) -> bool:
+        if rule_index == len(rule_parts):
+            return path_index == len(path_parts)
+        if rule_parts[rule_index] == "**":
+            return matches(path_index, rule_index + 1) or (
+                path_index < len(path_parts) and matches(path_index + 1, rule_index)
+            )
+        return (
+            path_index < len(path_parts)
+            and fnmatch.fnmatchcase(path_parts[path_index], rule_parts[rule_index])
+            and matches(path_index + 1, rule_index + 1)
+        )
+
+    return matches(0, 0)
+
+
 def is_allowed(path: str, rules: list[str]) -> bool:
-    return any(fnmatch.fnmatchcase(path, rule) for rule in rules)
+    return any(matches_rule(path, rule) for rule in rules)
 
 
 def main() -> int:
@@ -46,9 +68,13 @@ def main() -> int:
 
     try:
         rules = load_rules(args.allowlist)
-        changed = git_paths(args.repository, "diff", "--name-only", "-z", f"{args.base}...HEAD")
-        changed |= git_paths(args.repository, "diff", "--cached", "--name-only", "-z")
-        changed |= git_paths(args.repository, "diff", "--name-only", "-z")
+        changed = git_paths(
+            args.repository, "diff", "--no-renames", "--name-only", "-z", f"{args.base}...HEAD"
+        )
+        changed |= git_paths(
+            args.repository, "diff", "--cached", "--no-renames", "--name-only", "-z"
+        )
+        changed |= git_paths(args.repository, "diff", "--no-renames", "--name-only", "-z")
         changed |= git_paths(args.repository, "ls-files", "--others", "--exclude-standard", "-z")
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         print(f"scope-check: {error}", file=sys.stderr)

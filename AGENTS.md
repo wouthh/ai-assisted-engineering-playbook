@@ -19,8 +19,9 @@ Run from the repository root:
 
 ```bash
 python3 -m unittest discover -s tests -v
+python3 -m unittest discover -s examples/fictional-order-service/tests -v
 bash -n scripts/repo-preflight.sh
-python3 -m py_compile scripts/check-change-scope.py scripts/check-report-redaction.py
+python3 -m py_compile scripts/check-change-scope.py scripts/check-report-redaction.py examples/fictional-order-service/src/order_rules.py
 python3 scripts/check-change-scope.py --help
 python3 scripts/check-report-redaction.py --help
 git diff --check

@@ -59,6 +59,37 @@ class PreflightTests(RepositoryFixture):
         self.assertIn("not clean", result.stderr)
         self.assertNotIn("changed", result.stdout + result.stderr)
 
+    def test_dirty_submodule_cannot_be_hidden_by_repository_config(self) -> None:
+        source = self.root / "submodule-source"
+        subprocess.run(["git", "init", "-b", "main", str(source)], check=True, capture_output=True)
+        (source / "tracked.txt").write_text("original\n", encoding="utf-8")
+        git(source, "add", "tracked.txt")
+        git(source, "commit", "-m", "add synthetic submodule content")
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.repository),
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                str(source),
+                "vendor/sample",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        git(self.repository, "config", "-f", ".gitmodules", "submodule.vendor/sample.ignore", "all")
+        git(self.repository, "add", ".gitmodules", "vendor/sample")
+        git(self.repository, "commit", "-m", "add synthetic submodule")
+        (self.repository / "vendor/sample/tracked.txt").write_text("modified\n", encoding="utf-8")
+
+        result = run(str(ROOT / "scripts/repo-preflight.sh"), str(self.repository))
+
+        self.assertEqual(result.returncode, 5)
+        self.assertIn("not clean", result.stderr)
+
 
 class ScopeTests(RepositoryFixture):
     def test_allowed_committed_change_passes(self) -> None:
@@ -115,6 +146,72 @@ class ScopeTests(RepositoryFixture):
         )
         self.assertEqual(result.returncode, 1)
         self.assertIn("unexpected\tstaged.txt", result.stdout)
+
+    def test_rename_checks_source_and_destination(self) -> None:
+        (self.repository / "protected.txt").write_text("synthetic\n", encoding="utf-8")
+        git(self.repository, "add", "protected.txt")
+        git(self.repository, "commit", "-m", "add protected path")
+        git(self.repository, "switch", "-c", "feature")
+        git(self.repository, "mv", "protected.txt", "approved.txt")
+        git(self.repository, "commit", "-m", "rename protected path")
+        allowlist = self.root / "allowlist.txt"
+        allowlist.write_text("approved.txt\n", encoding="utf-8")
+
+        result = run(
+            sys.executable,
+            str(ROOT / "scripts/check-change-scope.py"),
+            "--repository",
+            str(self.repository),
+            "--base",
+            "main",
+            "--allowlist",
+            str(allowlist),
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("unexpected\tprotected.txt", result.stdout)
+
+    def test_single_star_does_not_cross_directory_boundary(self) -> None:
+        allowlist = self.root / "allowlist.txt"
+        allowlist.write_text("docs/*.md\n", encoding="utf-8")
+        nested = self.repository / "docs/private/nested.md"
+        nested.parent.mkdir(parents=True)
+        nested.write_text("synthetic\n", encoding="utf-8")
+
+        result = run(
+            sys.executable,
+            str(ROOT / "scripts/check-change-scope.py"),
+            "--repository",
+            str(self.repository),
+            "--base",
+            "main",
+            "--allowlist",
+            str(allowlist),
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("unexpected\tdocs/private/nested.md", result.stdout)
+
+    def test_double_star_explicitly_allows_recursive_paths(self) -> None:
+        allowlist = self.root / "allowlist.txt"
+        allowlist.write_text("docs/**/*.md\n", encoding="utf-8")
+        nested = self.repository / "docs/private/nested.md"
+        nested.parent.mkdir(parents=True)
+        nested.write_text("synthetic\n", encoding="utf-8")
+
+        result = run(
+            sys.executable,
+            str(ROOT / "scripts/check-change-scope.py"),
+            "--repository",
+            str(self.repository),
+            "--base",
+            "main",
+            "--allowlist",
+            str(allowlist),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("allowed\tdocs/private/nested.md", result.stdout)
 
 
 class RedactionTests(unittest.TestCase):
