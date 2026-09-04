@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_left
 import json
 import re
 import sys
@@ -47,10 +48,11 @@ def main() -> int:
         except (OSError, UnicodeError) as error:
             print(f"redaction-check: cannot read {path}: {error}", file=sys.stderr)
             return 2
+        newline_offsets = [index for index, character in enumerate(report) if character == "\n"]
         for name, pattern in patterns:
             for match in pattern.finditer(report):
                 findings += 1
-                line_number = report.count("\n", 0, match.start()) + 1
+                line_number = bisect_left(newline_offsets, match.start()) + 1
                 print(
                     "finding\t"
                     f"{json.dumps(name, ensure_ascii=True)}\t"

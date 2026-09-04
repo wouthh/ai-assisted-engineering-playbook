@@ -11,7 +11,13 @@ export GIT_NO_LAZY_FETCH=1
 export GIT_GRAFT_FILE=/dev/null
 
 git_read() {
-  git --no-optional-locks --no-replace-objects -c core.fsmonitor=false "$@"
+  git --no-optional-locks --no-replace-objects \
+    -c core.fsmonitor=false \
+    -c core.trustctime=true \
+    -c core.checkStat=default \
+    -c core.ignoreStat=false \
+    -c core.fileMode=true \
+    "$@"
 }
 
 repository=${1:-.}
@@ -46,6 +52,25 @@ for operation_marker in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-merge reb
     exit 7
   fi
 done
+
+if ! submodule_operation_state=$(git_read -C "$root" submodule foreach --quiet --recursive '
+  for operation_marker in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-merge rebase-apply sequencer BISECT_START; do
+    if ! marker_path=$(git --no-optional-locks --no-replace-objects rev-parse --path-format=absolute --git-path "$operation_marker" 2>/dev/null); then
+      exit 1
+    fi
+    if [ -e "$marker_path" ]; then
+      printf "operation\n"
+    fi
+  done
+' 2>/dev/null); then
+  printf 'preflight: unable to inspect submodule Git operation state\n' >&2
+  exit 6
+fi
+
+if [ -n "$submodule_operation_state" ]; then
+  printf 'preflight: Git operation is in progress in a submodule\n' >&2
+  exit 7
+fi
 
 if ! index_state=$(git_read -C "$root" ls-files --recurse-submodules -v 2>/dev/null); then
   printf 'preflight: unable to inspect tracked-path index flags\n' >&2

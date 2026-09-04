@@ -19,6 +19,14 @@ GIT_READ_ONLY = [
     "--no-replace-objects",
     "-c",
     "core.fsmonitor=false",
+    "-c",
+    "core.trustctime=true",
+    "-c",
+    "core.checkStat=default",
+    "-c",
+    "core.ignoreStat=false",
+    "-c",
+    "core.fileMode=true",
 ]
 GIT_LOCAL_ENVIRONMENT = (
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
@@ -70,6 +78,28 @@ def repository_root(repository: Path) -> Path:
         errors="surrogateescape",
     )
     return Path(result.stdout.strip())
+
+
+def resolve_commit(repository: Path, revision: str) -> str:
+    if not revision or revision.startswith("-"):
+        raise ValueError("base must name a commit and cannot start with '-'")
+    result = subprocess.run(
+        [
+            *GIT_READ_ONLY,
+            "-C",
+            str(repository),
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            f"{revision}^{{commit}}",
+        ],
+        check=True,
+        env=git_environment(),
+        stdout=subprocess.PIPE,
+        text=True,
+        encoding="ascii",
+    )
+    return result.stdout.strip()
 
 
 def hidden_index_path_count(repository: Path) -> int:
@@ -146,6 +176,7 @@ def main() -> int:
     try:
         rules = load_rules(args.allowlist)
         root = repository_root(args.repository)
+        base_commit = resolve_commit(root, args.base)
         hidden_paths = hidden_index_path_count(root)
         if hidden_paths:
             raise ValueError(
@@ -158,7 +189,8 @@ def main() -> int:
             "--ignore-submodules=none",
             "--name-only",
             "-z",
-            f"{args.base}...HEAD",
+            f"{base_commit}...HEAD",
+            "--",
         )
         changed |= git_paths(
             root,

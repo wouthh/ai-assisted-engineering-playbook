@@ -144,7 +144,7 @@ class PreflightTests(RepositoryFixture):
         result = run(str(ROOT / "scripts/repo-preflight.sh"), str(self.repository))
 
         self.assertEqual(result.returncode, 6)
-        self.assertIn("unable to inspect tracked-path index flags", result.stderr)
+        self.assertIn("unable to inspect", result.stderr)
         self.assertNotIn("working_tree\tclean", result.stdout)
 
     def test_in_progress_merge_is_not_reported_as_clean(self) -> None:
@@ -186,6 +186,58 @@ class PreflightTests(RepositoryFixture):
         self.assertIn("assume-unchanged or skip-worktree", result.stderr)
         self.assertNotIn("README.md", result.stdout + result.stderr)
 
+    def test_in_progress_submodule_merge_is_not_reported_as_clean(self) -> None:
+        source = self.root / "submodule-source"
+        raw_git("init", "-b", "main", str(source))
+        (source / "tracked.txt").write_text("original\n", encoding="utf-8")
+        git(source, "add", "tracked.txt")
+        git(source, "commit", "-m", "add synthetic submodule content")
+        subprocess.run(
+            [
+                *GIT_BASE,
+                "-C",
+                str(self.repository),
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                str(source),
+                "vendor/sample",
+            ],
+            check=True,
+            env=git_environment(),
+            capture_output=True,
+        )
+        git(self.repository, "add", ".gitmodules", "vendor/sample")
+        git(self.repository, "commit", "-m", "add synthetic submodule")
+        submodule = self.repository / "vendor/sample"
+        git(submodule, "switch", "-c", "pending")
+        git(submodule, "commit", "--allow-empty", "-m", "synthetic pending change")
+        git(submodule, "switch", "main")
+        git(submodule, "merge", "--no-ff", "--no-commit", "pending")
+
+        result = run(str(ROOT / "scripts/repo-preflight.sh"), str(self.repository))
+
+        self.assertEqual(result.returncode, 7)
+        self.assertIn("operation is in progress in a submodule", result.stderr)
+        self.assertNotIn("working_tree\tclean", result.stdout)
+
+    def test_relaxed_stat_configuration_cannot_hide_same_size_edit(self) -> None:
+        git(self.repository, "config", "core.trustctime", "false")
+        git(self.repository, "config", "core.checkStat", "minimal")
+        git(self.repository, "status", "--short")
+        original = (self.repository / "README.md").stat()
+        (self.repository / "README.md").write_text("# Concealed repository\n", encoding="utf-8")
+        os.utime(
+            self.repository / "README.md",
+            ns=(original.st_atime_ns, original.st_mtime_ns),
+        )
+
+        result = run(str(ROOT / "scripts/repo-preflight.sh"), str(self.repository))
+
+        self.assertEqual(result.returncode, 5)
+        self.assertIn("not clean", result.stderr)
+
 
 class ScopeTests(RepositoryFixture):
     def test_allowed_committed_change_passes(self) -> None:
@@ -224,6 +276,76 @@ class ScopeTests(RepositoryFixture):
         )
         self.assertEqual(result.returncode, 1)
         self.assertIn('unexpected\t"unexpected.txt"', result.stdout)
+
+    def test_empty_base_fails_closed(self) -> None:
+        allowlist = self.root / "allowlist.txt"
+        allowlist.write_text("README.md\n", encoding="utf-8")
+
+        result = run(
+            sys.executable,
+            str(ROOT / "scripts/check-change-scope.py"),
+            "--repository",
+            str(self.repository),
+            "--base=",
+            "--allowlist",
+            str(allowlist),
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("base must name a commit", result.stderr)
+
+    def test_option_like_base_fails_without_creating_output(self) -> None:
+        git(self.repository, "switch", "-c", "feature")
+        (self.repository / "protected.txt").write_text("synthetic\n", encoding="utf-8")
+        git(self.repository, "add", "protected.txt")
+        git(self.repository, "commit", "-m", "add protected path")
+        output = self.root / "unexpected-output"
+        allowlist = self.root / "allowlist.txt"
+        allowlist.write_text("README.md\n", encoding="utf-8")
+
+        result = run(
+            sys.executable,
+            str(ROOT / "scripts/check-change-scope.py"),
+            "--repository",
+            str(self.repository),
+            f"--base=--output={output}",
+            "--allowlist",
+            str(allowlist),
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("base must name a commit", result.stderr)
+        self.assertFalse(output.exists())
+
+    def test_relaxed_stat_configuration_cannot_hide_same_size_edit(self) -> None:
+        (self.repository / "protected.txt").write_text("original\n", encoding="utf-8")
+        git(self.repository, "add", "protected.txt")
+        git(self.repository, "commit", "-m", "add protected path")
+        git(self.repository, "config", "core.trustctime", "false")
+        git(self.repository, "config", "core.checkStat", "minimal")
+        git(self.repository, "status", "--short")
+        original = (self.repository / "protected.txt").stat()
+        (self.repository / "protected.txt").write_text("modified\n", encoding="utf-8")
+        os.utime(
+            self.repository / "protected.txt",
+            ns=(original.st_atime_ns, original.st_mtime_ns),
+        )
+        allowlist = self.root / "allowlist.txt"
+        allowlist.write_text("README.md\n", encoding="utf-8")
+
+        result = run(
+            sys.executable,
+            str(ROOT / "scripts/check-change-scope.py"),
+            "--repository",
+            str(self.repository),
+            "--base",
+            "main",
+            "--allowlist",
+            str(allowlist),
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('unexpected\t"protected.txt"', result.stdout)
 
     def test_staged_path_outside_allowlist_fails(self) -> None:
         allowlist = self.root / "allowlist.txt"
