@@ -6,9 +6,45 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
+GIT_BASE = [
+    "git",
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "commit.gpgSign=false",
+    "-c",
+    "tag.gpgSign=false",
+    "-c",
+    "core.fsmonitor=false",
+]
+
+
+def git_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    environment.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull})
+    environment["GIT_CONFIG_COUNT"] = "0"
+    for name in (
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    ):
+        environment.pop(name, None)
+    return environment
+
+
+def raw_git(*arguments: str) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        [*GIT_BASE, *arguments],
+        check=True,
+        env=git_environment(),
+        capture_output=True,
+    )
 
 
 def run(*arguments: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
@@ -16,7 +52,7 @@ def run(*arguments: str, cwd: Path | None = None) -> subprocess.CompletedProcess
 
 
 def git(repository: Path, *arguments: str) -> None:
-    environment = os.environ.copy()
+    environment = git_environment()
     environment.update(
         {
             "GIT_AUTHOR_NAME": "Synthetic Author",
@@ -25,7 +61,12 @@ def git(repository: Path, *arguments: str) -> None:
             "GIT_COMMITTER_EMAIL": "author@example.invalid",
         }
     )
-    subprocess.run(["git", "-C", str(repository), *arguments], check=True, env=environment, capture_output=True)
+    subprocess.run(
+        [*GIT_BASE, "-C", str(repository), *arguments],
+        check=True,
+        env=environment,
+        capture_output=True,
+    )
 
 
 class RepositoryFixture(unittest.TestCase):
@@ -34,8 +75,8 @@ class RepositoryFixture(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.remote = self.root / "remote.git"
         self.repository = self.root / "work"
-        subprocess.run(["git", "init", "--bare", str(self.remote)], check=True, capture_output=True)
-        subprocess.run(["git", "init", "-b", "main", str(self.repository)], check=True, capture_output=True)
+        raw_git("init", "--bare", str(self.remote))
+        raw_git("init", "-b", "main", str(self.repository))
         (self.repository / "README.md").write_text("# Synthetic repository\n", encoding="utf-8")
         git(self.repository, "add", "README.md")
         git(self.repository, "commit", "-m", "initial synthetic commit")
@@ -61,13 +102,13 @@ class PreflightTests(RepositoryFixture):
 
     def test_dirty_submodule_cannot_be_hidden_by_repository_config(self) -> None:
         source = self.root / "submodule-source"
-        subprocess.run(["git", "init", "-b", "main", str(source)], check=True, capture_output=True)
+        raw_git("init", "-b", "main", str(source))
         (source / "tracked.txt").write_text("original\n", encoding="utf-8")
         git(source, "add", "tracked.txt")
         git(source, "commit", "-m", "add synthetic submodule content")
         subprocess.run(
             [
-                "git",
+                *GIT_BASE,
                 "-C",
                 str(self.repository),
                 "-c",
@@ -78,6 +119,7 @@ class PreflightTests(RepositoryFixture):
                 "vendor/sample",
             ],
             check=True,
+            env=git_environment(),
             capture_output=True,
         )
         git(self.repository, "config", "-f", ".gitmodules", "submodule.vendor/sample.ignore", "all")
@@ -99,6 +141,25 @@ class PreflightTests(RepositoryFixture):
         self.assertIn("unable to determine", result.stderr)
         self.assertNotIn("working_tree\tclean", result.stdout)
 
+    def test_in_progress_merge_is_not_reported_as_clean(self) -> None:
+        git(self.repository, "switch", "-c", "pending")
+        git(self.repository, "commit", "--allow-empty", "-m", "synthetic pending change")
+        git(self.repository, "switch", "main")
+        git(self.repository, "merge", "--no-ff", "--no-commit", "pending")
+
+        result = run(str(ROOT / "scripts/repo-preflight.sh"), str(self.repository))
+
+        self.assertEqual(result.returncode, 7)
+        self.assertIn("operation is in progress", result.stderr)
+        self.assertNotIn("working_tree\tclean", result.stdout)
+
+    def test_fixture_git_ignores_host_signing_configuration(self) -> None:
+        hostile_config = self.root / "hostile-gitconfig"
+        hostile_config.write_text("[commit]\n\tgpgSign = true\n", encoding="utf-8")
+
+        with mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(hostile_config)}):
+            git(self.repository, "commit", "--allow-empty", "-m", "unsigned synthetic commit")
+
 
 class ScopeTests(RepositoryFixture):
     def test_allowed_committed_change_passes(self) -> None:
@@ -119,7 +180,7 @@ class ScopeTests(RepositoryFixture):
             str(allowlist),
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("allowed\tREADME.md", result.stdout)
+        self.assertIn('allowed\t"README.md"', result.stdout)
 
     def test_untracked_path_outside_allowlist_fails(self) -> None:
         allowlist = self.root / "allowlist.txt"
@@ -136,7 +197,7 @@ class ScopeTests(RepositoryFixture):
             str(allowlist),
         )
         self.assertEqual(result.returncode, 1)
-        self.assertIn("unexpected\tunexpected.txt", result.stdout)
+        self.assertIn('unexpected\t"unexpected.txt"', result.stdout)
 
     def test_staged_path_outside_allowlist_fails(self) -> None:
         allowlist = self.root / "allowlist.txt"
@@ -154,7 +215,7 @@ class ScopeTests(RepositoryFixture):
             str(allowlist),
         )
         self.assertEqual(result.returncode, 1)
-        self.assertIn("unexpected\tstaged.txt", result.stdout)
+        self.assertIn('unexpected\t"staged.txt"', result.stdout)
 
     def test_rename_checks_source_and_destination(self) -> None:
         (self.repository / "protected.txt").write_text("synthetic\n", encoding="utf-8")
@@ -178,7 +239,7 @@ class ScopeTests(RepositoryFixture):
         )
 
         self.assertEqual(result.returncode, 1)
-        self.assertIn("unexpected\tprotected.txt", result.stdout)
+        self.assertIn('unexpected\t"protected.txt"', result.stdout)
 
     def test_single_star_does_not_cross_directory_boundary(self) -> None:
         allowlist = self.root / "allowlist.txt"
@@ -199,7 +260,7 @@ class ScopeTests(RepositoryFixture):
         )
 
         self.assertEqual(result.returncode, 1)
-        self.assertIn("unexpected\tdocs/private/nested.md", result.stdout)
+        self.assertIn('unexpected\t"docs/private/nested.md"', result.stdout)
 
     def test_double_star_explicitly_allows_recursive_paths(self) -> None:
         allowlist = self.root / "allowlist.txt"
@@ -220,17 +281,17 @@ class ScopeTests(RepositoryFixture):
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("allowed\tdocs/private/nested.md", result.stdout)
+        self.assertIn('allowed\t"docs/private/nested.md"', result.stdout)
 
     def test_submodule_ignore_cannot_hide_scope_change(self) -> None:
         source = self.root / "submodule-source"
-        subprocess.run(["git", "init", "-b", "main", str(source)], check=True, capture_output=True)
+        raw_git("init", "-b", "main", str(source))
         (source / "tracked.txt").write_text("original\n", encoding="utf-8")
         git(source, "add", "tracked.txt")
         git(source, "commit", "-m", "add synthetic submodule content")
         subprocess.run(
             [
-                "git",
+                *GIT_BASE,
                 "-C",
                 str(self.repository),
                 "-c",
@@ -241,6 +302,7 @@ class ScopeTests(RepositoryFixture):
                 "vendor/sample",
             ],
             check=True,
+            env=git_environment(),
             capture_output=True,
         )
         git(self.repository, "config", "-f", ".gitmodules", "submodule.vendor/sample.ignore", "all")
@@ -262,7 +324,7 @@ class ScopeTests(RepositoryFixture):
         )
 
         self.assertEqual(result.returncode, 1)
-        self.assertIn("unexpected\tvendor/sample", result.stdout)
+        self.assertIn('unexpected\t"vendor/sample"', result.stdout)
 
     def test_nested_repository_argument_still_scans_repository_root(self) -> None:
         nested = self.repository / "sub"
@@ -284,8 +346,52 @@ class ScopeTests(RepositoryFixture):
         )
 
         self.assertEqual(result.returncode, 1)
-        self.assertIn("allowed\tsub/inside.txt", result.stdout)
-        self.assertIn("unexpected\toutside.txt", result.stdout)
+        self.assertIn('allowed\t"sub/inside.txt"', result.stdout)
+        self.assertIn('unexpected\t"outside.txt"', result.stdout)
+
+    def test_index_visibility_flags_fail_closed(self) -> None:
+        (self.repository / "protected.txt").write_text("original\n", encoding="utf-8")
+        git(self.repository, "add", "protected.txt")
+        git(self.repository, "commit", "-m", "add protected path")
+        git(self.repository, "update-index", "--assume-unchanged", "protected.txt")
+        (self.repository / "protected.txt").write_text("modified\n", encoding="utf-8")
+        allowlist = self.root / "allowlist.txt"
+        allowlist.write_text("README.md\n", encoding="utf-8")
+
+        result = run(
+            sys.executable,
+            str(ROOT / "scripts/check-change-scope.py"),
+            "--repository",
+            str(self.repository),
+            "--base",
+            "main",
+            "--allowlist",
+            str(allowlist),
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("assume-unchanged or skip-worktree", result.stderr)
+
+    def test_reported_paths_escape_control_characters(self) -> None:
+        strange = self.repository / "unsafe\nallowed\tapproved.py"
+        strange.write_text("synthetic\n", encoding="utf-8")
+        allowlist = self.root / "allowlist.txt"
+        allowlist.write_text("README.md\n", encoding="utf-8")
+
+        result = run(
+            sys.executable,
+            str(ROOT / "scripts/check-change-scope.py"),
+            "--repository",
+            str(self.repository),
+            "--base",
+            "main",
+            "--allowlist",
+            str(allowlist),
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('unexpected\t"unsafe\\nallowed\\tapproved.py"', result.stdout)
+        self.assertNotIn("\nallowed\tapproved.py", result.stdout)
 
 
 class RedactionTests(unittest.TestCase):
@@ -322,6 +428,24 @@ class RedactionTests(unittest.TestCase):
                 str(report),
             )
             self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_multiline_expression_matches_complete_report(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            patterns = root / "patterns.tsv"
+            report = root / "report.txt"
+            patterns.write_text("synthetic-block\tBEGIN[\\s\\S]*END\n", encoding="utf-8")
+            report.write_text("prefix\nBEGIN\nmiddle\nEND\n", encoding="utf-8")
+            result = run(
+                sys.executable,
+                str(ROOT / "scripts/check-report-redaction.py"),
+                "--patterns",
+                str(patterns),
+                str(report),
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("line:2", result.stdout)
+            self.assertNotIn("middle", result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

@@ -6,14 +6,18 @@ from __future__ import annotations
 import argparse
 import fnmatch
 from functools import lru_cache
+import json
 import subprocess
 import sys
 from pathlib import Path, PurePosixPath
 
 
+GIT_READ_ONLY = ["git", "--no-optional-locks", "-c", "core.fsmonitor=false"]
+
+
 def git_paths(repository: Path, *arguments: str) -> set[str]:
     result = subprocess.run(
-        ["git", "-C", str(repository), *arguments],
+        [*GIT_READ_ONLY, "-C", str(repository), *arguments],
         check=True,
         stdout=subprocess.PIPE,
     )
@@ -22,7 +26,7 @@ def git_paths(repository: Path, *arguments: str) -> set[str]:
 
 def repository_root(repository: Path) -> Path:
     result = subprocess.run(
-        ["git", "-C", str(repository), "rev-parse", "--show-toplevel"],
+        [*GIT_READ_ONLY, "-C", str(repository), "rev-parse", "--show-toplevel"],
         check=True,
         stdout=subprocess.PIPE,
         text=True,
@@ -30,6 +34,22 @@ def repository_root(repository: Path) -> Path:
         errors="surrogateescape",
     )
     return Path(result.stdout.strip())
+
+
+def hidden_index_path_count(repository: Path) -> int:
+    result = subprocess.run(
+        [*GIT_READ_ONLY, "-C", str(repository), "ls-files", "-v", "-z"],
+        check=True,
+        stdout=subprocess.PIPE,
+    )
+    count = 0
+    for entry in result.stdout.split(b"\0"):
+        if not entry:
+            continue
+        tag = chr(entry[0])
+        if tag == "S" or tag.islower():
+            count += 1
+    return count
 
 
 def load_rules(path: Path) -> list[str]:
@@ -81,6 +101,11 @@ def main() -> int:
     try:
         rules = load_rules(args.allowlist)
         root = repository_root(args.repository)
+        hidden_paths = hidden_index_path_count(root)
+        if hidden_paths:
+            raise ValueError(
+                f"{hidden_paths} tracked path(s) use assume-unchanged or skip-worktree"
+            )
         changed = git_paths(
             root,
             "diff",
@@ -115,7 +140,7 @@ def main() -> int:
     unexpected = sorted(path for path in changed if not is_allowed(path, rules))
     for path in sorted(changed):
         state = "allowed" if path not in unexpected else "unexpected"
-        print(f"{state}\t{path}")
+        print(f"{state}\t{json.dumps(path, ensure_ascii=True)}")
 
     if unexpected:
         print(f"scope-check: {len(unexpected)} path(s) outside the allowlist", file=sys.stderr)

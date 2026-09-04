@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from pathlib import Path
@@ -41,15 +42,20 @@ def main() -> int:
     findings = 0
     for path in args.paths:
         try:
-            lines = path.read_text(encoding="utf-8").splitlines()
+            report = path.read_text(encoding="utf-8")
         except (OSError, UnicodeError) as error:
             print(f"redaction-check: cannot read {path}: {error}", file=sys.stderr)
             return 2
-        for line_number, line in enumerate(lines, 1):
-            for name, pattern in patterns:
-                if pattern.search(line):
-                    findings += 1
-                    print(f"finding\t{name}\t{path}\tline:{line_number}")
+        for name, pattern in patterns:
+            for match in pattern.finditer(report):
+                findings += 1
+                line_number = report.count("\n", 0, match.start()) + 1
+                print(
+                    "finding\t"
+                    f"{json.dumps(name, ensure_ascii=True)}\t"
+                    f"{json.dumps(str(path), ensure_ascii=True)}\t"
+                    f"line:{line_number}"
+                )
 
     if findings:
         print(f"redaction-check: {findings} finding(s); matched content suppressed", file=sys.stderr)
