@@ -22,7 +22,7 @@ def load_patterns(path: Path) -> list[tuple[str, re.Pattern[str]]]:
             raise ValueError(f"invalid pattern row {number}") from error
         if not name.strip() or not expression:
             raise ValueError(f"invalid pattern row {number}")
-        patterns.append((name.strip(), re.compile(expression)))
+        patterns.append((name.strip(), re.compile(expression, re.MULTILINE)))
     if not patterns:
         raise ValueError("pattern file contains no rules")
     return patterns
@@ -48,7 +48,17 @@ def main() -> int:
         except (OSError, UnicodeError) as error:
             print(f"redaction-check: cannot read {path}: {error}", file=sys.stderr)
             return 2
-        newline_offsets = [index for index, character in enumerate(report) if character == "\n"]
+        newline_offsets = []
+        index = 0
+        while index < len(report):
+            if report[index] == "\r" and index + 1 < len(report) and report[index + 1] == "\n":
+                newline_offsets.append(index + 1)
+                index += 2
+            elif report[index] in {"\r", "\n"}:
+                newline_offsets.append(index)
+                index += 1
+            else:
+                index += 1
         for name, pattern in patterns:
             for match in pattern.finditer(report):
                 findings += 1

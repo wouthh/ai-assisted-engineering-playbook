@@ -18,15 +18,51 @@ git_read() {
     -c core.ignoreStat=false \
     -c core.fileMode=true \
     -c core.ignoreCase=false \
+    -c core.symlinks=true \
     -c advice.graftFileDeprecated=false \
     "$@"
 }
 
 repository=${1:-.}
 
-if ! root=$(git_read -C "$repository" rev-parse --show-toplevel 2>/dev/null); then
+if ! root_record=$(git_read -C "$repository" rev-parse --show-toplevel 2>/dev/null && printf '.'); then
   printf 'preflight: not a Git working tree\n' >&2
   exit 2
+fi
+root_record=${root_record%.}
+case $root_record in
+  *$'\n') root=${root_record%$'\n'} ;;
+  *)
+    printf 'preflight: invalid repository-root record\n' >&2
+    exit 6
+    ;;
+esac
+
+if filter_names=$(git_read -C "$root" config --name-only --list 2>/dev/null); then
+  if printf '%s\n' "$filter_names" | LC_ALL=C grep -Eiq '^filter\..*\.(clean|process)$'; then
+    printf 'preflight: repository config contains clean/process filters\n' >&2
+    exit 9
+  fi
+else
+  printf 'preflight: unable to inspect content-filter configuration\n' >&2
+  exit 6
+fi
+
+if ! submodule_filter_state=$(git_read -C "$root" submodule foreach --quiet --recursive '
+  if ! names=$(git --no-optional-locks --no-replace-objects config --name-only --list 2>/dev/null); then
+    exit 1
+  fi
+  if printf "%s\n" "$names" | LC_ALL=C grep -Eiq "^filter\\..*\\.(clean|process)$"; then
+    printf "filter\n"
+  fi
+' 2>/dev/null); then
+  printf 'preflight: unable to inspect submodule content-filter configuration\n' >&2
+  exit 6
+fi
+
+if [ -n "$submodule_filter_state" ]; then
+  printf 'preflight: submodule config contains clean/process filters\n' >&2
+  exit 9
 fi
 
 if ! branch=$(git_read -C "$root" symbolic-ref --quiet --short HEAD); then

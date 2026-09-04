@@ -30,6 +30,8 @@ GIT_READ_ONLY = [
     "-c",
     "core.ignoreCase=false",
     "-c",
+    "core.symlinks=true",
+    "-c",
     "advice.graftFileDeprecated=false",
 ]
 GIT_LOCAL_ENVIRONMENT = (
@@ -77,11 +79,59 @@ def repository_root(repository: Path) -> Path:
         check=True,
         env=git_environment(),
         stdout=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="surrogateescape",
     )
-    return Path(result.stdout.strip())
+    if not result.stdout.endswith(b"\n"):
+        raise ValueError("repository root output has no record terminator")
+    root = result.stdout[:-1].decode("utf-8", "surrogateescape")
+    if not root:
+        raise ValueError("repository root is empty")
+    return Path(root)
+
+
+def configured_content_filter_count(repository: Path) -> int:
+    result = subprocess.run(
+        [*GIT_READ_ONLY, "-C", str(repository), "config", "--name-only", "--null", "--list"],
+        check=True,
+        env=git_environment(),
+        stdout=subprocess.PIPE,
+    )
+    names = (
+        item.decode("utf-8", "surrogateescape").lower()
+        for item in result.stdout.split(b"\0")
+        if item
+    )
+    return sum(
+        1
+        for name in names
+        if name.startswith("filter.") and name.rsplit(".", 1)[-1] in {"clean", "process"}
+    )
+
+
+def submodule_content_filter_count(repository: Path) -> int:
+    command = r'''
+      if ! names=$(git --no-optional-locks --no-replace-objects config --name-only --list); then
+        exit 1
+      fi
+      if printf '%s\n' "$names" | LC_ALL=C grep -Eiq '^filter\..*\.(clean|process)$'; then
+        printf 'filter\n'
+      fi
+    '''
+    result = subprocess.run(
+        [
+            *GIT_READ_ONLY,
+            "-C",
+            str(repository),
+            "submodule",
+            "foreach",
+            "--quiet",
+            "--recursive",
+            command,
+        ],
+        check=True,
+        env=git_environment(),
+        stdout=subprocess.PIPE,
+    )
+    return sum(1 for line in result.stdout.splitlines() if line == b"filter")
 
 
 def resolve_commit(repository: Path, revision: str) -> str:
@@ -180,6 +230,12 @@ def main() -> int:
     try:
         rules = load_rules(args.allowlist)
         root = repository_root(args.repository)
+        configured_filters = configured_content_filter_count(root)
+        configured_filters += submodule_content_filter_count(root)
+        if configured_filters:
+            raise ValueError(
+                f"{configured_filters} repository or submodule(s) configure clean/process filters"
+            )
         base_commit = resolve_commit(root, args.base)
         hidden_paths = hidden_index_path_count(root)
         if hidden_paths:

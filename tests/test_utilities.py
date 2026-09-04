@@ -261,6 +261,55 @@ class PreflightTests(RepositoryFixture):
         self.assertNotIn("\nhead\tfake", result.stdout)
         self.assertIn("\\nhead\\tfake", result.stdout)
 
+    def test_trailing_space_in_repository_root_is_preserved(self) -> None:
+        clean_repository = self.root / "work"
+        dirty_repository = self.root / "work "
+        self.repository.rename(dirty_repository)
+        self.repository = dirty_repository
+        raw_git("init", "-b", "main", str(clean_repository))
+        (clean_repository / "README.md").write_text("clean\n", encoding="utf-8")
+        git(clean_repository, "add", "README.md")
+        git(clean_repository, "commit", "-m", "initial clean commit")
+        (dirty_repository / "README.md").write_text("dirty\n", encoding="utf-8")
+
+        result = run(str(ROOT / "scripts/repo-preflight.sh"), str(dirty_repository))
+
+        self.assertEqual(result.returncode, 5)
+        self.assertIn("not clean", result.stderr)
+
+    def test_content_filter_is_rejected_without_execution(self) -> None:
+        marker = self.root / "filter-executed"
+        (self.repository / ".gitattributes").write_text("README.md filter=hider\n", encoding="utf-8")
+        git(self.repository, "add", ".gitattributes")
+        git(self.repository, "commit", "-m", "configure synthetic attributes")
+        git(
+            self.repository,
+            "config",
+            "filter.hider.clean",
+            f"sh -c 'touch {marker}; cat'",
+        )
+        (self.repository / "README.md").write_text("changed\n", encoding="utf-8")
+
+        result = run(str(ROOT / "scripts/repo-preflight.sh"), str(self.repository))
+
+        self.assertEqual(result.returncode, 9)
+        self.assertIn("clean/process filters", result.stderr)
+        self.assertFalse(marker.exists())
+
+    def test_symlink_type_change_cannot_be_hidden(self) -> None:
+        link = self.repository / "link"
+        link.symlink_to("synthetic-target")
+        git(self.repository, "add", "link")
+        git(self.repository, "commit", "-m", "add synthetic symlink")
+        git(self.repository, "config", "core.symlinks", "false")
+        link.unlink()
+        link.write_text("synthetic-target", encoding="utf-8")
+
+        result = run(str(ROOT / "scripts/repo-preflight.sh"), str(self.repository))
+
+        self.assertEqual(result.returncode, 5)
+        self.assertIn("not clean", result.stderr)
+
 
 class ScopeTests(RepositoryFixture):
     def test_allowed_committed_change_passes(self) -> None:
@@ -392,6 +441,88 @@ class ScopeTests(RepositoryFixture):
 
         self.assertEqual(result.returncode, 1)
         self.assertIn('unexpected\t"README"', result.stdout)
+
+    def test_trailing_space_in_repository_root_is_preserved(self) -> None:
+        clean_repository = self.root / "work"
+        dirty_repository = self.root / "work "
+        self.repository.rename(dirty_repository)
+        self.repository = dirty_repository
+        raw_git("init", "-b", "main", str(clean_repository))
+        (clean_repository / "README.md").write_text("clean\n", encoding="utf-8")
+        git(clean_repository, "add", "README.md")
+        git(clean_repository, "commit", "-m", "initial clean commit")
+        (dirty_repository / "unexpected.txt").write_text("synthetic\n", encoding="utf-8")
+        allowlist = self.root / "allowlist.txt"
+        allowlist.write_text("README.md\n", encoding="utf-8")
+
+        result = run(
+            sys.executable,
+            str(ROOT / "scripts/check-change-scope.py"),
+            "--repository",
+            str(dirty_repository),
+            "--base",
+            "main",
+            "--allowlist",
+            str(allowlist),
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('unexpected\t"unexpected.txt"', result.stdout)
+
+    def test_content_filter_is_rejected_without_execution(self) -> None:
+        marker = self.root / "filter-executed"
+        (self.repository / ".gitattributes").write_text("README.md filter=hider\n", encoding="utf-8")
+        git(self.repository, "add", ".gitattributes")
+        git(self.repository, "commit", "-m", "configure synthetic attributes")
+        git(
+            self.repository,
+            "config",
+            "filter.hider.clean",
+            f"sh -c 'touch {marker}; cat'",
+        )
+        (self.repository / "README.md").write_text("changed\n", encoding="utf-8")
+        allowlist = self.root / "allowlist.txt"
+        allowlist.write_text("README.md\n", encoding="utf-8")
+
+        result = run(
+            sys.executable,
+            str(ROOT / "scripts/check-change-scope.py"),
+            "--repository",
+            str(self.repository),
+            "--base",
+            "main",
+            "--allowlist",
+            str(allowlist),
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("clean/process filters", result.stderr)
+        self.assertFalse(marker.exists())
+
+    def test_symlink_type_change_cannot_be_hidden(self) -> None:
+        link = self.repository / "link"
+        link.symlink_to("synthetic-target")
+        git(self.repository, "add", "link")
+        git(self.repository, "commit", "-m", "add synthetic symlink")
+        git(self.repository, "config", "core.symlinks", "false")
+        link.unlink()
+        link.write_text("synthetic-target", encoding="utf-8")
+        allowlist = self.root / "allowlist.txt"
+        allowlist.write_text("README.md\n", encoding="utf-8")
+
+        result = run(
+            sys.executable,
+            str(ROOT / "scripts/check-change-scope.py"),
+            "--repository",
+            str(self.repository),
+            "--base",
+            "main",
+            "--allowlist",
+            str(allowlist),
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('unexpected\t"link"', result.stdout)
 
     def test_staged_path_outside_allowlist_fails(self) -> None:
         allowlist = self.root / "allowlist.txt"
@@ -796,6 +927,46 @@ class RedactionTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
             self.assertIn("synthetic-crlf", result.stdout)
             self.assertNotIn("BEGIN", result.stdout + result.stderr)
+
+    def test_lone_carriage_return_counts_as_line_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            patterns = root / "patterns.tsv"
+            report = root / "report.txt"
+            patterns.write_text("synthetic-token\tSECRET\n", encoding="utf-8")
+            report.write_bytes(b"first\rsecond SECRET\r")
+
+            result = run(
+                sys.executable,
+                str(ROOT / "scripts/check-report-redaction.py"),
+                "--patterns",
+                str(patterns),
+                str(report),
+            )
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("line:2", result.stdout)
+
+    def test_line_anchors_apply_to_each_report_line(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            patterns = root / "patterns.tsv"
+            report = root / "report.txt"
+            patterns.write_text("anchored\t^SECRET=\n", encoding="utf-8")
+            report.write_text("first\nSECRET=synthetic\n", encoding="utf-8")
+
+            result = run(
+                sys.executable,
+                str(ROOT / "scripts/check-report-redaction.py"),
+                "--patterns",
+                str(patterns),
+                str(report),
+            )
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("anchored", result.stdout)
+            self.assertIn("line:2", result.stdout)
+            self.assertNotIn("SECRET=synthetic", result.stdout + result.stderr)
 
 
 if __name__ == "__main__":
