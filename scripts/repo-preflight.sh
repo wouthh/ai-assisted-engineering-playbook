@@ -29,7 +29,7 @@ git_read() {
 repository=${1:-.}
 
 check_index_bytes() {
-  local checkout=$1 record metadata path mode blob stage
+  local checkout=$1 record metadata path mode blob stage expected actual
   git_read -C "$checkout" ls-files --stage -z |
     while IFS= read -r -d '' record; do
       metadata=${record%%$'\t'*}
@@ -39,13 +39,25 @@ check_index_bytes() {
         100644|100755)
           [ "$stage" = 0 ] || return 1
           [ ! -L "$checkout/$path" ] && [ -f "$checkout/$path" ] || return 1
-          git_read -C "$checkout" cat-file --filters "--path=$path" "$blob" |
-            cmp -s -- "$checkout/$path" - || return 1
+          expected=$(git_read -C "$checkout" cat-file --filters "--path=$path" "$blob" |
+            git_read -C "$checkout" hash-object --stdin) || return 1
+          actual=$(git_read -C "$checkout" hash-object --no-filters -- "$path") || return 1
+          [ "$expected" = "$actual" ] || return 1
           ;;
       esac
     done
 }
-export -f git_read check_index_bytes
+PREFLIGHT_BYTE_CHECK_SCRIPT="$(declare -f git_read check_index_bytes)
+check_index_bytes ."
+export PREFLIGHT_BYTE_CHECK_SCRIPT
+
+check_all_index_bytes() {
+  if ! check_index_bytes "$root" || ! git_read -C "$root" submodule foreach --quiet --recursive \
+    'bash -euo pipefail -c "$PREFLIGHT_BYTE_CHECK_SCRIPT"' >/dev/null 2>&1; then
+    printf 'preflight: working-tree bytes differ from the expected index checkout or cannot be inspected\n' >&2
+    exit 5
+  fi
+}
 
 if core_worktree=$(git_read -C "$repository" config --get core.worktree 2>/dev/null); then
   printf 'preflight: repository config redirects the worktree\n' >&2
@@ -212,11 +224,7 @@ if [ -n "$working_state" ]; then
   exit 5
 fi
 
-if ! check_index_bytes "$root" || ! git_read -C "$root" submodule foreach --quiet --recursive \
-  'bash -euo pipefail -c "check_index_bytes ."' >/dev/null 2>&1; then
-  printf 'preflight: working-tree bytes differ from the expected index checkout or cannot be inspected\n' >&2
-  exit 5
-fi
+check_all_index_bytes
 
 if ! final_branch=$(git_read -C "$root" symbolic-ref --quiet --short HEAD); then
   printf 'preflight: repository state changed during inspection\n' >&2
@@ -247,4 +255,5 @@ if [ "$branch" != "$final_branch" ] || [ "$head_sha" != "$final_head" ] || \
 fi
 
 check_operations
+check_all_index_bytes
 printf 'working_tree\tclean\n'

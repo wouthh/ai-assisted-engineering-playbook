@@ -295,23 +295,33 @@ def tree_gitlinks(repository: Path, revision: str | None) -> dict[str, str]:
     }
 
 
-def committed_changes(repository: Path, base: str | None, head: str) -> set[str]:
-    if base is None:
-        changed = git_paths(repository, "ls-tree", "-r", "--name-only", "-z", head)
+def available_submodule(repository: Path, name: str) -> Path:
+    submodule = repository / name
+    if submodule.is_symlink() or not (submodule / ".git").exists():
+        raise ValueError("committed submodule checkout is unavailable")
+    if repository_root(submodule).resolve() != submodule.resolve():
+        raise ValueError("submodule worktree is redirected")
+    return submodule
+
+
+def committed_changes(repository: Path, base: str | None, head: str | None) -> set[str]:
+    if base is None and head is None:
+        return set()
+    if base is None or head is None:
+        changed = git_paths(repository, "ls-tree", "-r", "--name-only", "-z", head or base)
     else:
         changed = git_paths(repository, "diff", "--no-renames", "--ignore-submodules=none",
                             "--name-only", "-z", f"{base}..{head}", "--")
     base_links = tree_gitlinks(repository, base)
-    for name, target in tree_gitlinks(repository, head).items():
+    head_links = tree_gitlinks(repository, head)
+    for name in base_links.keys() | head_links.keys():
+        target = head_links.get(name)
         previous = base_links.get(name)
         if previous == target:
             continue
-        submodule = repository / name
-        if submodule.is_symlink() or not (submodule / ".git").exists():
-            raise ValueError("committed submodule checkout is unavailable")
-        if repository_root(submodule).resolve() != submodule.resolve():
-            raise ValueError("submodule worktree is redirected")
-        resolve_commit(submodule, target)
+        submodule = available_submodule(repository, name)
+        if target is not None:
+            resolve_commit(submodule, target)
         if previous is not None:
             resolve_commit(submodule, previous)
         changed |= {f"{name}/{path}" for path in committed_changes(submodule, previous, target)}
@@ -364,6 +374,7 @@ def collect_changes(repository: Path, base: str, head: str, *, nested: bool = Fa
             unstaged.add(entry[3:].decode("utf-8", "surrogateescape"))
     changed |= git_paths(repository, "ls-files", "--full-name", "--others", "--exclude-standard", "-z")
     base_links = tree_gitlinks(repository, base)
+    index_link_names = set()
     for entry in git_bytes(repository, "ls-files", "--stage", "-z").split(b"\0"):
         if not entry.startswith(b"160000 "):
             continue
@@ -372,6 +383,7 @@ def collect_changes(repository: Path, base: str, head: str, *, nested: bool = Fa
         if stage != b"0":
             raise ValueError("submodule index is unmerged")
         name = raw_name.decode("utf-8", "surrogateescape")
+        index_link_names.add(name)
         submodule = repository / name
         if submodule.is_symlink():
             raise ValueError("submodule checkout is a symlink")
@@ -391,6 +403,13 @@ def collect_changes(repository: Path, base: str, head: str, *, nested: bool = Fa
         changed |= {
             f"{name}/{path}"
             for path in collect_changes(submodule, submodule_base, submodule_head, nested=True)
+        }
+    head_links = tree_gitlinks(repository, head)
+    for name in head_links.keys() - index_link_names:
+        submodule = available_submodule(repository, name)
+        changed |= {
+            f"{name}/{path}"
+            for path in committed_changes(submodule, head_links[name], None)
         }
     return changed | unstaged
 

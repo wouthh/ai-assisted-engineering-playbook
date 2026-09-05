@@ -154,6 +154,73 @@ class RepositoryFixture(unittest.TestCase):
 
 
 class PreflightTests(RepositoryFixture):
+    def test_submodule_byte_check_does_not_need_exported_functions(self) -> None:
+        self.add_synthetic_submodule()
+        real_git = shutil.which("git")
+        wrapper_directory = self.root / "function-stripping-shell"
+        wrapper_directory.mkdir()
+        wrapper = wrapper_directory / "git"
+        wrapper.write_text(
+            f"#!{sys.executable}\nimport os, sys\n"
+            "environment = {key: value for key, value in os.environ.items() if not key.startswith('BASH_FUNC_')}\n"
+            f"os.execve({real_git!r}, [{real_git!r}, *sys.argv[1:]], environment)\n",
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+        environment = os.environ.copy()
+        environment["PATH"] = f"{wrapper_directory}:{environment['PATH']}"
+        result = run(str(ROOT / "scripts/repo-preflight.sh"), str(self.repository), env=environment)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_missing_cmp_does_not_block_clean_preflight(self) -> None:
+        self.add_synthetic_submodule()
+        wrapper_directory = self.root / "missing-cmp"
+        wrapper_directory.mkdir()
+        marker = self.root / "cmp-called"
+        wrapper = wrapper_directory / "cmp"
+        wrapper.write_text(f"#!/bin/sh\n: > {shlex.quote(str(marker))}\nexit 127\n", encoding="utf-8")
+        wrapper.chmod(0o755)
+        environment = os.environ.copy()
+        environment["PATH"] = f"{wrapper_directory}:{environment['PATH']}"
+        result = run(str(ROOT / "scripts/repo-preflight.sh"), str(self.repository), env=environment)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(marker.exists())
+
+    def test_normalized_raw_drift_at_final_state_check_is_detected(self) -> None:
+        (self.repository / ".gitattributes").write_text("protected.txt ident\n", encoding="utf-8")
+        path = self.repository / "protected.txt"
+        path.write_bytes(b"$Id$\n")
+        git(self.repository, "add", ".gitattributes", "protected.txt")
+        git(self.repository, "commit", "-m", "synthetic ident configuration")
+        blob = git_output(self.repository, "rev-parse", "HEAD:protected.txt")
+        path.write_bytes(f"$Id: {blob} $\n".encode())
+        git(self.repository, "add", "protected.txt")
+        real_git = shutil.which("git")
+        wrapper_directory = self.root / "late-byte-drift"
+        wrapper_directory.mkdir()
+        wrapper = wrapper_directory / "git"
+        counter = self.root / "symbolic-ref-count"
+        wrapper.write_text(
+            f"#!{sys.executable}\nimport os, subprocess, sys\nfrom pathlib import Path\n"
+            f"real_git = {real_git!r}\n"
+            "result = subprocess.run([real_git, *sys.argv[1:]])\n"
+            "if 'symbolic-ref' in sys.argv:\n"
+            f"    counter = Path({str(counter)!r})\n"
+            "    count = int(counter.read_text()) + 1 if counter.exists() else 1\n"
+            "    counter.write_text(str(count))\n"
+            "    if count == 2:\n"
+            f"        Path({str(path)!r}).write_bytes(b'$Id: ' + b'0' * 40 + b' $\\n')\n"
+            f"        subprocess.run([real_git, '-C', {str(self.repository)!r}, 'add', 'protected.txt'], check=True)\n"
+            "sys.exit(result.returncode)\n", encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+        environment = os.environ.copy()
+        environment["PATH"] = f"{wrapper_directory}:{environment['PATH']}"
+        result = run(str(ROOT / "scripts/repo-preflight.sh"), str(self.repository), env=environment)
+        self.assertEqual(result.returncode, 5, result.stdout + result.stderr)
+        self.assertNotIn("working_tree\tclean", result.stdout)
+        self.assertNotIn("0" * 40, result.stdout + result.stderr)
+
     def test_operation_started_during_inspection_fails_closed(self) -> None:
         submodule = self.add_synthetic_submodule()
         real_git = shutil.which("git")
@@ -459,6 +526,24 @@ class PreflightTests(RepositoryFixture):
 
 
 class ScopeTests(RepositoryFixture):
+    def test_removed_gitlink_requires_inspectable_nested_deletions(self) -> None:
+        self.add_synthetic_submodule()
+        base = git_output(self.repository, "rev-parse", "HEAD")
+        git(self.repository, "rm", "-f", "vendor/sample")
+        allowlist = self.root / "allowlist.txt"
+        allowlist.write_text(".gitmodules\nvendor/sample\n", encoding="utf-8")
+        command = (
+            sys.executable, str(ROOT / "scripts/check-change-scope.py"),
+            "--repository", str(self.repository), "--base", base,
+            "--allowlist", str(allowlist),
+        )
+        for committed in (False, True):
+            if committed:
+                git(self.repository, "commit", "-am", "remove synthetic module")
+            result = run(*command)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("submodule checkout is unavailable", result.stderr)
+
     def test_smudge_driver_is_rejected_without_execution(self) -> None:
         marker = self.root / "smudge-executed"
         (self.repository / ".gitattributes").write_text("README.md filter=example\n", encoding="utf-8")

@@ -4,18 +4,13 @@ Repository preflight protects user work and makes later evidence attributable to
 
 ## Minimum preflight
 
-Before mutation, verify:
+From a trusted checkout of this playbook, stop other repository writers and run the hardened helper before mutation:
 
 ```bash
-git rev-parse --show-toplevel
-git status --short --branch
-git rev-parse HEAD
-git remote
-git remote get-url origin >/dev/null
-git branch --show-current
+./scripts/repo-preflight.sh /path/to/repository
 ```
 
-The remote command verifies that `origin` resolves without printing a URL that could contain credentials in user information, a query, or a fragment. Confirm repository identity through a trusted host UI or authenticated metadata API when that evidence is required; never retain a raw credential-bearing remote URL in a prompt or log. Then read repository guidance and inspect relevant source, tests, and current pull-request state. The included [`repo-preflight.sh`](../scripts/repo-preflight.sh) performs a conservative subset and fails if the working tree is dirty, detached, lacks an upstream, or cannot be inspected reliably.
+The helper reports the root, branch, HEAD, and upstream without printing a remote URL that could contain credentials in user information, a query, or a fragment. Confirm repository identity through a trusted host UI or authenticated metadata API when that evidence is required; never retain a raw credential-bearing remote URL in a prompt or log. Then read repository guidance and inspect relevant source, tests, and current pull-request state. The included [`repo-preflight.sh`](../scripts/repo-preflight.sh) fails if the working tree is dirty, detached, lacks an upstream, or cannot be inspected reliably. Do not substitute a raw `git status` command before the helper's configuration guards: repository configuration can make Git execute hooks or content filters.
 
 ## Existing changes belong to someone
 
@@ -44,6 +39,10 @@ All tracked submodules must already be initialized; both tools fail closed other
 The root comparison uses one unambiguous merge base, including the gitlink baselines used to inspect nested changes. Porcelain status paths are included even when built-in text normalization makes a diff empty; an observed local edit still requires scope approval.
 
 Committed, staged, and checked-out submodule targets are inspected independently, so reversing a gitlink in one surface cannot conceal a change in another. Both tools compare raw regular-file bytes with Git's expected index checkout; built-in EOL, encoding, and identifier expansion are applied to the expected bytes, not used to normalize away actual edits. Configured clean, smudge, and process drivers are rejected before this comparison, and the caller's `GIT_EXEC_PATH` override is removed. Content and digests are never printed. The installed Git and tools on the executable `PATH` must still be trusted.
+
+Removed or replaced gitlinks are included in the scope comparison; if the old module cannot be inspected locally, the check fails closed rather than approving an opaque deletion. Preflight repeats its raw-byte comparison at the final gate, and submodule byte checks do not depend on exported Bash functions surviving an intermediate shell.
+
+These helpers are conservative checks for a trusted, quiescent checkout, not a sandbox or an atomic isolation boundary. Their read-only behavior assumes that repository configuration and the installed tools are not changed during inspection. If that prerequisite cannot be established, do not run them against the live checkout; use a separately reviewed isolated inspection workflow. Observed-drift checks do not prove that every concurrent change was detected.
 
 ## Preserve linear evidence
 
