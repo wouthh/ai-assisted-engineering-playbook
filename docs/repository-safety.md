@@ -43,6 +43,8 @@ All tracked submodules must already be initialized; both tools fail closed other
 
 The root comparison uses one unambiguous merge base, including the gitlink baselines used to inspect nested changes. Porcelain status paths are included even when built-in text normalization makes a diff empty; an observed local edit still requires scope approval.
 
+Committed, staged, and checked-out submodule targets are inspected independently, so reversing a gitlink in one surface cannot conceal a change in another. Both tools compare raw regular-file bytes with Git's expected index checkout; built-in EOL, encoding, and identifier expansion are applied to the expected bytes, not used to normalize away actual edits. Configured clean, smudge, and process drivers are rejected before this comparison, and the caller's `GIT_EXEC_PATH` override is removed. Content and digests are never printed. The installed Git and tools on the executable `PATH` must still be trusted.
+
 ## Preserve linear evidence
 
 Use normal follow-up commits during review. Do not amend, rebase, or force-push unless the repository workflow and task explicitly require it. A reviewer should be able to see how a finding was corrected.

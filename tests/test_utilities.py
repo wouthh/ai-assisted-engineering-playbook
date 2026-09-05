@@ -459,6 +459,117 @@ class PreflightTests(RepositoryFixture):
 
 
 class ScopeTests(RepositoryFixture):
+    def test_smudge_driver_is_rejected_without_execution(self) -> None:
+        marker = self.root / "smudge-executed"
+        (self.repository / ".gitattributes").write_text("README.md filter=example\n", encoding="utf-8")
+        git(self.repository, "add", ".gitattributes")
+        git(self.repository, "commit", "-m", "declare synthetic filter attribute")
+        git(self.repository, "config", "filter.example.smudge", f"touch {shlex.quote(str(marker))}; cat")
+        allowlist = self.root / "allowlist.txt"
+        allowlist.write_text("README.md\n", encoding="utf-8")
+        commands = (
+            (str(ROOT / "scripts/repo-preflight.sh"), str(self.repository)),
+            (sys.executable, str(ROOT / "scripts/check-change-scope.py"),
+             "--repository", str(self.repository), "--base", "HEAD", "--allowlist", str(allowlist)),
+        )
+        for command in commands:
+            result = run(*command)
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("filter", result.stderr)
+            self.assertFalse(marker.exists())
+
+    def test_worktree_gitlink_reversal_cannot_hide_staged_nested_path(self) -> None:
+        submodule = self.add_synthetic_submodule()
+        original_nested = git_output(submodule, "rev-parse", "HEAD")
+        (submodule / "protected.txt").write_text("staged change\n", encoding="utf-8")
+        git(submodule, "commit", "-am", "change protected nested content")
+        git(self.repository, "add", "vendor/sample")
+        git(submodule, "switch", "--detach", original_nested)
+        allowlist = self.root / "allowlist.txt"
+        allowlist.write_text("vendor/sample\n", encoding="utf-8")
+        result = run(
+            sys.executable, str(ROOT / "scripts/check-change-scope.py"),
+            "--repository", str(self.repository), "--base", "HEAD",
+            "--allowlist", str(allowlist),
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('unexpected\t"vendor/sample/protected.txt"', result.stdout)
+
+    def test_staged_gitlink_reversal_cannot_hide_committed_nested_path(self) -> None:
+        submodule = self.add_synthetic_submodule()
+        base = git_output(self.repository, "rev-parse", "HEAD")
+        original_nested = git_output(submodule, "rev-parse", "HEAD")
+        (submodule / "protected.txt").write_text("committed change\n", encoding="utf-8")
+        git(submodule, "commit", "-am", "change protected nested content")
+        git(self.repository, "commit", "-am", "advance committed gitlink")
+        git(submodule, "switch", "--detach", original_nested)
+        git(self.repository, "add", "vendor/sample")
+        allowlist = self.root / "allowlist.txt"
+        allowlist.write_text("vendor/sample\n", encoding="utf-8")
+        result = run(
+            sys.executable, str(ROOT / "scripts/check-change-scope.py"),
+            "--repository", str(self.repository), "--base", base,
+            "--allowlist", str(allowlist),
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('unexpected\t"vendor/sample/protected.txt"', result.stdout)
+
+    def test_ident_expansion_is_checked_without_cleaning_away_edits(self) -> None:
+        submodule = self.add_synthetic_submodule()
+        for repository in (self.repository, submodule):
+            (repository / ".gitattributes").write_text("protected.txt ident\n", encoding="utf-8")
+            (repository / "protected.txt").write_bytes(b"$Id$\n")
+            git(repository, "add", ".gitattributes", "protected.txt")
+            git(repository, "commit", "-m", "declare synthetic ident expansion")
+            blob = git_output(repository, "rev-parse", "HEAD:protected.txt")
+            (repository / "protected.txt").write_bytes(f"$Id: {blob} $\n".encode())
+            git(repository, "add", "protected.txt")
+        git(self.repository, "commit", "-am", "advance expanded module")
+        for repository in (submodule, self.repository):
+            git(repository, "status", "--short")
+        allowlist = self.root / "allowlist.txt"
+        allowlist.write_text("README.md\n", encoding="utf-8")
+        commands = (
+            (str(ROOT / "scripts/repo-preflight.sh"), str(self.repository)),
+            (sys.executable, str(ROOT / "scripts/check-change-scope.py"),
+             "--repository", str(self.repository), "--base", "HEAD", "--allowlist", str(allowlist)),
+        )
+        for command in commands:
+            result = run(*command)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for repository in (self.repository, submodule):
+            (repository / "protected.txt").write_bytes(b"$Id: " + b"a" * 40 + b" $\n")
+            git(repository, "add", "protected.txt")
+        for repository in (submodule, self.repository):
+            git(repository, "status", "--short")
+        for command in commands:
+            result = run(*command)
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertNotIn("a" * 40, result.stdout + result.stderr)
+
+    def test_ambient_git_exec_path_cannot_execute_a_submodule_helper(self) -> None:
+        helpers = self.root / "untrusted-helpers"
+        helpers.mkdir()
+        marker = self.root / "helper-executed"
+        helper = helpers / "git-submodule"
+        helper.write_text(
+            "#!/bin/sh\n" + f": > {shlex.quote(str(marker))}\nexit 0\n", encoding="utf-8"
+        )
+        helper.chmod(0o755)
+        environment = os.environ.copy()
+        environment["GIT_EXEC_PATH"] = str(helpers)
+        allowlist = self.root / "allowlist.txt"
+        allowlist.write_text("README.md\n", encoding="utf-8")
+        commands = (
+            (str(ROOT / "scripts/repo-preflight.sh"), str(self.repository)),
+            (sys.executable, str(ROOT / "scripts/check-change-scope.py"),
+             "--repository", str(self.repository), "--base", "HEAD", "--allowlist", str(allowlist)),
+        )
+        for command in commands:
+            result = run(*command, env=environment)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertFalse(marker.exists())
+
     def test_diverged_submodule_uses_superproject_merge_base(self) -> None:
         submodule = self.add_synthetic_submodule()
         root_ancestor = git_output(self.repository, "rev-parse", "HEAD")

@@ -5,7 +5,7 @@ unset GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_CONFIG GIT_CONFIG_PARAMETERS \
   GIT_CONFIG_COUNT GIT_OBJECT_DIRECTORY GIT_DIR GIT_WORK_TREE \
   GIT_IMPLICIT_WORK_TREE GIT_GRAFT_FILE GIT_INDEX_FILE \
   GIT_NO_REPLACE_OBJECTS GIT_REPLACE_REF_BASE GIT_PREFIX GIT_SHALLOW_FILE \
-  GIT_COMMON_DIR GIT_CONFIG_GLOBAL GIT_CONFIG_NOSYSTEM GIT_CONFIG_SYSTEM \
+  GIT_COMMON_DIR GIT_CONFIG_GLOBAL GIT_CONFIG_NOSYSTEM GIT_CONFIG_SYSTEM GIT_EXEC_PATH \
   2>/dev/null || :
 export GIT_OPTIONAL_LOCKS=0
 export GIT_NO_LAZY_FETCH=1
@@ -27,6 +27,25 @@ git_read() {
 }
 
 repository=${1:-.}
+
+check_index_bytes() {
+  local checkout=$1 record metadata path mode blob stage
+  git_read -C "$checkout" ls-files --stage -z |
+    while IFS= read -r -d '' record; do
+      metadata=${record%%$'\t'*}
+      path=${record#*$'\t'}
+      read -r mode blob stage <<< "$metadata"
+      case $mode in
+        100644|100755)
+          [ "$stage" = 0 ] || return 1
+          [ ! -L "$checkout/$path" ] && [ -f "$checkout/$path" ] || return 1
+          git_read -C "$checkout" cat-file --filters "--path=$path" "$blob" |
+            cmp -s -- "$checkout/$path" - || return 1
+          ;;
+      esac
+    done
+}
+export -f git_read check_index_bytes
 
 if core_worktree=$(git_read -C "$repository" config --get core.worktree 2>/dev/null); then
   printf 'preflight: repository config redirects the worktree\n' >&2
@@ -55,7 +74,7 @@ esac
 if filter_names=$(git_read -C "$root" config --name-only --list 2>/dev/null); then
   while IFS= read -r filter_name; do
     case $filter_name in
-      filter.*.clean|filter.*.process)
+      filter.*.clean|filter.*.smudge|filter.*.process)
         printf 'preflight: repository config contains clean/process filters\n' >&2
         exit 9
         ;;
@@ -77,7 +96,7 @@ if ! submodule_filter_state=$(git_read -C "$root" submodule foreach --quiet --re
   fi
   while IFS= read -r name; do
     case $name in
-      filter.*.clean|filter.*.process) printf "filter\n" ;;
+      filter.*.clean|filter.*.smudge|filter.*.process) printf "filter\n" ;;
     esac
   done <<EOF
 $names
@@ -190,6 +209,12 @@ fi
 
 if [ -n "$working_state" ]; then
   printf 'preflight: working tree is not clean\n' >&2
+  exit 5
+fi
+
+if ! check_index_bytes "$root" || ! git_read -C "$root" submodule foreach --quiet --recursive \
+  'bash -euo pipefail -c "check_index_bytes ."' >/dev/null 2>&1; then
+  printf 'preflight: working-tree bytes differ from the expected index checkout or cannot be inspected\n' >&2
   exit 5
 fi
 

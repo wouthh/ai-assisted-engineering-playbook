@@ -55,6 +55,7 @@ GIT_LOCAL_ENVIRONMENT = (
     "GIT_CONFIG_GLOBAL",
     "GIT_CONFIG_NOSYSTEM",
     "GIT_CONFIG_SYSTEM",
+    "GIT_EXEC_PATH",
 )
 
 
@@ -134,7 +135,7 @@ def configured_content_filter_count(repository: Path) -> int:
     return sum(
         1
         for name in names
-        if name.startswith("filter.") and name.rsplit(".", 1)[-1] in {"clean", "process"}
+        if name.startswith("filter.") and name.rsplit(".", 1)[-1] in {"clean", "smudge", "process"}
     )
 
 
@@ -151,7 +152,7 @@ def submodule_content_filter_count(repository: Path) -> int:
       fi
       while IFS= read -r name; do
         case $name in
-          filter.*.clean|filter.*.process) printf 'filter\n' ;;
+          filter.*.clean|filter.*.smudge|filter.*.process) printf 'filter\n' ;;
         esac
       done <<EOF
 $names
@@ -283,6 +284,63 @@ def require_initialized_submodules(repository: Path) -> None:
         raise ValueError("tracked submodule is not initialized")
 
 
+def tree_gitlinks(repository: Path, revision: str | None) -> dict[str, str]:
+    if revision is None:
+        return {}
+    return {
+        entry.split(b"\t", 1)[1].decode("utf-8", "surrogateescape"):
+        entry.split(b"\t", 1)[0].split()[2].decode("ascii")
+        for entry in git_bytes(repository, "ls-tree", "-r", "-z", revision).split(b"\0")
+        if entry.startswith(b"160000 ")
+    }
+
+
+def committed_changes(repository: Path, base: str | None, head: str) -> set[str]:
+    if base is None:
+        changed = git_paths(repository, "ls-tree", "-r", "--name-only", "-z", head)
+    else:
+        changed = git_paths(repository, "diff", "--no-renames", "--ignore-submodules=none",
+                            "--name-only", "-z", f"{base}..{head}", "--")
+    base_links = tree_gitlinks(repository, base)
+    for name, target in tree_gitlinks(repository, head).items():
+        previous = base_links.get(name)
+        if previous == target:
+            continue
+        submodule = repository / name
+        if submodule.is_symlink() or not (submodule / ".git").exists():
+            raise ValueError("committed submodule checkout is unavailable")
+        if repository_root(submodule).resolve() != submodule.resolve():
+            raise ValueError("submodule worktree is redirected")
+        resolve_commit(submodule, target)
+        if previous is not None:
+            resolve_commit(submodule, previous)
+        changed |= {f"{name}/{path}" for path in committed_changes(submodule, previous, target)}
+    return changed
+
+
+def raw_index_changes(repository: Path) -> set[str]:
+    actual = {entry[0]: entry for entry in worktree_contents(repository)}
+    changed = set()
+    for entry in git_bytes(repository, "ls-files", "--stage", "-z").split(b"\0"):
+        if not entry:
+            continue
+        metadata, raw_name = entry.split(b"\t", 1)
+        mode, blob, stage = metadata.split()
+        if mode not in {b"100644", b"100755"} or stage != b"0":
+            continue
+        name = raw_name.decode("utf-8", "surrogateescape")
+        record = actual.get(name)
+        if record is None or len(record) != 3 or not isinstance(record[1], int) or not stat.S_ISREG(record[1]):
+            changed.add(name)
+            continue
+        # All configured clean/smudge/process drivers were rejected first.
+        # Built-in checkout conversion preserves legitimate EOL/ident handling.
+        expected = git_bytes(repository, "cat-file", "--filters", f"--path={name}", blob.decode("ascii"))
+        if hashlib.sha256(expected).digest() != record[2]:
+            changed.add(name)
+    return changed
+
+
 def collect_changes(repository: Path, base: str, head: str, *, nested: bool = False) -> set[str]:
     options = ("--no-renames", "--ignore-submodules=none", "--name-only", "-z")
     if not nested:
@@ -290,9 +348,10 @@ def collect_changes(repository: Path, base: str, head: str, *, nested: bool = Fa
         if len(merge_bases) != 1:
             raise ValueError("scope comparison requires one unambiguous merge base")
         base = merge_bases[0].decode("ascii")
-    changed = git_paths(repository, "diff", *options, f"{base}..{head}", "--")
+    changed = committed_changes(repository, base, head)
     changed |= git_paths(repository, "diff", "--cached", *options)
     unstaged = git_paths(repository, "diff", *options)
+    unstaged |= raw_index_changes(repository)
     # Status retains edits that Git's built-in content normalization can hide
     # from a diff. Disable rename records so every NUL record has one path.
     for entry in git_bytes(
@@ -304,11 +363,7 @@ def collect_changes(repository: Path, base: str, head: str, *, nested: bool = Fa
                 raise ValueError("unexpected porcelain status record")
             unstaged.add(entry[3:].decode("utf-8", "surrogateescape"))
     changed |= git_paths(repository, "ls-files", "--full-name", "--others", "--exclude-standard", "-z")
-    base_links = {}
-    for entry in git_bytes(repository, "ls-tree", "-r", "-z", base).split(b"\0"):
-        if entry.startswith(b"160000 "):
-            metadata, raw_name = entry.split(b"\t", 1)
-            base_links[raw_name.decode("utf-8", "surrogateescape")] = metadata.split()[2].decode("ascii")
+    base_links = tree_gitlinks(repository, base)
     for entry in git_bytes(repository, "ls-files", "--stage", "-z").split(b"\0"):
         if not entry.startswith(b"160000 "):
             continue
@@ -326,6 +381,9 @@ def collect_changes(repository: Path, base: str, head: str, *, nested: bool = Fa
             raise ValueError("submodule worktree is redirected")
         submodule_head = resolve_commit(submodule, "HEAD")
         expected = index_commit.decode("ascii")
+        changed |= {
+            f"{name}/{path}" for path in committed_changes(submodule, base_links.get(name), expected)
+        }
         if submodule_head == expected:
             # Local file edits are approved by their full paths, not the gitlink.
             unstaged.discard(name)
@@ -414,7 +472,7 @@ def main() -> int:
         configured_filters += submodule_content_filter_count(root)
         if configured_filters:
             raise ValueError(
-                f"{configured_filters} repository or submodule(s) configure clean/process filters"
+                f"{configured_filters} repository or submodule(s) configure clean/process filters or smudge drivers"
             )
         base_commit = resolve_commit(root, args.base)
         initial_state = repository_state(root)
