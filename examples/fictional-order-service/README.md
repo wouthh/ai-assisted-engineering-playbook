@@ -30,7 +30,7 @@ Acceptance:
 
 ## 2. Preflight
 
-In a real repository, run the repository preflight before editing and record the branch and head. This example is part of the playbook repository, so its changes are covered by the root validation gate and change-scope review.
+In a real repository, run the repository preflight before editing and record the branch and head. Use trusted tools, stop other repository writers, and keep configuration stable during inspection. The helpers detect observed drift; they are not a sandbox or atomic isolation boundary. This example is part of the playbook repository, so its changes are covered by the root validation gate and change-scope review.
 
 For a new implementation branch, refresh the verified upstream target and branch from it. Index the real project before adapting missing AGENTS.md guidance; an existing authorized PR instead continues from its verified remote head. Do not replace unrelated work or infer a publication destination.
 

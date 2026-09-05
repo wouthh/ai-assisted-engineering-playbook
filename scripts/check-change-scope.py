@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Verify that committed, local, and untracked changes stay in an allowlist."""
+"""Verify that committed, local, and untracked changes stay in an allowlist.
+
+Requires trusted tools, a quiescent checkout, and stable configuration.
+Observed-drift checks are not a sandbox or atomic isolation boundary.
+Stop other writers before inspection; do not rely on this against hostile modification.
+"""
 
 from __future__ import annotations
 

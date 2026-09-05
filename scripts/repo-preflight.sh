@@ -1,6 +1,19 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
+case ${1:-} in
+  -h|--help)
+    printf '%s\n' \
+      'Usage: repo-preflight.sh [repository]' \
+      '' \
+      'Inspect repository identity and working state without changing them.' \
+      'Requires trusted tools, a quiescent checkout, and stable configuration.' \
+      'Observed-drift checks are not a sandbox or atomic isolation boundary.' \
+      'Stop other writers before inspection; do not rely on this against hostile modification.'
+    exit 0
+    ;;
+esac
+
 unset GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_CONFIG GIT_CONFIG_PARAMETERS \
   GIT_CONFIG_COUNT GIT_OBJECT_DIRECTORY GIT_DIR GIT_WORK_TREE \
   GIT_IMPLICIT_WORK_TREE GIT_GRAFT_FILE GIT_INDEX_FILE \

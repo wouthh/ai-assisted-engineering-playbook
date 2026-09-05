@@ -14,7 +14,7 @@ See the official [Codex instruction-discovery guide](https://learn.chatgpt.com/d
 
 Inspect only the repository and task-relevant dependencies:
 
-1. Actual Git root, authenticated remote identity, default or integration branch, current head, dirty state, in-progress operations, and existing PR.
+1. Actual Git root, authenticated remote identity, default or integration branch, current head, dirty state, in-progress operations, and existing PR, where present. For a genuinely new project, record absent Git history or remote as not applicable; do not create or publish a repository merely to complete indexing.
 2. Applicable root/nested AGENTS files, overrides, and existing contributor guidance; record precedence or conflicts.
 3. Entry points, domain modules, persistence, side effects, external boundaries, generated artifacts, and protected inputs.
 4. Runtime versions, manifests, lockfiles, package manager, supported setup, tests, static tools, CI, packaging, and deployment/rollback documentation.
@@ -26,6 +26,8 @@ Use bounded repository search, not a scan of a person's home directory. Do not r
 
 During an authorized implementation, use [the reusable template](../templates/AGENTS.template.md) if guidance is missing or materially incomplete. Fill it from the evidence above. Preserve stronger local rules, legal notices, and nested instructions. Merge only the missing contract; do not overwrite an existing file with the template or create no-op instruction churn.
 
+Onboarding is idempotent: repeating it without new facts must leave the files byte-for-byte unchanged. Verify preservation of custom guidance and nested overrides using disposable fixtures, not unrelated personal repositories.
+
 For new projects, agree on the product scope and remote/visibility before publication. Add a small runnable test baseline and an appropriate local gate. Select real commands for the stack; do not pretend every JavaScript project uses npm or every backend can run on the host. Record commands not yet run as unverified and remove unresolved template placeholders from the adopted project guidance.
 
 Include narrow instruction changes in the implementation PR, or create a focused guidance PR when instruction maintenance is the task. If an explicit path allowlist excludes AGENTS.md, obtain a scope extension. During questions, audits, planning, or read-only work, report gaps without editing. Do not bulk-rewrite unrelated project instructions.
@@ -34,6 +36,6 @@ Include narrow instruction changes in the implementation PR, or create a focused
 
 When an authorized change alters commands, layout, safety boundaries, or delivery rules, update the affected guidance and canonical documentation in the same PR. Test the documented commands in their proper environment; inspect links and resolve contradictions. Keep current-run logs and transient failures in the task evidence rather than bloating AGENTS.md.
 
-When a lesson is genuinely reusable, propose a normal playbook branch/PR updating the template and relevant documents together. Do not automatically import a new remote template or modify global policy from unreviewed code. Global policy changes remain an owner's decision; local installation and rollback belong in an owner-only ledger. Memory updates use the active agent's permitted mechanism and authorization.
+Only when a material reusable gap exists and cross-repository maintenance is authorized, propose a normal playbook branch/PR updating the template and relevant documents together. Project-specific instruction updates alone do not require a playbook PR. Never propagate proprietary rules, client identities, private paths, or project data. Do not automatically import a new remote template or modify global policy from unreviewed code. Global policy changes remain an owner's decision; local installation and rollback belong in an owner-only ledger. Memory updates use the active agent's permitted mechanism and authorization.
 
 Policy identifier `implementation-review-loop-v1` identifies the contract, not proof that a particular project implements it. Verify the project guidance and actual workflow before claiming adoption. This is an on-task maintenance practice, not an unattended synchronization service.

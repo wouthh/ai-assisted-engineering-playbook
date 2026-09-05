@@ -16,6 +16,7 @@ Describe what this repository owns and the audience it serves.
 - List files, data, environments, and external systems that require special care.
 - State how to handle an existing dirty working tree.
 - State which values must never appear in logs, commits, or review comments.
+- When using the playbook's inspection helpers, require trusted tools, a quiescent checkout, and stable configuration. Observed-drift checks are not a sandbox or atomic isolation; stop if these prerequisites cannot be established.
 
 ## Change boundaries
 
@@ -54,9 +55,10 @@ State what each command proves and which environment is authoritative.
 ## Instruction maintenance
 
 - Index before adopting new instructions. During authorized implementation, narrowly improve missing or inaccurate guidance in the same PR; do not overwrite stronger rules or edit outside a strict allowlist without approval.
-- New projects require a runnable test baseline and real documented commands. Existing projects retain their authoritative gates. Read-only tasks report guidance gaps without modifying files.
+- New projects require a runnable test baseline and real documented commands; do not assume an existing remote, base branch, or commit history. Creating or publishing a repository requires task authorization. Existing projects retain their authoritative gates. Read-only tasks report guidance gaps without modifying files.
 - Update this file when layout, commands, invariants, safety or delivery rules change. Keep durable guidance concise and link detailed docs; do not store transient logs, private workstation paths, or secrets here.
-- Propose reusable improvements through a normal playbook PR. Do not automatically adopt unreviewed templates or broaden global authority.
+- Make onboarding idempotent: preserve custom and nested instructions, add only missing or inaccurate guidance, and leave files unchanged on a second pass without new facts.
+- Propose a normal playbook PR only for a material reusable gap when cross-repository maintenance is authorized. Project-specific updates alone do not require one. Never propagate proprietary rules or private data, automatically adopt unreviewed templates, or broaden global authority.
 
 ## Code Review Rules
 

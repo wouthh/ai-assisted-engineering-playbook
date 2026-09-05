@@ -48,13 +48,15 @@ The default delivery path is a refreshed upstream base, feature branch, tests an
 
 ## Tested utilities
 
+The repository-inspection helpers require trusted installed tools, a quiescent checkout, and configuration that remains stable throughout inspection. Stop other writers first. Their checks detect observed drift; they are not a sandbox or atomic isolation boundary against concurrent or hostile modification. If those prerequisites cannot be established, use a separately reviewed isolated inspection workflow instead. See [repository safety](docs/repository-safety.md).
+
 ### Repository preflight
 
 ```bash
 ./scripts/repo-preflight.sh /path/to/repository
 ```
 
-Reports repository root, branch, HEAD, upstream, and whether tracked or untracked changes exist. It performs no mutation and fails closed on a detached head, missing upstream, or dirty state.
+Reports repository root, branch, HEAD, upstream, and whether tracked or untracked changes exist. Under the prerequisites above, it performs no mutation and fails closed on a detached head, missing upstream, or dirty state. Both repository helpers support `--help` outside a repository without invoking Git.
 
 ### Change-scope check
 

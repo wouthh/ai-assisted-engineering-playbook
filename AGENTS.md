@@ -5,7 +5,7 @@ This repository is a reusable playbook for human-owned AI-assisted software deli
 ## Invariants
 
 - Human intent, authority, review, and acceptance remain explicit.
-- Utilities are read-only by default, offline-capable, and tested with synthetic fixtures.
+- Utilities are read-only by default, offline-capable, and tested with synthetic fixtures. Repository inspection requires trusted tools, a quiescent checkout, and stable configuration; observed-drift checks are not sandboxing or atomic isolation.
 - Never add workstation-specific paths, credentials, personal data, private repository references, or real provider payloads.
 - Examples must be fictional or independently reusable. Do not copy source from another repository.
 - Do not present the redaction helper as a complete secret scanner.
@@ -21,6 +21,7 @@ Run from the repository root:
 python3 -m unittest discover -s tests -v
 python3 -m unittest discover -s examples/fictional-order-service/tests -v
 bash -n scripts/repo-preflight.sh
+./scripts/repo-preflight.sh --help
 python3 -m py_compile scripts/check-change-scope.py scripts/check-report-redaction.py examples/fictional-order-service/src/order_rules.py
 python3 scripts/check-change-scope.py --help
 python3 scripts/check-report-redaction.py --help
@@ -36,6 +37,7 @@ Policy: `implementation-review-loop-v1`. Follow [project onboarding](docs/projec
 
 - Index before editing. New work starts from refreshed upstream `main` on a feature branch; an authorized existing PR continues from its exact remote head without silent rebase or reset.
 - Keep this file, the reusable AGENTS template, linked workflow documentation, and fictional walkthrough consistent when their contract changes. Preserve scoped, repository-specific review rules rather than copying every general rule into each file.
+- Cross-repository playbook maintenance requires a material reusable gap and authorization for that work. Project-specific guidance changes alone do not require a playbook PR; never propagate private project details.
 - For authorized publication, validate and document the change, push normal commits, open a ready PR, and verify the hosted diff. First inspect the configured automatic review, including Codex reactions on the PR body; request review only if no current cycle is running.
 - Evaluate all feedback, fix valid in-scope findings, validate/push, reply and resolve addressed threads, then obtain fresh completed review of the substantive head. A bot thumbs-up must be attributable to that head; eyes, stale reactions, and silence are not clean review.
 - Incorrect findings need evidence before resolution; ambiguous or disputed security findings remain open. Use bounded waits and an exact-head handoff when review is unavailable.

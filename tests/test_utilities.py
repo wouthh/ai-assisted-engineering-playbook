@@ -82,6 +82,38 @@ def git(repository: Path, *arguments: str) -> None:
     git_output(repository, *arguments)
 
 
+class HelpTests(unittest.TestCase):
+    def assert_help_without_git(self, command: list[str]) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            marker = root / "git-called"
+            executable_directory = root / "bin"
+            executable_directory.mkdir()
+            wrapper = executable_directory / "git"
+            wrapper.write_text(
+                "#!/bin/sh\n"
+                f": > {shlex.quote(str(marker))}\n"
+                "exit 98\n",
+                encoding="utf-8",
+            )
+            wrapper.chmod(0o755)
+            environment = os.environ.copy()
+            environment["PATH"] = f"{executable_directory}:{environment.get('PATH', '')}"
+            for flag in ("--help", "-h"):
+                with self.subTest(flag=flag):
+                    result = run(*command, flag, cwd=root, env=environment)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertFalse(marker.exists(), "help must not invoke Git")
+                    for phrase in ("trusted tools", "quiescent checkout", "stable configuration", "atomic isolation"):
+                        self.assertIn(phrase, result.stdout)
+
+    def test_preflight_help_outside_repository_without_git(self) -> None:
+        self.assert_help_without_git(["bash", str(ROOT / "scripts/repo-preflight.sh")])
+
+    def test_scope_help_outside_repository_without_git(self) -> None:
+        self.assert_help_without_git([sys.executable, str(ROOT / "scripts/check-change-scope.py")])
+
+
 class RepositoryFixture(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
