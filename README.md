@@ -50,6 +50,8 @@ The default delivery path is a refreshed upstream base, feature branch, tests an
 
 The repository-inspection helpers require trusted installed tools, a quiescent checkout, and configuration that remains stable throughout inspection. Stop other writers first. Their checks detect observed drift; they are not a sandbox or atomic isolation boundary against concurrent or hostile modification. If those prerequisites cannot be established, use a separately reviewed isolated inspection workflow instead. See [repository safety](docs/repository-safety.md).
 
+Both helpers discard inherited `GIT_TRACE*` variables before invoking Git, so caller-selected trace destinations do not create or append files during inspection.
+
 ### Repository preflight
 
 ```bash

@@ -66,6 +66,10 @@ GIT_LOCAL_ENVIRONMENT = (
 
 def git_environment() -> dict[str, str]:
     environment = os.environ.copy()
+    # Trace destinations can make otherwise read-only Git commands write files.
+    for name in tuple(environment):
+        if name.startswith("GIT_TRACE"):
+            environment.pop(name)
     for name in GIT_LOCAL_ENVIRONMENT:
         environment.pop(name, None)
     environment["GIT_OPTIONAL_LOCKS"] = "0"

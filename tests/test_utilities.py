@@ -131,6 +131,26 @@ class RepositoryFixture(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def assert_trace_destinations_untouched(self, command: list[str]) -> None:
+        for variable in (
+            "GIT_TRACE", "GIT_TRACE_SETUP", "GIT_TRACE_PERFORMANCE",
+            "GIT_TRACE2", "GIT_TRACE2_EVENT", "GIT_TRACE2_PERF",
+        ):
+            for existing in (False, True):
+                with self.subTest(variable=variable, existing=existing):
+                    destination = self.root / f"{variable}-{existing}.log"
+                    original = b"preserve synthetic log\n"
+                    if existing:
+                        destination.write_bytes(original)
+                    environment = os.environ.copy()
+                    environment[variable] = str(destination)
+                    result = run(*command, env=environment)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    if existing:
+                        self.assertEqual(destination.read_bytes(), original)
+                    else:
+                        self.assertFalse(destination.exists(), "inspection must not create a trace file")
+
     def add_synthetic_submodule(self) -> Path:
         source = self.root / "nested-source"
         raw_git("init", "-b", "main", str(source))
@@ -186,6 +206,11 @@ class RepositoryFixture(unittest.TestCase):
 
 
 class PreflightTests(RepositoryFixture):
+    def test_inherited_trace_destinations_are_not_written(self) -> None:
+        self.assert_trace_destinations_untouched(
+            [str(ROOT / "scripts/repo-preflight.sh"), str(self.repository)]
+        )
+
     def test_submodule_byte_check_does_not_need_exported_functions(self) -> None:
         self.add_synthetic_submodule()
         real_git = shutil.which("git")
@@ -558,6 +583,15 @@ class PreflightTests(RepositoryFixture):
 
 
 class ScopeTests(RepositoryFixture):
+    def test_inherited_trace_destinations_are_not_written(self) -> None:
+        allowlist = self.root / "allowlist.txt"
+        allowlist.write_text("README.md\n", encoding="utf-8")
+        self.assert_trace_destinations_untouched([
+            sys.executable, str(ROOT / "scripts/check-change-scope.py"),
+            "--repository", str(self.repository), "--base", "HEAD",
+            "--allowlist", str(allowlist),
+        ])
+
     def test_removed_gitlink_requires_inspectable_nested_deletions(self) -> None:
         self.add_synthetic_submodule()
         base = git_output(self.repository, "rev-parse", "HEAD")

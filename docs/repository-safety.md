@@ -44,6 +44,8 @@ Removed or replaced gitlinks are included in the scope comparison; if the old mo
 
 These helpers are conservative checks for a trusted, quiescent checkout, not a sandbox or an atomic isolation boundary. Their read-only behavior assumes that repository configuration and the installed tools are not changed during inspection. If that prerequisite cannot be established, do not run them against the live checkout; use a separately reviewed isolated inspection workflow. Observed-drift checks do not prove that every concurrent change was detected.
 
+Both helpers discard inherited `GIT_TRACE*` variables, including Trace2 destinations, before invoking Git. Otherwise trusted Git can create or append trace files even during read-only commands. Synthetic regressions cover absent and pre-existing destinations; this environment safeguard does not provide isolation against concurrent writers.
+
 ## Preserve linear evidence
 
 Use normal follow-up commits during review. Do not amend, rebase, or force-push unless the repository workflow and task explicitly require it. A reviewer should be able to see how a finding was corrected.

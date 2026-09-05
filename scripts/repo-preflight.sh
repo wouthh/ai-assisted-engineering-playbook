@@ -14,6 +14,11 @@ case ${1:-} in
     ;;
 esac
 
+# Even read-only Git commands can create or append caller-selected trace files.
+for trace_variable in "${!GIT_TRACE@}"; do
+  unset "$trace_variable"
+done
+
 unset GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_CONFIG GIT_CONFIG_PARAMETERS \
   GIT_CONFIG_COUNT GIT_OBJECT_DIRECTORY GIT_DIR GIT_WORK_TREE \
   GIT_IMPLICIT_WORK_TREE GIT_GRAFT_FILE GIT_INDEX_FILE \
