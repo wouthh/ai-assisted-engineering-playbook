@@ -99,6 +99,18 @@ class RepositoryFixture(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def add_synthetic_submodule(self) -> Path:
+        source = self.root / "nested-source"
+        raw_git("init", "-b", "main", str(source))
+        for name in ("approved.txt", "protected.txt"):
+            (source / name).write_text("original\n", encoding="utf-8")
+        git(source, "add", "approved.txt", "protected.txt")
+        git(source, "commit", "-m", "synthetic nested content")
+        raw_git("-C", str(self.repository), "-c", "protocol.file.allow=always",
+                "submodule", "add", str(source), "vendor/sample")
+        git(self.repository, "commit", "-am", "add synthetic module")
+        return self.repository / "vendor/sample"
+
     def drifting_git_environment(self, trigger: str) -> dict[str, str]:
         real_git = shutil.which("git")
         self.assertIsNotNone(real_git)
@@ -142,6 +154,37 @@ class RepositoryFixture(unittest.TestCase):
 
 
 class PreflightTests(RepositoryFixture):
+    def test_operation_started_during_inspection_fails_closed(self) -> None:
+        submodule = self.add_synthetic_submodule()
+        real_git = shutil.which("git")
+        wrapper_directory = self.root / "operation-drift-bin"
+        wrapper_directory.mkdir()
+        wrapper = wrapper_directory / "git"
+        wrapper.write_text(
+            "#!/usr/bin/env bash\nset -eu\n"
+            f"real_git={shlex.quote(real_git or '')}\n"
+            '"$real_git" "$@"\n'
+            'for argument in "$@"; do\n'
+            '  if [ "$argument" = --porcelain=v1 ]; then\n'
+            '    printf "%s\\n" "$OPERATION_HEAD" > "$OPERATION_MARKER"\n'
+            '  fi\n'
+            'done\n', encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+        for repository in (self.repository, submodule):
+            with self.subTest(repository=repository.name):
+                marker = Path(git_output(repository, "rev-parse", "--path-format=absolute", "--git-path", "MERGE_HEAD"))
+                environment = os.environ.copy()
+                environment.update({
+                    "PATH": f"{wrapper_directory}:{environment['PATH']}",
+                    "OPERATION_HEAD": git_output(repository, "rev-parse", "HEAD"),
+                    "OPERATION_MARKER": str(marker),
+                })
+                result = run(str(ROOT / "scripts/repo-preflight.sh"), str(self.repository), env=environment)
+                self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
+                self.assertNotIn("working_tree\tclean", result.stdout)
+                marker.unlink()
+
     def test_clean_repository_passes(self) -> None:
         result = run(str(ROOT / "scripts/repo-preflight.sh"), str(self.repository))
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -416,6 +459,48 @@ class PreflightTests(RepositoryFixture):
 
 
 class ScopeTests(RepositoryFixture):
+    def test_uninitialized_submodule_fails_both_tools(self) -> None:
+        submodule = self.add_synthetic_submodule()
+        (submodule / ".git").unlink()
+        (submodule / "unexpected.txt").write_text("synthetic local work\n", encoding="utf-8")
+        allowlist = self.root / "allowlist.txt"
+        allowlist.write_text("README.md\n", encoding="utf-8")
+        commands = (
+            (str(ROOT / "scripts/repo-preflight.sh"), str(self.repository)),
+            (sys.executable, str(ROOT / "scripts/check-change-scope.py"),
+             "--repository", str(self.repository), "--base", "HEAD", "--allowlist", str(allowlist)),
+        )
+        for command in commands:
+            result = run(*command)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("not initialized", result.stderr)
+            self.assertNotIn("synthetic local work", result.stdout + result.stderr)
+
+    def test_submodule_files_require_individual_scope_approval(self) -> None:
+        submodule = self.add_synthetic_submodule()
+        allowlist = self.root / "allowlist.txt"
+        allowlist.write_text("vendor/sample/approved.txt\n", encoding="utf-8")
+        command = (
+            sys.executable, str(ROOT / "scripts/check-change-scope.py"),
+            "--repository", str(self.repository), "--base", "HEAD", "--allowlist", str(allowlist),
+        )
+        (submodule / "approved.txt").write_text("approved change\n", encoding="utf-8")
+        result = run(*command)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('allowed\t"vendor/sample/approved.txt"', result.stdout)
+        git(submodule, "add", "approved.txt")
+        self.assertEqual(run(*command).returncode, 0)
+        git(submodule, "commit", "-m", "approved nested change")
+        allowlist.write_text("vendor/sample\nvendor/sample/approved.txt\n", encoding="utf-8")
+        result = run(*command)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for name in ("protected.txt", "untracked.txt"):
+            (submodule / name).write_text("outside approved scope\n", encoding="utf-8")
+        result = run(*command)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        for name in ("protected.txt", "untracked.txt"):
+            self.assertIn(f'unexpected\t"vendor/sample/{name}"', result.stdout)
+
     def test_dirty_and_untracked_content_drift_fails_closed(self) -> None:
         allowlist = self.root / "allowlist.txt"
         allowlist.write_text("README.md\nnew.txt\n", encoding="utf-8")
@@ -940,7 +1025,7 @@ class ScopeTests(RepositoryFixture):
         )
 
         self.assertEqual(result.returncode, 1)
-        self.assertIn('unexpected\t"vendor/sample"', result.stdout)
+        self.assertIn('unexpected\t"vendor/sample/tracked.txt"', result.stdout)
 
     def test_submodule_index_flag_cannot_hide_scope_change(self) -> None:
         source = self.root / "submodule-source"

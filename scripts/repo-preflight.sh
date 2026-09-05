@@ -107,6 +107,20 @@ if ! upstream=$(git_read -C "$root" rev-parse --abbrev-ref --symbolic-full-name 
   exit 4
 fi
 
+check_operations() {
+  if ! submodule_status=$(git_read -C "$root" submodule status --recursive 2>/dev/null); then
+    printf 'preflight: unable to inspect submodule initialization\n' >&2
+    exit 6
+  fi
+  while IFS= read -r module_line; do
+    case $module_line in
+      -*)
+        printf 'preflight: tracked submodule is not initialized\n' >&2
+        exit 12
+        ;;
+    esac
+  done <<< "$submodule_status"
+
 for operation_marker in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-merge rebase-apply sequencer BISECT_START; do
   if ! marker_path=$(git_read -C "$root" rev-parse --path-format=absolute --git-path "$operation_marker" 2>/dev/null); then
     printf 'preflight: unable to inspect Git operation state\n' >&2
@@ -136,6 +150,9 @@ if [ -n "$submodule_operation_state" ]; then
   printf 'preflight: Git operation is in progress in a submodule\n' >&2
   exit 7
 fi
+}
+
+check_operations
 
 if ! initial_index=$(git_read -C "$root" ls-files --stage -v -z --recurse-submodules | git_read -C "$root" hash-object --stdin); then
   printf 'preflight: unable to snapshot index state\n' >&2
@@ -204,4 +221,5 @@ if [ "$branch" != "$final_branch" ] || [ "$head_sha" != "$final_head" ] || \
   exit 11
 fi
 
+check_operations
 printf 'working_tree\tclean\n'

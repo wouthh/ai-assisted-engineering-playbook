@@ -39,6 +39,8 @@ Check both content and shape:
 
 The scope utility compares tracked and untracked file contents as well as Git state before and after inspection, including initialized submodules. Content digests stay in memory and are never reported. Both utilities reject submodules whose configured working directory differs from their actual checkout. These checks detect observed drift; they do not lock out concurrent writers, so stop other writers and revalidate before acting on the result.
 
+All tracked submodules must already be initialized; both tools fail closed otherwise and never initialize or fetch them. The scope check prefixes nested file paths so approving a gitlink alone does not approve edits to its files. A changed gitlink still needs its own approval. Preflight checks root and submodule operation markers again before reporting a clean result.
+
 ## Preserve linear evidence
 
 Use normal follow-up commits during review. Do not amend, rebase, or force-push unless the repository workflow and task explicitly require it. A reviewer should be able to see how a finding was corrected.

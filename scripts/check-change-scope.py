@@ -263,7 +263,7 @@ def worktree_contents(repository: Path) -> tuple:
                     raise ValueError("submodule worktree is redirected")
                 content = repository_state(path)
             else:
-                content = "uninitialized-submodule"
+                raise ValueError("tracked submodule is not initialized")
         else:
             raise ValueError("unsupported working-tree file type")
         after = path.lstat()
@@ -276,7 +276,55 @@ def worktree_contents(repository: Path) -> tuple:
     return tuple(records)
 
 
+def require_initialized_submodules(repository: Path) -> None:
+    if any(line.startswith(b"-") for line in git_bytes(
+        repository, "submodule", "status", "--recursive"
+    ).splitlines()):
+        raise ValueError("tracked submodule is not initialized")
+
+
+def collect_changes(repository: Path, base: str, head: str, *, nested: bool = False) -> set[str]:
+    options = ("--no-renames", "--ignore-submodules=none", "--name-only", "-z")
+    separator = ".." if nested else "..."
+    changed = git_paths(repository, "diff", *options, f"{base}{separator}{head}", "--")
+    changed |= git_paths(repository, "diff", "--cached", *options)
+    unstaged = git_paths(repository, "diff", *options)
+    changed |= git_paths(repository, "ls-files", "--full-name", "--others", "--exclude-standard", "-z")
+    base_links = {}
+    for entry in git_bytes(repository, "ls-tree", "-r", "-z", base).split(b"\0"):
+        if entry.startswith(b"160000 "):
+            metadata, raw_name = entry.split(b"\t", 1)
+            base_links[raw_name.decode("utf-8", "surrogateescape")] = metadata.split()[2].decode("ascii")
+    for entry in git_bytes(repository, "ls-files", "--stage", "-z").split(b"\0"):
+        if not entry.startswith(b"160000 "):
+            continue
+        metadata, raw_name = entry.split(b"\t", 1)
+        _, index_commit, stage = metadata.split()
+        if stage != b"0":
+            raise ValueError("submodule index is unmerged")
+        name = raw_name.decode("utf-8", "surrogateescape")
+        submodule = repository / name
+        if submodule.is_symlink():
+            raise ValueError("submodule checkout is a symlink")
+        if not (submodule / ".git").exists():
+            raise ValueError("tracked submodule is not initialized")
+        if repository_root(submodule).resolve() != submodule.resolve():
+            raise ValueError("submodule worktree is redirected")
+        submodule_head = resolve_commit(submodule, "HEAD")
+        expected = index_commit.decode("ascii")
+        if submodule_head == expected:
+            # Local file edits are approved by their full paths, not the gitlink.
+            unstaged.discard(name)
+        submodule_base = resolve_commit(submodule, base_links.get(name, expected))
+        changed |= {
+            f"{name}/{path}"
+            for path in collect_changes(submodule, submodule_base, submodule_head, nested=True)
+        }
+    return changed | unstaged
+
+
 def repository_state(repository: Path) -> tuple:
+    require_initialized_submodules(repository)
     return (
         resolve_commit(repository, "HEAD"),
         git_bytes(repository, "ls-files", "--stage", "-v", "-z", "--recurse-submodules"),
@@ -362,34 +410,7 @@ def main() -> int:
             raise ValueError(
                 f"{hidden_paths} tracked path(s) use assume-unchanged or skip-worktree"
             )
-        changed = git_paths(
-            root,
-            "diff",
-            "--no-renames",
-            "--ignore-submodules=none",
-            "--name-only",
-            "-z",
-            f"{base_commit}...{head_commit}",
-            "--",
-        )
-        changed |= git_paths(
-            root,
-            "diff",
-            "--cached",
-            "--no-renames",
-            "--ignore-submodules=none",
-            "--name-only",
-            "-z",
-        )
-        changed |= git_paths(
-            root,
-            "diff",
-            "--no-renames",
-            "--ignore-submodules=none",
-            "--name-only",
-            "-z",
-        )
-        changed |= git_paths(root, "ls-files", "--full-name", "--others", "--exclude-standard", "-z")
+        changed = collect_changes(root, base_commit, head_commit)
         if repository_state(root) != initial_state:
             raise ValueError("repository HEAD, index, or working tree changed during inspection")
     except OSError as error:
