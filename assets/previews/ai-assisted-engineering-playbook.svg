@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-labelledby="title description">
+  <title id="title">AI-Assisted Engineering Playbook social preview</title>
+  <desc id="description">A restrained dark title card showing scope, change, checks, and review as a verified engineering loop.</desc>
+  <rect width="1280" height="640" fill="#0D1117"/>
+  <g fill="none" stroke="#58A6FF" stroke-width="5">
+    <rect x="900" y="88" width="240" height="82" rx="12"/>
+    <rect x="900" y="214" width="240" height="82" rx="12"/>
+    <rect x="900" y="340" width="240" height="82" rx="12"/>
+    <rect x="900" y="466" width="240" height="82" rx="12"/>
+    <path d="M1020 170v44M1020 296v44M1020 422v44"/>
+  </g>
+  <g fill="#F0F6FC" font-family="Arial, Helvetica, sans-serif">
+    <text x="96" y="120" font-size="28" font-weight="700" letter-spacing="2">HUMAN-OWNED DELIVERY</text>
+    <text x="96" y="220" font-size="56" font-weight="700">AI-Assisted Engineering</text>
+    <text x="96" y="284" font-size="56" font-weight="700">Playbook</text>
+    <text x="96" y="348" font-size="29" fill="#B1BAC4">Verified scope, tests, review, and delivery</text>
+    <text x="96" y="548" font-size="25" fill="#B1BAC4">github.com/wouthh/ai-assisted-engineering-playbook</text>
+  </g>
+  <g fill="#F0F6FC" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="700" text-anchor="middle">
+    <text x="1020" y="137">SCOPE</text>
+    <text x="1020" y="263">CHANGE</text>
+    <text x="1020" y="389">CHECKS</text>
+    <text x="1020" y="515">REVIEW</text>
+  </g>
+</svg>
