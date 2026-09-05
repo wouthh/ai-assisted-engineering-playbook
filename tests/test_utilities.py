@@ -459,6 +459,52 @@ class PreflightTests(RepositoryFixture):
 
 
 class ScopeTests(RepositoryFixture):
+    def test_diverged_submodule_uses_superproject_merge_base(self) -> None:
+        submodule = self.add_synthetic_submodule()
+        root_ancestor = git_output(self.repository, "rev-parse", "HEAD")
+        nested_ancestor = git_output(submodule, "rev-parse", "HEAD")
+        git(self.repository, "switch", "-c", "base-side")
+        (submodule / "protected.txt").write_text("same final content\n", encoding="utf-8")
+        git(submodule, "commit", "-am", "base-side nested change")
+        base_nested_tree = git_output(submodule, "rev-parse", "HEAD^{tree}")
+        git(self.repository, "commit", "-am", "advance base-side gitlink")
+        git(self.repository, "switch", "-c", "feature", root_ancestor)
+        git(submodule, "switch", "-c", "feature", nested_ancestor)
+        (submodule / "protected.txt").write_text("same final content\n", encoding="utf-8")
+        git(submodule, "commit", "-am", "feature-side nested change")
+        self.assertEqual(git_output(submodule, "rev-parse", "HEAD^{tree}"), base_nested_tree)
+        git(self.repository, "commit", "-am", "advance feature gitlink")
+        allowlist = self.root / "allowlist.txt"
+        allowlist.write_text("vendor/sample\n", encoding="utf-8")
+        result = run(
+            sys.executable, str(ROOT / "scripts/check-change-scope.py"),
+            "--repository", str(self.repository), "--base", "base-side",
+            "--allowlist", str(allowlist),
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('unexpected\t"vendor/sample/protected.txt"', result.stdout)
+
+    def test_normalized_worktree_edit_still_requires_scope_approval(self) -> None:
+        submodule = self.add_synthetic_submodule()
+        for repository in (self.repository, submodule):
+            (repository / ".gitattributes").write_text("*.txt text\n", encoding="utf-8")
+            (repository / "protected.txt").write_bytes(b"original\n")
+            git(repository, "add", ".gitattributes", "protected.txt")
+            git(repository, "commit", "-m", "declare synthetic text normalization")
+        git(self.repository, "commit", "-am", "advance normalized module")
+        allowlist = self.root / "allowlist.txt"
+        allowlist.write_text("README.md\n", encoding="utf-8")
+        for repository in (self.repository, submodule):
+            (repository / "protected.txt").write_bytes(b"original\r\n")
+        result = run(
+            sys.executable, str(ROOT / "scripts/check-change-scope.py"),
+            "--repository", str(self.repository), "--base", "HEAD",
+            "--allowlist", str(allowlist),
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        for path in ("protected.txt", "vendor/sample/protected.txt"):
+            self.assertIn(f'unexpected\t"{path}"', result.stdout)
+
     def test_uninitialized_submodule_fails_both_tools(self) -> None:
         submodule = self.add_synthetic_submodule()
         (submodule / ".git").unlink()

@@ -285,10 +285,24 @@ def require_initialized_submodules(repository: Path) -> None:
 
 def collect_changes(repository: Path, base: str, head: str, *, nested: bool = False) -> set[str]:
     options = ("--no-renames", "--ignore-submodules=none", "--name-only", "-z")
-    separator = ".." if nested else "..."
-    changed = git_paths(repository, "diff", *options, f"{base}{separator}{head}", "--")
+    if not nested:
+        merge_bases = git_bytes(repository, "merge-base", "--all", base, head).splitlines()
+        if len(merge_bases) != 1:
+            raise ValueError("scope comparison requires one unambiguous merge base")
+        base = merge_bases[0].decode("ascii")
+    changed = git_paths(repository, "diff", *options, f"{base}..{head}", "--")
     changed |= git_paths(repository, "diff", "--cached", *options)
     unstaged = git_paths(repository, "diff", *options)
+    # Status retains edits that Git's built-in content normalization can hide
+    # from a diff. Disable rename records so every NUL record has one path.
+    for entry in git_bytes(
+        repository, "status", "--porcelain=v1", "--no-renames", "-z",
+        "--untracked-files=all", "--ignore-submodules=none",
+    ).split(b"\0"):
+        if entry:
+            if len(entry) < 4 or entry[2:3] != b" ":
+                raise ValueError("unexpected porcelain status record")
+            unstaged.add(entry[3:].decode("utf-8", "surrogateescape"))
     changed |= git_paths(repository, "ls-files", "--full-name", "--others", "--exclude-standard", "-z")
     base_links = {}
     for entry in git_bytes(repository, "ls-tree", "-r", "-z", base).split(b"\0"):

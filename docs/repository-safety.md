@@ -41,6 +41,8 @@ The scope utility compares tracked and untracked file contents as well as Git st
 
 All tracked submodules must already be initialized; both tools fail closed otherwise and never initialize or fetch them. The scope check prefixes nested file paths so approving a gitlink alone does not approve edits to its files. A changed gitlink still needs its own approval. Preflight checks root and submodule operation markers again before reporting a clean result.
 
+The root comparison uses one unambiguous merge base, including the gitlink baselines used to inspect nested changes. Porcelain status paths are included even when built-in text normalization makes a diff empty; an observed local edit still requires scope approval.
+
 ## Preserve linear evidence
 
 Use normal follow-up commits during review. Do not amend, rebase, or force-push unless the repository workflow and task explicitly require it. A reviewer should be able to see how a finding was corrected.
