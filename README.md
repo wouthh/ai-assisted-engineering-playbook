@@ -26,12 +26,15 @@ It is useful for individual contributors, reviewers, and teams writing repositor
 
 - [Intake and scope](docs/intake-and-scope.md)
 - [Repository safety](docs/repository-safety.md)
+- [Project onboarding and instruction maintenance](docs/project-onboarding.md)
 - [Implementation loop](docs/implementation-loop.md)
 - [Validation and review](docs/validation-and-review.md)
 - [Privacy and secrets](docs/privacy-and-secrets.md)
 - [Rollback and handoff](docs/rollback-and-handoff.md)
 
 Use the root [AGENTS.md](AGENTS.md) as a small working example of repository guidance. Copy and adapt [the reusable template](templates/AGENTS.template.md) rather than copying workstation-specific policy from another project.
+
+The default delivery path is a refreshed upstream base, feature branch, tests and documentation, ready PR, repeated current-head cloud review, and human review or an explicitly authorized GitHub merge. Instruction maintenance is part of authorized implementation, not permission to edit projects during a read-only task. Cloud review must actually be configured; AGENTS.md alone does not enable it.
 
 ## Reusable templates
 

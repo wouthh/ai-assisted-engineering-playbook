@@ -32,6 +32,8 @@ Acceptance:
 
 In a real repository, run the repository preflight before editing and record the branch and head. This example is part of the playbook repository, so its changes are covered by the root validation gate and change-scope review.
 
+For a new implementation branch, refresh the verified upstream target and branch from it. Index the real project before adapting missing AGENTS.md guidance; an existing authorized PR instead continues from its verified remote head. Do not replace unrelated work or infer a publication destination.
+
 ## 3. Implementation
 
 [`src/order_rules.py`](src/order_rules.py) keeps the decision pure. Input validation occurs before the amount comparison, and the result is an explicit enum rather than an ambiguous Boolean.
@@ -57,9 +59,11 @@ A useful review asks whether the boundary is correct, whether equality is specif
 
 If a correction changes behavior, add a normal follow-up commit, rerun the focused and full gates, and obtain a fresh review of the new head.
 
+After validation and authorized publication, open a ready PR. Check the automatic Codex review first, including reactions on the PR body. A current-cycle bot thumbs-up may be its clean result without a comment, but eyes, silence, and stale reactions are not completion. Inspect every feedback surface, reply and resolve only addressed findings, and repeat on substantive heads until clean. An unavailable review produces an exact-head handoff, not a claim of success. These are illustrative steps; no actual cloud review was run for this fictional service.
+
 ## 6. Delivery and rollback
 
-This example has no deployment. In a real repository, merge only after the exact validated head has a clean review.
+This example has no deployment. In a real repository, leave the PR for human review unless merging is authorized. Then merge through GitHub only after the exact validated head has a clean review and all other gates pass; re-query before merging and verify the live target afterward.
 
 Rollback would use a normal revert pull request. If real orders had already been routed for review, operational reconciliation would be required before reverting behavior; the Git revert alone would not undo those decisions.
 

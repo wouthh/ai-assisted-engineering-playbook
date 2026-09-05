@@ -29,3 +29,20 @@ git diff --cached --check
 ```
 
 Inspect the complete staged diff before committing. Do not add generated reports, local repositories, tokens, or execution logs.
+
+## Default delivery and guidance maintenance
+
+Policy: `implementation-review-loop-v1`. Follow [project onboarding](docs/project-onboarding.md), the [implementation loop](docs/implementation-loop.md), and [validation and review](docs/validation-and-review.md).
+
+- Index before editing. New work starts from refreshed upstream `main` on a feature branch; an authorized existing PR continues from its exact remote head without silent rebase or reset.
+- Keep this file, the reusable AGENTS template, linked workflow documentation, and fictional walkthrough consistent when their contract changes. Preserve scoped, repository-specific review rules rather than copying every general rule into each file.
+- For authorized publication, validate and document the change, push normal commits, open a ready PR, and verify the hosted diff. First inspect the configured automatic review, including Codex reactions on the PR body; request review only if no current cycle is running.
+- Evaluate all feedback, fix valid in-scope findings, validate/push, reply and resolve addressed threads, then obtain fresh completed review of the substantive head. A bot thumbs-up must be attributable to that head; eyes, stale reactions, and silence are not clean review.
+- Incorrect findings need evidence before resolution; ambiguous or disputed security findings remain open. Use bounded waits and an exact-head handoff when review is unavailable.
+- Leave clean PRs for human review unless GitHub merging is explicitly authorized. Never self-approve or bypass repository requirements.
+
+## Code Review Rules
+
+- Flag actual side effects, secret disclosure, or false success within the helpers' documented trusted-tool, quiescent-checkout boundary. They do not promise sandboxing or atomic isolation against concurrent writers; any broader requirement needs an explicit design decision, not a claim of protection from repeated checks alone.
+- Scope checks must include committed, staged, unstaged, untracked, renamed/deleted, and nested submodule paths, or fail closed when they cannot be inspected. A gitlink allowlist entry alone does not approve every nested file.
+- Review-completion guidance must distinguish a current-head clean bot signal from acknowledgement, silence, stale reactions, and human approval. Mechanical formatting checks belong in validation, not stylistic review churn.

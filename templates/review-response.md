@@ -24,5 +24,8 @@ Relevant source, behavior, or test without reproducing sensitive material:
 - Validation:
 - Thread state:
 - Fresh review requested:
+- Reviewed head and cycle/request:
+- Bot reaction actor, location (PR body or request comment), time, and head correlation:
+- Remaining human approval, check, or clarification:
 
 Resolve a thread only after the correction or complete response is visible and validated.

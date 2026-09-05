@@ -35,10 +35,42 @@ Inspect:
 - inline comments;
 - conversation resolution state;
 - ordinary pull-request comments;
+- reactions on the PR body and on review-request comments, including the actor and time;
 - automated security findings;
 - required and optional checks.
 
 Deduplicate repeated findings. Treat security, privacy, data loss, authorization, and misleading-publication concerns conservatively.
+
+## Codex cloud review signals
+
+Verify the repository's actual cloud-review configuration. Automatic reviews, when enabled, run on a new ready PR without an extra comment. AGENTS.md cannot enable the integration. If no automatic cycle starts, use one `@codex review` request and record the head SHA and request time.
+
+Inspect both the PR body and review-request comment reactions. With the authenticated GitHub API, the read-only routes are:
+
+```text
+GET /repos/{owner}/{repo}/issues/{number}/reactions
+GET /repos/{owner}/{repo}/issues/comments/{comment_id}/reactions
+GET /repos/{owner}/{repo}/pulls/{number}/reviews
+GET /repos/{owner}/{repo}/pulls/{number}/comments
+GET /repos/{owner}/{repo}/issues/{number}/comments
+```
+
+Paginate complete results. Query GraphQL `reviewThreads` for resolution state and the PR's latest head, checks/statuses, and review decision. An issue-comment list alone does not show thread resolution or all review activity.
+
+Interpret signals conservatively:
+
+| Signal | Meaning and acceptance |
+| --- | --- |
+| Verified Codex bot eyes reaction | Acknowledged or working; not clean completion |
+| Verified Codex bot thumbs-up on PR body or request comment | May be clean completion without a prose review; must belong to the current head/cycle |
+| Completed Codex review or clean comment | Inspect its commit identity and all findings; only the current substantive head qualifies |
+| Silence, unavailable integration, owner reaction, or stale reaction | Not completed review |
+
+Reactions do not inherently carry a commit SHA. Record the head and request/creation event, verify the actor, and correlate signal timing with that cycle and any linked review/task. A reaction predating a new push cannot clear it. Timestamp alone is insufficient when cycles overlap or the head changed during review; request a fresh head-specific cycle and leave the PR open if attribution cannot be established. Do not equate a clean bot reaction with required human approval or let it override unresolved relevant threads.
+
+After substantive follow-up commits, request a fresh review unless a head-specific automatic cycle is already confirmed running. Repeat until the latest head is clean, not until comments merely stop arriving. Use bounded polling and handoff as described in the [implementation loop](implementation-loop.md); never dismiss a blocking concern or bypass checks to finish a loop.
+
+The official [Codex GitHub review guide](https://learn.chatgpt.com/docs/third-party/github) describes automatic and requested reviews. Integration behavior can change; verify the observed event and actor rather than assuming every repository has the same setup.
 
 ## Classify before acting
 
