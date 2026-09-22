@@ -90,3 +90,7 @@ Distinguish:
 - an external service that was not verified.
 
 Only the first two are test results. The others are limitations or blockers and should remain labelled as such.
+
+## Human and automated review are different evidence
+
+Describe automated checks, agent review, and human inspection separately. A passing test proves only that the recorded check passed for the tested state; an agent review proves only that automated review occurred. Neither establishes that a person inspected the design or implementation. Record the specific human inspection or acceptance that happened, and leave it unknown when there is no evidence. A recommendation to use human acceptance in a workflow is not proof that every historical change received it.
