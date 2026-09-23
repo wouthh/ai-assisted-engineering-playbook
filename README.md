@@ -1,6 +1,6 @@
 # AI-Assisted Engineering Playbook
 
-A practical playbook for AI-assisted software delivery with explicit scope, repository safeguards, testing, security checks, human review, and evidence-backed acceptance.
+Reusable guidance and tested utilities for scoped AI-assisted software delivery, with clear distinctions between automated checks, agent review, and human inspection.
 
 > **Maintained**
 >
@@ -34,7 +34,7 @@ It is useful for individual contributors, reviewers, and teams writing repositor
 
 Use the root [AGENTS.md](AGENTS.md) as a small working example of repository guidance. Copy and adapt [the reusable template](templates/AGENTS.template.md) rather than copying workstation-specific policy from another project.
 
-The default delivery path is a refreshed upstream base, feature branch, tests and documentation, ready PR, repeated current-head cloud review, and human review or an explicitly authorized GitHub merge. Instruction maintenance is part of authorized implementation, not permission to edit projects during a read-only task. Cloud review must actually be configured; AGENTS.md alone does not enable it.
+The recommended delivery path is a refreshed upstream base, a feature branch, tests and documentation, a ready PR, review of the current head, and human acceptance or an explicitly authorized GitHub merge. The [review evidence guidance](docs/validation-and-review.md#human-and-automated-review-are-different-evidence) defines what a completed review record must capture. This guidance does not establish that every past change followed the path. Instruction maintenance is part of authorized implementation, not permission to edit projects during a read-only task. Cloud review must actually be configured; AGENTS.md alone does not enable it.
 
 ## Reusable templates
 

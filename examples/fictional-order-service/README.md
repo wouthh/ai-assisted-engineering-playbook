@@ -59,7 +59,7 @@ A useful review asks whether the boundary is correct, whether equality is specif
 
 If a correction changes behavior, add a normal follow-up commit, rerun the focused and full gates, and obtain a fresh review of the new head.
 
-After validation and authorized publication, open a ready PR. Check the automatic Codex review first, including reactions on the PR body. A current-cycle bot thumbs-up may be its clean result without a comment, but eyes, silence, and stale reactions are not completion. Inspect every feedback surface, reply and resolve only addressed findings, and repeat on substantive heads until clean. An unavailable review produces an exact-head handoff, not a claim of success. These are illustrative steps; no actual cloud review was run for this fictional service.
+After validation and authorized publication, open a ready PR. Check the automatic Codex review first, including reactions on the PR body. A current-cycle bot thumbs-up may be its clean result without a comment, but eyes, silence, and stale reactions are not completion. Inspect every feedback surface, reply and resolve only addressed findings, and repeat on substantive heads until clean. An unavailable review produces an exact-head handoff, not a claim of success. These are illustrative steps; no actual cloud review was run for this fictional service. A real review record identifies the reviewer or tool, automated or human review type, exact head, scope and coverage, outcome, and remaining findings. For this example those fields are not applicable because no review occurred.
 
 ## 6. Delivery and rollback
 
