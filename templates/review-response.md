@@ -17,6 +17,13 @@ Concise, value-redacted summary:
 
 Relevant source, behavior, or test without reproducing sensitive material:
 
+- Reviewer or tool identity:
+- Review type: automated / human
+- Scope and coverage:
+- Reviewed head:
+- Outcome: clean / findings / in progress
+- Remaining findings or limitations:
+
 ## Action
 
 - Smallest correction or evidence-based explanation:

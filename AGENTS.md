@@ -40,6 +40,7 @@ Policy: `implementation-review-loop-v1`. Follow [project onboarding](docs/projec
 - Cross-repository playbook maintenance requires a material reusable gap and authorization for that work. Project-specific guidance changes alone do not require a playbook PR; never propagate private project details.
 - For authorized publication, validate and document the change, push normal commits, open a ready PR, and verify the hosted diff. First inspect the configured automatic review, including Codex reactions on the PR body; request review only if no current cycle is running.
 - Evaluate all feedback, fix valid in-scope findings, validate/push, reply and resolve addressed threads, then obtain fresh completed review of the substantive head. A bot thumbs-up must be attributable to that head; eyes, stale reactions, and silence are not clean review.
+- For each completed review, record the reviewer or tool identity, whether the review was automated or human, the exact reviewed head, scope and coverage, outcome, and remaining findings. A completed clean automated review is evidence of that recorded automated outcome, not proof of human inspection. Record any actual human inspection or acceptance separately.
 - Incorrect findings need evidence before resolution; ambiguous or disputed security findings remain open. Use bounded waits and an exact-head handoff when review is unavailable.
 - Leave clean PRs for human review unless GitHub merging is explicitly authorized. Never self-approve or bypass repository requirements.
 
