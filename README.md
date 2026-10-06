@@ -1,6 +1,6 @@
 # AI-Assisted Engineering Playbook
 
-Reusable guidance and tested utilities for scoped AI-assisted software delivery, with clear distinctions between automated checks, agent review, and human inspection.
+This playbook documents reusable AI-assisted software-engineering workflows for scoped coding-agent tasks, automated validation and pull-request review.
 
 > **Maintained**
 >
