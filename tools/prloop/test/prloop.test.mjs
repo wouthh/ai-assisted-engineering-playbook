@@ -936,6 +936,14 @@ test('a passed gate is cached by exact clean head, repository and command: no se
   assert.equal(count(), 3);
   assert.equal((await readyGate({ branch: 'feat', head }, { ...cfg, gate: 'false', forceGate: true }, r.work, deps)).ok, false);
   assert.equal(isTested(head, r.work), false); // a failed forced rerun withdraws the mark
+  const flaky = `${gate}; test ! -e "${join(r.dir, 'fail')}"`; // one command that passes, then fails
+  await readyGate({ branch: 'feat', head }, { ...cfg, gate: flaky }, r.work, deps);
+  assert.equal(gatePassed(flaky, r.work), head);
+  writeFileSync(join(r.dir, 'fail'), '');
+  assert.equal((await readyGate({ branch: 'feat', head }, { ...cfg, gate: flaky, forceGate: true }, r.work, deps)).ok, false);
+  assert.equal(gatePassed(flaky, r.work), null); // ...and its cached pass, so a plain ready reruns it
+  assert.equal((await readyGate({ branch: 'feat', head }, { ...cfg, gate: flaky }, r.work, deps)).ok, false);
+  assert.equal(count(), 6);
   writeFileSync(join(r.work, 'scratch.txt'), 'x\n');
   assert.equal(gatePassed(gate, r.work), null); // a dirty tree never hits
   rmSync(join(r.work, 'scratch.txt'));
@@ -950,7 +958,7 @@ test('a passed gate is cached by exact clean head, repository and command: no se
   head = r.run(r.work, 'rev-parse', 'HEAD');
   assert.equal(gatePassed(gate, r.work), null); // the head changed
   await readyGate({ branch: 'feat', head }, { ...cfg, gate }, r.work, deps);
-  assert.equal(count(), 4);
+  assert.equal(count(), 7);
   // A gate the caller ran itself is recorded by mark-tested --gate, so ready does not rerun it.
   const other = 'npm test';
   const res = spawnSync(process.execPath, [PRLOOP, 'mark-tested', '--gate', other], { cwd: r.work, encoding: 'utf8', env: { ...process.env, PRLOOP_LOCK_TOKEN: '' } });
