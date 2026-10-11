@@ -687,7 +687,7 @@ export async function runAll(opts, cfg) {
     if (!slot()) return;
     const trigger = s.verdict === 'timeout' ? 'timeout' : s.verdict === 'not_requested' ? 'not_requested'
       : s.unresolvedThreads.some((x) => isLocal(x.body)) ? 'local_review' : 'findings';
-    return fix(st, s, cwd, { verdict: s.verdict, trigger, findings: s.unresolvedThreads, missing: s.reasons });
+    return fix(st, s, cwd, { verdict: s.verdict, trigger, findings: s.unresolvedThreads, missing: [...s.reasons, ...localGate(s, cwd)] });
   }
 
   for (;;) {
