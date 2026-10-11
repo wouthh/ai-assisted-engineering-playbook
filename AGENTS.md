@@ -22,11 +22,12 @@ python3 -m unittest discover -s tests -v
 python3 -m unittest discover -s examples/fictional-order-service/tests -v
 bash -n scripts/repo-preflight.sh
 ./scripts/repo-preflight.sh --help
-python3 -m py_compile scripts/check-change-scope.py scripts/check-report-redaction.py examples/fictional-order-service/src/order_rules.py
+python3 -m py_compile scripts/check-change-scope.py scripts/check-report-redaction.py scripts/git-identity-guard.py examples/fictional-order-service/src/order_rules.py
 python3 scripts/check-change-scope.py --help
 python3 scripts/check-report-redaction.py --help
 node --test
 ./bin/prloop --help
+python3 scripts/git-identity-guard.py --help
 git diff --check
 git diff --cached --check
 ```
