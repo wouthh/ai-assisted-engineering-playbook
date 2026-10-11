@@ -560,6 +560,14 @@ test('run --status shows each PR\'s last events from its run log, also legacy li
   assert.deepEqual(st.prs[0].events.map((e) => e.phase), ['p1', 'p2', 'p3', 'p4', 'p5']); // not PR 8, not the other repo
 });
 
+test('run --status ignores repo-less lines in logs the state does not name', (t) => {
+  const dir = tempState(t);
+  writeFileSync(join(dir, 'example-org__example-repo__7.json'), JSON.stringify({ repo: 'example-org/example-repo', pr: 7, phase: 'waiting' })); // legacy: no log
+  writeFileSync(join(dir, 'run-2026-01-02T10-00-00-000Z.jsonl'), '{"pr":7,"phase":"other"}\n'); // could be any repo's PR 7
+  writeFileSync(join(dir, 'run-2026-01-01T10-00-00-000Z.jsonl'), '{"repo":"example-org/example-repo","pr":7,"phase":"mine"}\n');
+  assert.deepEqual(runStatus('example-org/example-repo').prs[0].events.map((e) => e.phase), ['mine']);
+});
+
 test('reset-rounds resets the counter once, logs it, and refuses a second reset', (t) => {
   const dir = tempState(t);
   writeFileSync(join(dir, 'example-org__example-repo__7.json'), JSON.stringify({ repo: 'example-org/example-repo', pr: 7, phase: 'blocked', rounds: 7, seen: { a: ['T1'] } }));
@@ -573,6 +581,7 @@ test('configuration errors are JSON errors, and an unknown --agent is rejected',
   assert.throws(() => config({ agent: 'nonee' }, {}), /--agent must be claude, codex or none/);
   assert.throws(() => config({}, { PRLOOP_AGENT: 'Claude' }), /--agent must be/);
   assert.throws(() => config({ maxLocalReviews: 'three' }, {}), /--max-local-reviews must be/);
+  assert.throws(() => config({ maxRounds: '9'.repeat(400) }, {}), /--max-rounds must be a positive integer/); // Infinity
   assert.throws(() => config({}, { PRLOOP_MAX_LOCAL_REVIEWS: '-1' }), /--max-local-reviews must be/);
   assert.equal(config({ maxLocalReviews: '0' }, {}).maxLocal, 0);
   for (const [k, v] of [['maxRounds', 'eight'], ['maxRounds', 'Infinity'], ['maxRounds', '0'], ['maxAgents', '0'], ['maxAgents', '1.5'],

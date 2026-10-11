@@ -68,9 +68,9 @@ export function parseDuration(s, name = 'duration') {
   return ms;
 }
 
-// NaN or Infinity would make a cap check never trip, and zero agents would never start one.
+// NaN or Infinity (a long digit string) would make a cap check never trip, and zero agents would never start one.
 const positiveInt = (name, v) => {
-  if (!/^\d+$/.test(String(v)) || !(Number(v) > 0)) throw new Error(`--${name} must be a positive integer, not ${v}`);
+  if (!/^\d+$/.test(String(v)) || !(Number(v) > 0) || !Number.isSafeInteger(Number(v))) throw new Error(`--${name} must be a positive integer, not ${v}`);
   return Number(v);
 };
 
@@ -867,10 +867,10 @@ export function runStatus(repoFilter, last = 5) {
   const prs = files.filter((f) => /__\d+\.json$/.test(f)).map((f) => JSON.parse(readFileSync(join(dir, f), 'utf8')))
     .filter((st) => !repoFilter || st.repo === repoFilter)
     .map((st) => {
-      // The state names its run log; older log lines carry no repo, so match them by PR number within that log.
-      const mine = (e) => e.pr === st.pr && (e.repo ?? st.repo) === st.repo;
+      // The state names its run log; older log lines carry no repo, so trust them only within that log.
+      const mine = (f) => (e) => e.pr === st.pr && (f === st.log ? (e.repo ?? st.repo) : e.repo) === st.repo;
       let events = [];
-      for (const f of [st.log, ...logs].filter(Boolean)) if ((events = read(f).filter(mine)).length) break;
+      for (const f of [st.log, ...logs].filter(Boolean)) if ((events = read(f).filter(mine(f))).length) break;
       return { repo: st.repo, pr: st.pr, phase: st.phase, head: short(st.head), rounds: st.rounds, roundResets: st.roundResets, reason: st.reason, next: st.next,
         updatedAt: st.updatedAt, carry: st.carry, events: events.slice(-last) };
     });
