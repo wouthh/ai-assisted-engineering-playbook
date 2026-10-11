@@ -889,6 +889,48 @@ export function createReviewPolicy({
   return policy;
 }
 
+const CURRENT_REQUEST_STATUSES = new Set([
+  "reserved",
+  "confirmed",
+  "timed_out",
+  "legacy_adopted_pending",
+  "clear",
+  "findings",
+]);
+
+// A persisted request must be well-formed, bound to the cycle pointer, and a
+// terminal result must match its charged generation (or be an uncharged
+// adopted legacy request).
+function assertCurrentRequest(policy) {
+  const request = policy.current_request;
+  if (request === null || request === undefined) {
+    if (policy.current_request_cycle_id !== null && policy.current_request_cycle_id !== undefined) {
+      throw new Error("state_corruption: current_request_cycle_id has no current_request");
+    }
+    return;
+  }
+  requirePlainObject(request, "review policy current_request");
+  if (!CURRENT_REQUEST_STATUSES.has(request.status)) {
+    throw new Error("state_corruption: current_request status is unsupported");
+  }
+  const cycleId = requireMarkerToken(request.cycle_id, "current_request.cycle_id");
+  requireMarkerToken(request.head_sha, "current_request.head_sha");
+  if (policy.current_request_cycle_id !== cycleId) {
+    throw new Error("state_corruption: current_request does not match current_request_cycle_id");
+  }
+  if (request.status === "clear" || request.status === "findings") {
+    const generation = policy.external_review_generations.find(
+      (candidate) => candidate.cycle_id === cycleId,
+    );
+    const bound = generation
+      ? generation.head_sha === request.head_sha && generation.status === request.status
+      : request.budget_charged === false;
+    if (!bound) {
+      throw new Error("state_corruption: terminal current_request has no matching generation");
+    }
+  }
+}
+
 export function assertReviewPolicy(
   policy,
   { allowLegacyIdentity = false } = {},
@@ -1064,6 +1106,7 @@ export function assertReviewPolicy(
     throw new Error("state_corruption: owner_overrides must be an array");
   }
   assertOwnerOverrideLedger(policy);
+  assertCurrentRequest(policy);
   if (!Array.isArray(policy.legacy_request_evidence)) {
     throw new Error(
       "state_corruption: legacy_request_evidence must be an array",
