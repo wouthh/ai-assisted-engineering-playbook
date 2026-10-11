@@ -1015,6 +1015,37 @@ test('sync linearizes a branch with merge commits on a rebase-only repository an
   assert.equal(syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head: v.head, settings: { merge: false, squash: false } }).verdict, 'up_to_date');
 });
 
+test('sync refuses to linearize when a merge commit carries its own edits', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.commit('feature', { 'app.txt': 'feature\n' });
+  divergeOnMain(r, { 'log.csv': 'id\na\nbase\n' });
+  r.run(r.work, 'merge', '-q', '--no-commit', 'main');
+  writeFileSync(join(r.work, 'merge-only.txt'), 'x\n'); // an edit that exists only in the merge commit
+  r.run(r.work, 'add', '.');
+  r.run(r.work, 'commit', '-qm', 'merge main');
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: false, squash: false } });
+  assert.equal(v.verdict, 'error', JSON.stringify(v));
+  assert.match(v.error, /drop changes made in merge commits/);
+  assert.deepEqual([r.run(r.work, 'rev-parse', 'HEAD'), r.run(r.work, 'rev-parse', 'origin/feat')], [head, head]);
+  assert.equal(r.run(r.work, 'status', '--porcelain'), '');
+});
+
+test('status and a local review count only the configured gate\'s pass as tested', async (t) => {
+  tempState(t);
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  markTested(head, r.work); // a generic marker, not a pass of the configured gate
+  const s = { pr: 7, branch: 'feat', head, base: 'main', unresolvedThreads: [] };
+  const v = await localReview('example-org/example-repo', s, { ...cfg, gate: 'npm test' }, r.work);
+  assert.equal(v.verdict, 'not_requested');
+  assert.match(v.missing.join(), /not marked tested/);
+});
+
 test('validation state edits are serialized: a writer waits for a live lock and takes over a dead one', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'prloop-edit-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
