@@ -134,7 +134,24 @@ export function fetchPr(repo, pr) {
   const out = ghRetry( ['api', 'graphql', '-f', `query=${PR_QUERY}`, '-F', `owner=${owner}`, '-F', `name=${name}`, '-F', `pr=${pr}`]);
   const { viewer, repository: r } = JSON.parse(out).data;
   if (!r?.pullRequest) throw new Error(`PR ${repo}#${pr} not found`);
-  return { ...r.pullRequest, viewer, repoSettings: { merge: r.mergeCommitAllowed, squash: r.squashMergeAllowed, rebase: r.rebaseMergeAllowed } };
+  return { ...r.pullRequest, viewer, headSeenAt: headSeenAt(r.pullRequest.headRefOid),
+    repoSettings: { merge: r.mergeCommitAllowed, squash: r.squashMergeAllowed, rebase: r.rebaseMergeAllowed } };
+}
+
+// When prloop first saw each head. GitHub exposes no push time, and a fast-forward to an older commit
+// keeps an old committer date, so this local observation is the lower bound for current-head evidence.
+// It errs safe: a signal posted before prloop first saw the head is ignored, costing at most a re-request.
+function headSeenAt(sha) {
+  const f = join(stateDir(), 'heads.json');
+  let seen = {};
+  try { seen = JSON.parse(readFileSync(f, 'utf8')); } catch { /* first use */ }
+  if (!seen[sha]) {
+    seen[sha] = new Date().toISOString();
+    seen = Object.fromEntries(Object.entries(seen).sort((a, b) => a[1].localeCompare(b[1])).slice(-500)); // bounded
+    mkdirSync(stateDir(), { recursive: true });
+    writeFileSync(f, JSON.stringify(seen));
+  }
+  return seen[sha];
 }
 
 // ---------- pure classification (tested with fixtures) ----------
@@ -162,9 +179,9 @@ export const localCleanBody = (head) => `${LOCAL} No issues found on ${head}.`;
 // - outdated threads stay unresolved until someone resolves them: an outdated anchor is not a fix.
 export function classify(pr, cfg, nowMs = Date.now()) {
   const head = pr.headRefOid;
-  // ponytail: GitHub exposes no push time. A force-push event covers a head replaced by an older
-  // commit; a fast-forward to a commit dated before an existing request is still not detected.
-  const headTime = [pr.commits.nodes[0]?.commit.committedDate, pr.timelineItems?.nodes[0]?.createdAt]
+  // GitHub exposes no push time: take the latest of the commit date, the last force-push and when prloop
+  // first saw this head, so an older commit that becomes the head cannot inherit earlier signals.
+  const headTime = [pr.commits.nodes[0]?.commit.committedDate, pr.timelineItems?.nodes[0]?.createdAt, pr.headSeenAt]
     .filter(Boolean).sort().at(-1) ?? '1970-01-01T00:00:00Z';
   if (pr.reviewThreads.pageInfo?.hasNextPage) throw new Error('more than 100 review threads: prloop cannot see them all, so it fails closed');
   // Local review output counts only from the authenticated user who posts it; anyone can type the prefix.
@@ -328,11 +345,13 @@ export function fetchBase(cwd, base, baseOid, remote = 'origin') {
 }
 
 export function syncBranch({ cwd, branch, base, baseOid, head, settings, union = [], remote = 'origin' }) {
+  // A fork PR's branch usually tracks its own remote; push there, not to the base repository.
+  const headRemote = tryGit(['config', `branch.${branch}.remote`], cwd) || remote;
   if (tryGit(['branch', '--show-current'], cwd) !== branch) return { verdict: 'error', error: `run sync inside a checkout of ${branch}` };
   if (dirty(cwd)) return { verdict: 'error', error: 'working tree is not clean' };
   const baseError = fetchBase(cwd, base, baseOid, remote);
   if (baseError) return { verdict: 'error', error: baseError };
-  tryGit(['fetch', '--quiet', remote, branch], cwd);
+  tryGit(['fetch', '--quiet', headRemote, branch], cwd);
   if (git(['rev-parse', 'HEAD'], cwd) !== head) return { verdict: 'error', error: `local HEAD differs from remote PR head ${short(head)}: push or pull first` };
   if (tryGit(['merge-base', '--is-ancestor', `${remote}/${base}`, 'HEAD'], cwd) !== null) return { verdict: 'up_to_date', head };
   // ponytail: merge whenever merge or squash merges are allowed; rebase only for rebase-only repos.
@@ -354,7 +373,7 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
     step([rebase ? 'rebase' : 'merge', '--abort']);
     return { verdict: 'error', error: `${rebase ? 'rebase' : 'merge'} failed` };
   }
-  const push = rebase ? ['push', `--force-with-lease=${branch}:${head}`, remote, `HEAD:${branch}`] : ['push', remote, `HEAD:${branch}`];
+  const push = rebase ? ['push', `--force-with-lease=${branch}:${head}`, headRemote, `HEAD:${branch}`] : ['push', headRemote, `HEAD:${branch}`];
   if (!step(push)) return { verdict: 'error', error: 'push failed; the branch is updated locally only' };
   clearTested(cwd);
   const newHead = git(['rev-parse', 'HEAD'], cwd);
@@ -515,10 +534,14 @@ export function recordFindings(seen, findings) {
 
 export const DENIED = /permission (was |has been )?denied|denied permission|not (been )?permitted|requires? (your )?approval/i;
 
+// Comment text without badges, HTML, markdown emphasis and the reviewer's boilerplate footer.
+export const plain = (body) => String(body ?? '').replace(/\n+(AGENTS\.md reference|Useful\? React)[\s\S]*$/, '')
+  .replace(/!\[[^\]]*\]\([^)]*\)/g, '').replace(/<[^>]+>/g, '').replace(/[*_`#>]/g, '').replace(/\s+/g, ' ').trim();
+
 // The fix agent sees only this trigger, never the round history.
 export function buildPrompt(t) {
   const data = t.trigger === 'conflict' ? `Conflicted files: ${t.conflicts.join(', ')}`
-    : t.findings?.length ? `Findings:\n${t.findings.map((f) => `- ${f.id} ${f.path ?? ''}:${f.line ?? ''} ${f.body.replace(/\s+/g, ' ').slice(0, 600)}`).join('\n')}`
+    : t.findings?.length ? `Findings:\n${t.findings.map((f) => `- ${f.id} ${f.path ?? ''}:${f.line ?? ''} ${plain(f.body).slice(0, 600)}`).join('\n')}`
       : `Missing: ${(t.missing ?? []).join('; ') || 'a review request on the current head'}`;
   const request = t.localReview
     ? 'Do not post a review request: prloop reviews this PR locally once `prloop ready` passes.'
@@ -620,6 +643,7 @@ export async function runAll(opts, cfg) {
     const prompt = buildPrompt(t);
     if (cfg.agent === 'none') return event(st, 'needs_agent', { verdict: v.verdict, prompt, next: 'spawn an agent with this prompt, then rerun prloop run' });
     event(st, 'agent', { verdict: v.verdict });
+    const testedBefore = isTested(s.head, cwd);
     const r = await runFixAgent(cfg, prompt, cwd);
     const result = parseAgentResult(r.final);
     if (DENIED.test(`${r.final}\n${r.stderr}`)) return block(st, 'the agent reported a permission denial');
@@ -631,7 +655,7 @@ export async function runAll(opts, cfg) {
     if (result.status === 'blocked') return block(st, `agent: ${result.reason ?? 'blocked'}`);
     const after = classify(fetchPr(repo, st.pr), cfg);
     const progressed = after.head !== s.head || after.unresolvedThreads.length < s.unresolvedThreads.length
-      || after.trigger?.id !== s.trigger?.id || isTested(after.head, cwd) !== isTested(s.head, cwd);
+      || after.trigger?.id !== s.trigger?.id || (!testedBefore && isTested(after.head, cwd));
     if (!progressed) return block(st, `agent made no progress (${result.status}): no commit, resolved thread, request or gate`);
     event(st, 'polling', { status: result.status });
   }
@@ -675,7 +699,7 @@ export async function runAll(opts, cfg) {
       const missing = cwd ? localGate(s, cwd) : [`no worktree for ${s.branch} to confirm the head was tested; pass --worktree`];
       if (!cwd) return block(st, missing[0]);
       if (missing.length) return slot() && fix(st, s, cwd, { verdict: 'not_tested', trigger: 'not_requested', missing,
-        note: 'The head is already reviewed clean: run the gate only and skip the review request (report status nothing_to_do).' });
+        note: 'The head is already reviewed clean and only needs the gate: run `prloop ready`, which runs the gate and marks the head tested, then reports that the head is already reviewed clean. That report is expected: skip the review request and report status nothing_to_do.' });
       if (s.mergeable !== 'MERGEABLE') return s.mergeable === 'UNKNOWN' ? undefined : block(st, `GitHub reports mergeable=${s.mergeable}`);
       sh('gh', ['pr', 'merge', String(st.pr), '--repo', repo, `--${opts.merge}`, '--match-head-commit', s.head]);
       const after = classify(fetchPr(repo, st.pr), cfg);

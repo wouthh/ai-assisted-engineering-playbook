@@ -54,28 +54,30 @@ State what each command proves and which environment is authoritative.
 
 ## PR review loop
 
-Install [`prloop`](https://github.com/wouthh/ai-assisted-engineering-playbook/tree/main/tools/prloop) on `PATH` (a symlink to `bin/prloop` is enough). It does the polling, gating and syncing as a plain script so agents spend tokens only on real work. Remove this section if the project does not use an automated reviewer.
+Install [`prloop`](https://github.com/wouthh/ai-assisted-engineering-playbook/tree/main/tools/prloop) on `PATH` (a symlink to `bin/prloop` is enough). A plain script does the polling, gating and syncing, so model tokens go only to real work. Remove this section if the project does not use an automated reviewer.
 
-Recommended: the coordinator starts one background supervisor for its PRs and checks in rarely.
+### Coordinator
 
-```text
-prloop run --repo <owner/name> --pr <N,...> --gate "<full local gate>" &
-prloop run --status --repo <owner/name>
-```
+- Group ready PRs into one batch and start the supervisor once, in the background: `prloop run --repo <owner/name> --pr <N,...> --gate "<full local gate>" --max-agents 2 &`.
+- Check `prloop run --status --repo <owner/name>` only on a notification or every 20-30 minutes or more, never in a tight loop.
+- Act only on the final summary or on `blocked`, `needs_human` and `needs_agent` items. Never poll GitHub or wait for reviews yourself.
+- Cap parallel load with `--max-agents`, and keep this file and shared templates current when the workflow changes.
 
-It spawns a fresh fix agent only for findings, a conflict, a missing or timed-out review request, or a local-review gap. A fix agent does one step and exits:
+### Fix agent (one session, one step)
 
 1. Read only the referenced files plus this file.
 2. Fix each valid finding with a regression test; reply with evidence on invalid ones and leave them unresolved; resolve conflicts.
 3. Run focused tests, then commit and push normally (`prloop sync <pr>` first if the base moved).
 4. Resolve the fixed threads; reply on disputed ones.
-5. `prloop ready <pr>`: it runs the gate and marks the head tested. After a gate failure, rerun the failing tests or step with their focused command and fix them before calling `prloop ready` again (at most 5 calls).
+5. `prloop ready <pr>` runs the gate and marks the head tested. After a gate failure, rerun the failing tests or step with their focused command and fix them, including failures you did not cause, before calling `prloop ready` again. At most 5 calls; stop as blocked only when the same failure survives 3 consecutive fixes or the cause is environmental (missing tool, no network, permission denied).
 6. Post the review request once, reusing the previous request body.
 7. Exit with one JSON line: `{"status":"requested|blocked|nothing_to_do","head":"…","fixed":[…],"disputed":[…],"reason":"…"}`.
 
-Without a supervisor, run the same steps yourself and then `prloop wait <pr>`, acting on its verdict: `clean` (0) stop; `findings` (10) start again at step 1; `not_requested` (20) step 5; `requested_while_unresolved` (21) step 4; `timeout` (30) repost `rerequestBody` after `prloop ready`; `unavailable` (31) report or use `--reviewer local`; `error` (40) report.
+Never wait for or poll reviews, merge, touch other PRs, rewrite history except through `prloop sync`, or retry in a loop. A permission denial or missing tool means stop as blocked.
 
-Failsafes: stop and report on `blocked`, `needs_human` or `error`, on the round limit (default 8), when the same finding returns after two fixes, or when the same gate failure survives 3 consecutive fixes or is environmental (missing tool, no network, permission denied). Never poll reviews yourself, never post a second request while one runs on the same head, never retry in a loop.
+### Manual mode (one agent, no supervisor)
+
+Run the fix-agent steps, then `prloop wait <pr>` and act on its verdict: `clean` (0) stop; `findings` (10) start again at step 1; `not_requested` (20) step 5; `requested_while_unresolved` (21) step 4; `timeout` (30) repost `rerequestBody` after `prloop ready`; `unavailable` (31) report or use `--reviewer local`; `blocked` (50) or `error` (40) stop and report. Use `prloop status <pr>` for a one-off look.
 
 ## Instruction maintenance
 
