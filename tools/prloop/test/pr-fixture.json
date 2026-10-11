@@ -66,5 +66,8 @@
   },
   "reactions": {
     "nodes": []
+  },
+  "viewer": {
+    "login": "example-dev"
   }
 }
