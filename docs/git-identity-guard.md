@@ -2,7 +2,7 @@
 
 `scripts/git-identity-guard.py` is a global Git hook that refuses commits, merges, patches and pushes when they would record an unexpected author or committer email, or when a commit message contains an email address that is not on an allowlist. It is useful when AI coding agents commit on your behalf: agents can inherit the wrong identity from a sandbox or tool default, and some add co-author trailers with their own address.
 
-The guard only reads Git state and exits non-zero to refuse. It never changes configuration, identities or commits, and it needs only Python's standard library and a Git release that supports configuration-based hooks (`hook.<name>.command`; check with `git help config`).
+The guard only reads Git state and exits non-zero to refuse. It never changes configuration, identities or commits, and it needs only Python's standard library and a Git release that supports configuration-based hooks. Older releases accept the `hook.<name>.*` keys but silently ignore them; after installing, confirm that `git hook list commit-msg` names the guard.
 
 ## What it checks
 
@@ -12,11 +12,13 @@ Identity mode (default):
 - the effective author and committer identity (`git var`), which includes `GIT_AUTHOR_*` and `GIT_COMMITTER_*` environment overrides;
 - author metadata preserved by cherry-pick and rebase, read from raw commit headers and Git's operation files without executing them.
 
-Commit message mode (`--commit-msg FILE`) runs the identity checks and then refuses any email address in the message that is not allowed. Comment lines and everything below the scissors line are ignored, as Git does. Allowed addresses are:
+Commit message mode (`--commit-msg FILE`) runs the identity checks and then refuses any email address in the message that is not allowed. Every line is checked, including comment lines: a hook cannot tell whether Git will strip them, and `git commit -m` keeps them. As a consequence, `git commit -v` is refused when the included diff contains an address that is not allowed. Allowed addresses are:
 
 - the configured `expected_email` and any `allowed_message_emails`;
 - GitHub's generic `noreply` and `support` addresses and `users.noreply.github.com` addresses;
 - reserved documentation domains: `example.com`, `example.net`, `example.org`, and names ending in `.example`, `.invalid` or `.test`.
+
+Push mode (`--pre-push`) runs the identity checks and then reads the update list Git supplies on standard input. Every outgoing commit that no remote-tracking branch already contains must have the expected author and committer email and an allowed message. Commits that other people wrote are accepted once they are reachable from a remote-tracking branch, so fetch them into one before pushing a branch that contains them.
 
 A repository whose Git directory is under `/tmp`, `/var/tmp` or `$TMPDIR`, and which has no remote URL, is treated as disposable and skipped. Test suites that create throwaway repositories with synthetic identities therefore keep working. `$TMPDIR` is ignored when it is your home directory or one of its parents. Worktrees of real repositories keep their Git directory elsewhere and stay guarded.
 
@@ -35,19 +37,25 @@ The guard reads `$GIT_IDENTITY_GUARD_CONFIG` if set, otherwise `$XDG_CONFIG_HOME
 
 ## Installation
 
-Copy the script to a stable location, write the configuration, then register two configured hooks in your global Git configuration:
+Copy the script to a stable location, write the configuration, then register three configured hooks in your global Git configuration:
 
 ```bash
 install -D -m 755 scripts/git-identity-guard.py ~/.local/lib/git-identity-guard/git-identity-guard.py
 
 git config --global hook.identity-guard.command ~/.local/lib/git-identity-guard/git-identity-guard.py
-for event in pre-commit pre-merge-commit pre-applypatch prepare-commit-msg pre-push; do
+for event in pre-commit pre-merge-commit pre-applypatch prepare-commit-msg; do
   git config --global --add hook.identity-guard.event "$event"
 done
 
 git config --global hook.identity-message-guard.command "$HOME/.local/lib/git-identity-guard/git-identity-guard.py --commit-msg"
-git config --global hook.identity-message-guard.event commit-msg
+git config --global --add hook.identity-message-guard.event commit-msg
+git config --global --add hook.identity-message-guard.event applypatch-msg
+
+git config --global hook.identity-push-guard.command "$HOME/.local/lib/git-identity-guard/git-identity-guard.py --pre-push"
+git config --global hook.identity-push-guard.event pre-push
 ```
+
+`commit-msg` covers `git commit` and `git merge`; `applypatch-msg` covers patches applied with `git am`.
 
 Configured hooks run in addition to `core.hooksPath` and repository hooks, so existing project hooks keep working. Check the setup with `git hook run commit-msg -- <message-file>` in a repository, or by committing a test message in a scratch repository that has a remote URL.
 
@@ -55,11 +63,11 @@ Configured hooks run in addition to `core.hooksPath` and repository hooks, so ex
 
 This is an accident guard, not a security boundary.
 
-- `git commit --no-verify` skips `pre-commit` and `commit-msg`, so message checks are bypassed. `prepare-commit-msg` still runs the identity checks.
+- `git commit --no-verify` skips `pre-commit` and `commit-msg`, so message checks are bypassed at commit time. `prepare-commit-msg` still runs the identity checks, and the push check inspects the outgoing commits unless `git push --no-verify` is used too.
 - Anyone who can edit their own Git configuration, the script or the configuration file can disable the guard.
 - Commits created on a hosting platform, such as a squash merge in the GitHub web interface, never run local hooks. Review the merge message there, or enforce the rule in a server-side check.
 - The message check looks for email addresses only. It does not judge trailer names or other attribution text.
 
 ## Rollback
 
-Remove the two hooks with `git config --global --unset-all hook.identity-guard.event`, `git config --global --unset hook.identity-guard.command` and the same commands for `hook.identity-message-guard`. Then delete the installed script and, if you no longer need it, the configuration file.
+Remove the hooks with `git config --global --remove-section hook.identity-guard`, and the same command for `hook.identity-message-guard` and `hook.identity-push-guard`. Then delete the installed script and, if you no longer need it, the configuration file.

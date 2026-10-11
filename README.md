@@ -101,7 +101,7 @@ git config --global hook.identity-message-guard.command \
   "$HOME/.local/lib/git-identity-guard/git-identity-guard.py --commit-msg"
 ```
 
-A global Git hook that refuses commits, merges, patches, and pushes recording an unexpected author or committer email, and commit messages containing email addresses outside an allowlist, such as co-author trailers added by coding agents. Personal values come from a private configuration file, never from the script. Throwaway test repositories in temporary storage without a remote URL are skipped. It is an accident guard: `--no-verify` and hosting-platform merges bypass it. See [the Git identity guard guide](docs/git-identity-guard.md) for installation, configuration, and limits.
+A global Git hook that refuses commits, merges, patches, and pushes recording an unexpected author or committer email, and commit, patch, and outgoing commit messages containing email addresses outside an allowlist, such as co-author trailers added by coding agents. Personal values come from a private configuration file, never from the script. Throwaway test repositories in temporary storage without a remote URL are skipped. It is an accident guard: `--no-verify` and hosting-platform merges bypass it. See [the Git identity guard guide](docs/git-identity-guard.md) for installation, configuration, and limits.
 
 The inspection utilities and the Git identity guard use only Bash, Python's standard library, and Git; `prloop` uses Node.js, Git and the GitHub CLI. Tests create temporary synthetic repositories or use fixture JSON and never contact the network.
 

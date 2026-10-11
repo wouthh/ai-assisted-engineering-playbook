@@ -7,7 +7,9 @@ refuses; it never changes configuration, identities, or commits.
 Identity mode (default) checks configured and effective author and committer
 emails, plus author metadata preserved by cherry-pick and rebase. Commit
 message mode (--commit-msg FILE) additionally refuses email addresses in the
-message that are not on the allowlist, such as co-author trailers.
+message that are not on the allowlist, such as co-author trailers. Push mode
+(--pre-push) also checks the author, committer and message of every outgoing
+commit that no remote-tracking branch already contains.
 
 Private values live in a local JSON configuration file, never in this script:
 
@@ -31,12 +33,13 @@ import shlex
 import subprocess
 import sys
 
-USAGE = """usage: git-identity-guard.py [--commit-msg FILE] [HOOK-ARGUMENTS...]
+USAGE = """usage: git-identity-guard.py [--commit-msg FILE | --pre-push] [HOOK-ARGUMENTS...]
 
 Refuse Git operations whose identity or commit message email does not match
 the local guard configuration. Exits 0 when allowed and 1 when refused.
 
   --commit-msg FILE  also check email addresses in the commit message FILE
+  --pre-push         also check outgoing commits read from standard input
   -h, --help         show this help and exit
 
 Configuration: $GIT_IDENTITY_GUARD_CONFIG, or
@@ -44,11 +47,13 @@ $XDG_CONFIG_HOME/git-identity-guard/config.json, or
 ~/.config/git-identity-guard/config.json (see the module docstring)."""
 
 GIT = "git"
-# Avoid lock files, lazy fetches, and replacement objects while inspecting.
-ENV = dict(os.environ, GIT_OPTIONAL_LOCKS="0", GIT_NO_LAZY_FETCH="1",
-           GIT_NO_REPLACE_OBJECTS="1")
+# Avoid lock files, lazy fetches, and replacement objects while inspecting,
+# and drop inherited trace destinations so inspection never writes files.
+ENV = {name: value for name, value in os.environ.items()
+       if not name.startswith("GIT_TRACE")}
+ENV.update(GIT_OPTIONAL_LOCKS="0", GIT_NO_LAZY_FETCH="1", GIT_NO_REPLACE_OBJECTS="1")
+ZERO_OID = re.compile(r"0+")
 EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
-SCISSORS = re.compile(r"^. -+ >8 -+$")
 GITHUB_USER_NOREPLY = re.compile(
     r"(?:[1-9][0-9]*\+)?[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?"
     r"@users\.noreply\.github\.com")
@@ -198,23 +203,47 @@ def message_email_allowed(email: str, allowed: set[str]) -> bool:
             or GITHUB_USER_NOREPLY.fullmatch(lower) is not None)
 
 
+def check_message_text(text: str, allowed: set[str], label: str) -> None:
+    # Every line is checked: the hook cannot tell whether Git will strip
+    # comment lines (it keeps them for `git commit -m`, for example).
+    for number, line in enumerate(text.splitlines(), start=1):
+        for email in EMAIL.findall(line):
+            if not message_email_allowed(email, allowed):
+                raise Refusal(f"{label} line {number} contains email "
+                              f"{email!r}, which is not on the allowlist")
+
+
 def check_message(path: pathlib.Path, allowed: set[str]) -> None:
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         raise Refusal("could not read the commit message") from exc
-    comment = git("config", "--get", "core.commentChar", missing_ok=True) or "#"
-    comment = comment if len(comment) == 1 else "#"
-    for number, line in enumerate(text.splitlines(), start=1):
-        # Git drops comment lines and everything below the scissors line.
-        if SCISSORS.match(line) and line.startswith(comment):
-            break
-        if line.startswith(comment):
-            continue
-        for email in EMAIL.findall(line):
-            if not message_email_allowed(email, allowed):
-                raise Refusal(f"commit message line {number} contains email "
-                              f"{email!r}, which is not on the allowlist")
+    check_message_text(text, allowed, "commit message")
+
+
+def check_outgoing(updates: str, config: dict) -> None:
+    """Check commits a push would publish that no remote-tracking ref has."""
+    expected = config["expected"]
+    for line in updates.splitlines():
+        fields = line.split()
+        if len(fields) != 4:
+            raise Refusal("could not parse the pre-push update list")
+        local_oid = fields[1]
+        if ZERO_OID.fullmatch(local_oid):
+            continue  # Branch deletion: nothing is published.
+        commits = git("rev-list", local_oid, "--not", "--remotes")
+        for commit in commits.split():
+            raw = git("cat-file", "commit", commit, raw=True)
+            header, _, body = raw.partition(b"\n\n")
+            for role in (b"author", b"committer"):
+                match = re.search(rb"^" + role + rb" .* <([^<>]*)> -?\d+ [+-]\d{4}$",
+                                  header, re.MULTILINE)
+                if not match:
+                    raise Refusal(f"could not parse {role.decode()} of commit {commit[:12]}")
+                require_email(f"commit {commit[:12]} {role.decode()}",
+                              match.group(1).decode("utf-8", "replace"), expected)
+            check_message_text(body.decode("utf-8", "replace"),
+                               config["message_allowed"], f"commit {commit[:12]} message")
 
 
 def main(argv: list[str]) -> int:
@@ -222,18 +251,24 @@ def main(argv: list[str]) -> int:
         print(USAGE)
         return 0
     message = None
+    push = argv[:1] == ["--pre-push"]
     if argv[:1] == ["--commit-msg"]:
         if len(argv) < 2:
             print("git-identity-guard: --commit-msg requires a file", file=sys.stderr)
             return 2
         message = pathlib.Path(argv[1])
     try:
+        # Read the push update list before any early return so Git never
+        # blocks writing to a hook that did not consume its input.
+        updates = sys.stdin.read() if push else ""
         if disposable_repository():
             return 0
         config = load_config()
         check_identity(config["expected"])
         if message is not None:
             check_message(message, config["message_allowed"])
+        if push:
+            check_outgoing(updates, config)
     except (Refusal, OSError, UnicodeError) as exc:
         print(f"Git identity guard: refusing this operation: {exc}.", file=sys.stderr)
         print("Use the configured email for user, author and committer settings "

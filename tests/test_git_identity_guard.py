@@ -14,6 +14,22 @@ ROOT = Path(__file__).resolve().parents[1]
 GUARD = ROOT / "scripts" / "git-identity-guard.py"
 EXPECTED = "12345+synthetic-user@users.noreply.github.com"
 OTHER = "someone@synthetic-mail.net"
+ZERO = "0" * 40
+
+
+def configured_hooks_supported(env: dict[str, str], repository: Path) -> bool:
+    """Older Git accepts hook.<name>.* keys but silently ignores them."""
+    subprocess.run(["git", "config", "hook.feature-probe.command", "true"],
+                   cwd=repository, env=env, check=True)
+    subprocess.run(["git", "config", "hook.feature-probe.event", "pre-commit"],
+                   cwd=repository, env=env, check=True)
+    try:
+        listed = subprocess.run(["git", "hook", "list", "pre-commit"], cwd=repository,
+                                env=env, text=True, capture_output=True)
+        return listed.returncode == 0 and "feature-probe" in listed.stdout
+    finally:
+        subprocess.run(["git", "config", "--remove-section", "hook.feature-probe"],
+                       cwd=repository, env=env, check=True)
 
 
 class GuardFixture(unittest.TestCase):
@@ -55,11 +71,19 @@ class GuardFixture(unittest.TestCase):
                               env=env or self.env, text=True, capture_output=True,
                               check=True)
 
-    def guard(self, *arguments: str, env: dict[str, str] | None = None
-              ) -> subprocess.CompletedProcess[str]:
+    def guard(self, *arguments: str, env: dict[str, str] | None = None,
+              stdin: str = "") -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(GUARD), *arguments],
                               cwd=self.repository, env=env or self.env, text=True,
-                              capture_output=True)
+                              capture_output=True, input=stdin)
+
+    def require_configured_hooks(self) -> None:
+        if not configured_hooks_supported(self.env, self.repository):
+            self.skipTest("this Git release ignores configured hooks")
+
+    def commit(self, message: str, env: dict[str, str] | None = None) -> str:
+        self.git("commit", "--quiet", "--allow-empty", "-m", message, env=env)
+        return self.git("rev-parse", "HEAD").stdout.strip()
 
     def message(self, text: str) -> str:
         path = self.base / "COMMIT_EDITMSG"
@@ -104,6 +128,13 @@ class IdentityTests(GuardFixture):
         self.write_config({"expected_email": "not-an-address"})
         self.assert_refused(self.guard(), "valid expected_email")
 
+    def test_inherited_trace_destinations_are_not_written(self) -> None:
+        trace = self.base / "trace.json"
+        env = {**self.env, "GIT_TRACE2_EVENT": str(trace), "GIT_TRACE": str(trace)}
+        result = self.guard(env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(trace.exists())
+
     def test_cherry_pick_source_author_is_checked(self) -> None:
         env = {**self.env, "GIT_AUTHOR_EMAIL": OTHER}
         self.git("commit", "--quiet", "--allow-empty", "-m", "synthetic", env=env)
@@ -130,14 +161,10 @@ class MessageTests(GuardFixture):
         result = self.guard("--commit-msg", path)
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_comments_and_scissors_content_are_ignored(self) -> None:
-        path = self.message(
-            "Add feature\n"
-            f"# Please enter the commit message {OTHER}\n"
-            "# ------------------------ >8 ------------------------\n"
-            f"diff mentions {OTHER}\n")
-        result = self.guard("--commit-msg", path, "message")
-        self.assertEqual(result.returncode, 0, result.stderr)
+    def test_comment_lines_are_checked(self) -> None:
+        # `git commit -m` keeps comment-prefixed lines in the stored message.
+        path = self.message(f"Add feature\n\n# Co-authored-by: Synthetic <{OTHER}>\n")
+        self.assert_refused(self.guard("--commit-msg", path, "message"), "line 3")
 
     def test_identity_is_also_checked_in_message_mode(self) -> None:
         self.git("config", "user.email", OTHER)
@@ -145,6 +172,7 @@ class MessageTests(GuardFixture):
         self.assert_refused(self.guard("--commit-msg", path), "user.email email")
 
     def test_configured_hook_blocks_commit(self) -> None:
+        self.require_configured_hooks()
         command = f"{shlex.quote(sys.executable)} {shlex.quote(str(GUARD))} --commit-msg"
         self.git("config", "hook.identity-guard.command", command)
         self.git("config", "hook.identity-guard.event", "commit-msg")
@@ -156,6 +184,55 @@ class MessageTests(GuardFixture):
         self.assertIn("not on the allowlist", refused.stderr)
         self.git("commit", "--quiet", "--allow-empty", "-m", "Add feature")
         self.assertEqual(self.git("rev-list", "--count", "HEAD").stdout.strip(), "1")
+
+
+    def test_configured_hook_blocks_patch_message(self) -> None:
+        self.require_configured_hooks()
+        self.commit("Base")
+        env = {**self.env, "GIT_AUTHOR_EMAIL": EXPECTED}
+        (self.repository / "file.txt").write_text("synthetic\n", encoding="utf-8")
+        self.git("add", "file.txt")
+        self.git("commit", "--quiet", "-m", "Add file",
+                 "-m", f"Co-authored-by: Synthetic <{OTHER}>", env=env)
+        patch = self.git("format-patch", "-1", "--stdout").stdout
+        self.git("reset", "--quiet", "--hard", "HEAD~1")
+        command = f"{shlex.quote(sys.executable)} {shlex.quote(str(GUARD))} --commit-msg"
+        self.git("config", "hook.identity-message-guard.command", command)
+        self.git("config", "hook.identity-message-guard.event", "applypatch-msg")
+        applied = subprocess.run(["git", "am"], cwd=self.repository, env=self.env,
+                                 text=True, capture_output=True, input=patch)
+        self.assertNotEqual(applied.returncode, 0)
+        self.assertIn("not on the allowlist", applied.stderr)
+        self.git("am", "--abort")
+
+
+class PushTests(GuardFixture):
+    def test_outgoing_commit_with_other_author_is_refused(self) -> None:
+        commit = self.commit("Add feature", env={**self.env, "GIT_AUTHOR_EMAIL": OTHER})
+        updates = f"refs/heads/main {commit} refs/heads/main {ZERO}\n"
+        self.assert_refused(self.guard("--pre-push", "origin", "url", stdin=updates),
+                            "author email")
+
+    def test_outgoing_commit_message_email_is_refused(self) -> None:
+        commit = self.commit(f"Add feature\n\nCo-authored-by: Synthetic <{OTHER}>")
+        updates = f"refs/heads/main {commit} refs/heads/main {ZERO}\n"
+        self.assert_refused(self.guard("--pre-push", "origin", "url", stdin=updates),
+                            "message line 3")
+
+    def test_clean_outgoing_commits_and_deletions_pass(self) -> None:
+        commit = self.commit("Add feature")
+        updates = (f"refs/heads/main {commit} refs/heads/main {ZERO}\n"
+                   f"(delete) {ZERO} refs/heads/old {commit}\n")
+        result = self.guard("--pre-push", "origin", "url", stdin=updates)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_commits_on_remote_tracking_branches_are_not_rechecked(self) -> None:
+        old = self.commit("Upstream", env={**self.env, "GIT_AUTHOR_EMAIL": OTHER})
+        self.git("update-ref", "refs/remotes/origin/main", old)
+        commit = self.commit("Add feature")
+        updates = f"refs/heads/main {commit} refs/heads/main {old}\n"
+        result = self.guard("--pre-push", "origin", "url", stdin=updates)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class DisposableRepositoryTests(GuardFixture):
