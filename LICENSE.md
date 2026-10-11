@@ -10,7 +10,7 @@ The following material is licensed under the Creative Commons Attribution 4.0 In
 
 The following material is licensed under the Apache License 2.0 in `LICENSES/Apache-2.0.txt`:
 
-- files under `scripts/` and `tests/`;
+- files under `scripts/`, `tests/`, `bin/` and `tools/`, except Markdown documentation;
 - source code and fixtures under `examples/`;
 - other files explicitly marked as software examples.
 
