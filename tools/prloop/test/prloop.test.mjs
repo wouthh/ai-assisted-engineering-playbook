@@ -44,6 +44,14 @@ test('a thumbs-up on an older request does not count', () => {
   assert.equal(s.readyToRequest, true);
 });
 
+test('not_requested names the configured trigger text', async () => {
+  const pr = fixture();
+  pr.comments.nodes = [];
+  const v = await waitFor('example-org/example-repo', 7, config({ trigger: '/review' }, {}), { interval: 1, fetch: () => pr, now: () => NOW });
+  assert.equal(v.verdict, 'not_requested');
+  assert.match(v.next, /no "\/review" comment after head 1111111/);
+});
+
 test('clean via a reviewer comment matching the clean regex', () => {
   const pr = fixture();
   pr.comments.nodes.push({ id: 'IC_bot', databaseId: 102, body: "Codex Review: Didn't find any major issues. Nice work.",
