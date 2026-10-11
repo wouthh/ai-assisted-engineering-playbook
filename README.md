@@ -97,8 +97,8 @@ Keeps PRs moving through an external reviewer bot with minimal model tokens: a p
 ### Git identity guard
 
 ```bash
-git config --global hook.identity-message-guard.command \
-  "$HOME/.local/lib/git-identity-guard/git-identity-guard.py --commit-msg"
+guard=$(printf '%q' "$HOME/.local/lib/git-identity-guard/git-identity-guard.py")
+git config --global hook.identity-message-guard.command "$guard --commit-msg"
 ```
 
 A global Git hook that refuses commits, merges, patches, and pushes recording an unexpected author or committer email, and commit, patch, and outgoing commit messages containing email addresses outside an allowlist, such as co-author trailers added by coding agents. Personal values come from a private configuration file, never from the script. Throwaway test repositories in temporary storage without a remote URL are skipped. It is an accident guard: `--no-verify` and hosting-platform merges bypass it. See [the Git identity guard guide](docs/git-identity-guard.md) for installation, configuration, and limits.

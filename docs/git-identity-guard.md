@@ -41,17 +41,19 @@ Copy the script to a stable location, write the configuration, then register thr
 
 ```bash
 install -D -m 755 scripts/git-identity-guard.py ~/.local/lib/git-identity-guard/git-identity-guard.py
+# Hook commands are run by a shell, so store a shell-quoted path.
+guard=$(printf '%q' "$HOME/.local/lib/git-identity-guard/git-identity-guard.py")
 
-git config --global hook.identity-guard.command ~/.local/lib/git-identity-guard/git-identity-guard.py
+git config --global hook.identity-guard.command "$guard"
 for event in pre-commit pre-merge-commit pre-applypatch prepare-commit-msg; do
   git config --global --add hook.identity-guard.event "$event"
 done
 
-git config --global hook.identity-message-guard.command "$HOME/.local/lib/git-identity-guard/git-identity-guard.py --commit-msg"
+git config --global hook.identity-message-guard.command "$guard --commit-msg"
 git config --global --add hook.identity-message-guard.event commit-msg
 git config --global --add hook.identity-message-guard.event applypatch-msg
 
-git config --global hook.identity-push-guard.command "$HOME/.local/lib/git-identity-guard/git-identity-guard.py --pre-push"
+git config --global hook.identity-push-guard.command "$guard --pre-push"
 git config --global hook.identity-push-guard.event pre-push
 ```
 
