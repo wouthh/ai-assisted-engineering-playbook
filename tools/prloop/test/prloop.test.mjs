@@ -530,7 +530,12 @@ test('a held worktree lock refuses ready, sync and mark-tested unless the caller
   assert.equal(cli(['mark-tested'], { PRLOOP_LOCK_TOKEN: 'wrong' }).status, 40);
   assert.equal(cli(['mark-tested'], { PRLOOP_LOCK_TOKEN: lock.token }).status, 0);
   assert.equal(takeLock(r.work, 'another run').holder.pid, process.pid);
+  const st = spawnSync(process.execPath, [PRLOOP, 'lock-status', r.work], { encoding: 'utf8' });
+  assert.equal(st.status, 50);
+  assert.deepEqual(pick(JSON.parse(st.stdout), ['locked']), { locked: true });
+  assert.deepEqual(pick(JSON.parse(st.stdout).holder, ['pid', 'purpose']), { pid: process.pid, purpose: 'fix agent for PR #7' });
   lock.release();
+  assert.equal(spawnSync(process.execPath, [PRLOOP, 'lock-status', r.work]).status, 0);
   assert.equal(lockHolder(r.work, null), null);
   assert.equal(cli(['mark-tested']).status, 0);
 });
