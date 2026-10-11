@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import {
-  classify, config, globToRegex, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, syncBranch, unionLines, waitFor,
+  buildPrompt, classify, config, globToRegex, isTested, parseAgentResult, readyGate, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, syncBranch, unionLines, waitFor,
 } from '../prloop.mjs';
 
 const fixture = () => JSON.parse(readFileSync(new URL('./pr-fixture.json', import.meta.url), 'utf8'));
@@ -127,6 +127,13 @@ test('the default reviewer login is anchored', () => {
   const pr = fixture();
   request(pr).reactions.nodes.push({ content: 'THUMBS_UP', createdAt: at('10:20'), user: { login: 'not-chatgpt-codex-connector-fan' } });
   assert.equal(classify(pr, cfg, NOW).verdict, 'pending');
+});
+
+test('a request hidden behind more than 100 newer comments fails closed', () => {
+  const pr = fixture();
+  pr.comments.pageInfo = { hasPreviousPage: true };
+  pr.comments.nodes = [{ id: 'IC_n', databaseId: 1, body: 'thanks', createdAt: at('10:30'), author: { login: 'example-dev' }, reactions: { nodes: [] } }];
+  assert.throws(() => classify(pr, cfg, NOW), /more than 100 comments since the head/);
 });
 
 test('custom reviewer and trigger', () => {
@@ -398,13 +405,69 @@ test('dirty checks ignore config that hides untracked files', (t) => {
   assert.match(localGate({ branch: 'feat', head }, r.work).join(), /not clean/);
 });
 
-test('a local review fails closed when the base cannot be fetched', (t) => {
+test('a local review fails closed when the base cannot be fetched', async (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   const head = r.run(r.work, 'rev-parse', 'HEAD');
   markTested(head, r.work);
   const s = { pr: 7, head, branch: 'feat', base: 'no-such-base', unresolvedThreads: [] };
-  const v = localReview('example-org/example-repo', s, cfg, r.work); // never reaches the reviewer agent
+  const v = await localReview('example-org/example-repo', s, cfg, r.work); // never reaches the reviewer agent
   assert.equal(v.verdict, 'blocked');
-  assert.match(v.reason, /could not fetch base/);
+  assert.match(v.reason, /could not fetch origin\/no-such-base/);
+});
+
+test('sync refuses a base ref that lacks the PR base commit', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.commit('feature', { 'app.txt': 'feature\n' });
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', baseOid: head, head, settings: { merge: true } });
+  assert.equal(v.verdict, 'error');
+  assert.match(v.error, /does not contain the PR base commit/);
+});
+
+test('ready runs the gate: a failure returns the tail, a pass marks the head tested', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  const s = { branch: 'feat', head };
+  const failed = readyGate(s, 'echo step one; echo "FAIL tests/a.test.js"; exit 3', r.work);
+  assert.deepEqual([failed.ok, failed.status], [false, 3]);
+  assert.match(failed.tail, /FAIL tests\/a\.test\.js$/);
+  assert.equal(isTested(head, r.work), false);
+  assert.deepEqual(readyGate(s, 'true', r.work), { ok: true });
+  assert.equal(isTested(head, r.work), true);
+  assert.equal(readyGate(s, 'exit 1', r.work), null); // already tested: the gate does not rerun
+});
+
+test('agent result: the last JSON line, also inside a JSON wrapper', () => {
+  const line = '{"status":"requested","head":"abc","fixed":["T1"],"disputed":[],"reason":"fixed"}';
+  assert.equal(parseAgentResult(`work done\n${line}`).status, 'requested');
+  assert.deepEqual(parseAgentResult(JSON.stringify({ type: 'result', result: `Summary.\n${line}` })).fixed, ['T1']);
+  assert.equal(parseAgentResult('{"status":"maybe"}'), null);
+  assert.equal(parseAgentResult(''), null);
+});
+
+test('the fix prompt carries only the trigger data and the contract', () => {
+  const p = buildPrompt({ repo: 'example-org/example-repo', pr: 7, branch: 'feat/x', head: 'abc123', cwd: '/work/x', trigger: 'findings',
+    findings: [{ id: 'T1', path: 'src/a.js', line: 3, body: 'Off by one' }], gate: 'npm test', requestBody: '@codex review' });
+  for (const part of ['PR #7 in example-org/example-repo', 'branch feat/x', 'head abc123', 'worktree /work/x', 'Trigger: findings',
+    '- T1 src/a.js:3 Off by one', 'runs the gate (npm test)', 'reusing exactly:\n@codex review', '"status":"requested|blocked|nothing_to_do"',
+    'Never wait for or poll reviews']) assert.ok(p.includes(part), part);
+  assert.match(buildPrompt({ repo: 'o/n', pr: 1, trigger: 'conflict', conflicts: ['a.txt'], localReview: true }), /Conflicted files: a\.txt[\s\S]*Do not post a review request/);
+});
+
+test('run --status reads state files and the latest events without GitHub', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'prloop-state-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const old = process.env.XDG_STATE_HOME;
+  process.env.XDG_STATE_HOME = dir;
+  t.after(() => { if (old === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = old; });
+  mkdirSync(join(dir, 'prloop'));
+  writeFileSync(join(dir, 'prloop', 'example-org__example-repo__7.json'), JSON.stringify({ repo: 'example-org/example-repo', pr: 7, phase: 'waiting', head: 'abcdef1234', rounds: 2 }));
+  writeFileSync(join(dir, 'prloop', 'run-2026-01-01T10-00-00-000Z.jsonl'), '{"pr":7,"phase":"agent"}\n{"pr":7,"phase":"waiting"}\n');
+  const st = runStatus();
+  assert.deepEqual(st.prs.map((p) => [p.pr, p.phase, p.head, p.rounds]), [[7, 'waiting', 'abcdef1', 2]]);
+  assert.equal(st.events.at(-1).phase, 'waiting');
 });
