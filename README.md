@@ -91,7 +91,7 @@ prloop ready 42 && gh pr comment 42 --body "@codex review"
 prloop wait 42
 ```
 
-Waits for an external reviewer bot and prints one JSON verdict with the next step, so agents stop polling GitHub themselves. It also gates review requests, syncs branches with their base, and offers an optional supervisor with loop failsafes. It is a single dependency-free Node.js file that reads GitHub through `gh`. `status`, `ready` and `wait` only read; `sync` pushes the PR branch and `run` starts agents, each only when invoked. See [the review wait loop](docs/review-wait-loop.md) and [the command reference](tools/prloop/README.md).
+Waits for an external reviewer bot and prints one JSON verdict with the next step, so agents stop polling GitHub themselves. It also gates review requests, syncs branches with their base, and offers an optional supervisor with loop failsafes. It is a single dependency-free Node.js file that reads GitHub through `gh`. `status` and `ready` only read; `wait` reads, and posts a read-only local review only when the bot is unavailable or `--reviewer local` is set; `sync` pushes the PR branch and `run` starts agents, each only when invoked. See [the review wait loop](docs/review-wait-loop.md) and [the command reference](tools/prloop/README.md).
 
 The inspection utilities use only Bash, Python's standard library, and Git; `prloop` uses Node.js, Git and the GitHub CLI. Tests create temporary synthetic repositories or use fixture JSON and never contact the network.
 

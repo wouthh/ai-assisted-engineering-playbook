@@ -24,7 +24,7 @@ Every command prints one JSON object on stdout. `--repo owner/name` defaults to 
 | `prloop status <pr>` | Head SHA, unresolved threads (id, path, line, first 300 characters), latest trigger comment and whether it is newer than the head commit, reviewer state on the head (`none`, `reviewing`, `clean`, `findings`), and `readyToRequest` with reasons. | 0, 40 |
 | `prloop ready <pr>` | Gate before posting a review request. Passes only with no unresolved threads, no request already pending on the head, a tested head and, inside a checkout of the PR branch, a clean tree whose `HEAD` equals the remote PR head. Lists exactly what is missing. | 0 ready, 50 not ready |
 | `prloop mark-tested [--sha <sha>]` | Records that your gate passed for `HEAD` (or `--sha`). Stored as `prloop-tested` in the Git common directory; never pushed. | 0, 40 |
-| `prloop wait <pr>` | Polls every `--interval` (75s) until a verdict. A 👀 reaction means the bot is still reviewing. Never posts anything. | see below |
+| `prloop wait <pr>` | Polls every `--interval` (75s) until a verdict. A 👀 reaction means the bot is still reviewing. Posts nothing except a [local review](#local-reviewer-fallback) when one is needed. | see below |
 | `prloop sync <pr> [--union <glob>]...` | Brings the PR branch up to date with its base, inside the PR checkout. See [Syncing with the base](#syncing-with-the-base). | 0, 40, 41 |
 | `prloop run --repo o/n --pr N[,N...]` | Optional supervisor that waits, spawns one fresh agent per round and stops on failsafes. See [Supervisor](#supervisor). | 50 if any PR is blocked, else the first verdict code that needs action, else 0 |
 
