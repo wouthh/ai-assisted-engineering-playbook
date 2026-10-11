@@ -935,10 +935,9 @@ function assertCurrentRequest(policy) {
   const generation = policy.external_review_generations.find(
     (candidate) => candidate.cycle_id === cycleId,
   );
-  const terminal = request.status === "clear" || request.status === "findings";
   const bound = generation
-    ? generation.head_sha === request.head_sha &&
-      (!terminal || generation.status === request.status)
+    ? ["head_sha", "status", "request_type", "request_comment_body", "request_timestamp", "github_comment_id"]
+        .every((field) => generation[field] === request[field])
     : request.budget_charged === false &&
       request.request_type === REVIEW_REQUEST_TARGETED_CLOSURE &&
       Date.parse(requestedAt) < Date.parse(policy.policy_activated_at);
