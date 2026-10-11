@@ -343,8 +343,9 @@ const GiB = 2 ** 30;
 const SLOT_POLL = 5e3;
 const gib = (b) => (b / GiB).toFixed(1);
 const logStderr = (e) => console.error(JSON.stringify({ at: new Date().toISOString(), ...e }));
-// Per user: without XDG_RUNTIME_DIR (cron, CI, sudo) a shared /tmp path would collide between accounts.
-export const slotDir = () => (process.env.XDG_RUNTIME_DIR ? join(process.env.XDG_RUNTIME_DIR, 'prloop-slots') : join('/tmp', `prloop-slots-${process.getuid?.() ?? 'user'}`));
+// One directory per UID, whatever the session's environment: an interactive shell, cron, CI and sudo of one
+// account must share one slot pool, and a shared name would collide between accounts.
+export const slotDir = () => join('/tmp', `prloop-slots-${process.getuid?.() ?? 'user'}`);
 
 // MemAvailable counts reclaimable page cache; os.freemem() does not, so it is only the fallback.
 export function machineMetrics() {
@@ -1098,7 +1099,11 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     // state before a merge; an unchanged patch carries the clean review, so this costs no new review.
     if (s.mergeState === 'BEHIND' || s.mergeState === 'DIRTY' || s.mergeable === 'CONFLICTING') {
       if (!cwd) return block(st, `PR is ${s.mergeState} and no worktree has ${s.branch}; pass --worktree`);
-      const v = syncBranch({ cwd, branch: s.branch, base: s.base, baseOid: raw.baseRefOid, head: s.head, settings: raw.repoSettings, union: opts.union });
+      // Locked like a standalone sync, so two supervisors never fetch, merge or push in one checkout at once.
+      const lock = takeLock(cwd, `sync of PR #${st.pr}`);
+      if (lock.holder) return lockedOut(st, cwd, lock.holder);
+      let v;
+      try { v = syncBranch({ cwd, branch: s.branch, base: s.base, baseOid: raw.baseRefOid, head: s.head, settings: raw.repoSettings, union: opts.union }); } finally { lock.release(); }
       if (v.verdict === 'error') return block(st, `sync failed: ${v.error}`);
       if (v.verdict === 'synced' && v.unchanged && s.verdict === 'clean') {
         st.carry = recordCarry(repo, st.pr, s.head, v);

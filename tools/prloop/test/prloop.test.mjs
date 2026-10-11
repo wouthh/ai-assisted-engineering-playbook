@@ -676,13 +676,13 @@ test('a slot or lock claim stays live while a child outlives its killed owner', 
   assert.deepEqual(readdirSync(dir), []);
 });
 
-test('the slot directory is per user without XDG_RUNTIME_DIR and must not be writable by others', (t) => {
+test('the slot directory is one per user in every session and must not be writable by others', (t) => {
   const old = process.env.XDG_RUNTIME_DIR;
   t.after(() => { if (old === undefined) delete process.env.XDG_RUNTIME_DIR; else process.env.XDG_RUNTIME_DIR = old; });
   delete process.env.XDG_RUNTIME_DIR;
   assert.equal(slotDir(), `/tmp/prloop-slots-${process.getuid()}`);
-  process.env.XDG_RUNTIME_DIR = '/run/user/example';
-  assert.equal(slotDir(), '/run/user/example/prloop-slots');
+  process.env.XDG_RUNTIME_DIR = '/run/user/example'; // an interactive session shares the pool of cron or sudo
+  assert.equal(slotDir(), `/tmp/prloop-slots-${process.getuid()}`);
   const dir = mkdtempSync(join(tmpdir(), 'prloop-slots-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   execFileSync('chmod', ['0777', dir]);
@@ -1166,6 +1166,9 @@ test('run syncs a behind but mergeable clean head and gates the combined state b
   Object.assign(pr, { headRefName: 'feat', headRefOid: head, mergeStateStatus: 'BEHIND', mergeable: 'MERGEABLE' });
   request(pr).reactions.nodes.push({ content: 'THUMBS_UP', createdAt: at('10:20'), user: BOT });
   const calls = fakeGh(t, r.dir, pr);
+  // The push hook records the worktree lock claims while the automatic sync runs.
+  const lockDir = join(r.run(r.work, 'rev-parse', '--absolute-git-dir'), 'prloop-lock');
+  writeFileSync(join(r.work, '.git', 'hooks', 'pre-push'), `#!/bin/sh\ncat "${lockDir}"/* > "${r.dir}/seen"\n`, { mode: 0o755 });
   const runP = runAll({ repo: 'example-org/example-repo', pr: '7', worktree: r.work, merge: 'squash', deadline: '1h' }, { ...cfg, agent: 'none', interval: 1 }, { metrics: idle().metrics });
   for (let i = 0; i < 200 && r.run(r.work, 'rev-parse', 'HEAD') === head; i++) await new Promise((d) => setTimeout(d, 5));
   const synced = r.run(r.work, 'rev-parse', 'HEAD');
@@ -1174,6 +1177,8 @@ test('run syncs a behind but mergeable clean head and gates the combined state b
   writeFileSync(join(r.dir, 'pr.json'), JSON.stringify({ data: { viewer: { login: 'example-dev' }, repository: { mergeCommitAllowed: true, squashMergeAllowed: true, rebaseMergeAllowed: true, pullRequest: after } } }));
   const [res] = await runP;
   assert.notEqual(synced, head);
+  assert.match(readFileSync(join(r.dir, 'seen'), 'utf8'), /"purpose":"sync of PR #7"/); // locked while it pushed
+  assert.equal(lockHolder(r.work, null), null); // and released afterwards
   assert.equal(res.verdict, 'not_tested', JSON.stringify(res)); // the synced head needs the gate first
   assert.equal(res.head, synced);
   assert.ok(calls().every((c) => c.startsWith('api graphql')), 'no merge of the ungated head and no review request');
