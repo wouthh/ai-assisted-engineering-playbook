@@ -212,14 +212,19 @@ export function classify(pr, cfg, nowMs = Date.now()) {
     .filter((r) => isBot(r) && r.createdAt >= since && (r.content === 'EYES' || r.content === 'THUMBS_UP'))
     .map((r) => ({ at: r.createdAt, state: r.content === 'EYES' ? 'reviewing' : 'clean' }));
   const botReviews = pr.reviews.nodes.filter((r) => isBot(r) && r.commit?.oid === head && r.submittedAt >= since);
-  // Issue comments carry no commit: like PR-body reactions, they count only after a request or a 👀 on this
-  // head, so a delayed comment about the previous head cannot clear this one. Local clean bodies name the head.
+  // Issue comments carry no commit: they count only after a request or a 👀 on this head, and a clean one only
+  // after the bot acknowledged this cycle (👀 on the current request or on the PR body after this head), so a
+  // delayed comment about the previous head cannot clear this one, even after a new request. Local clean
+  // bodies name the head.
   const started = current || bodyReactions.some((r) => r.content === 'EYES');
+  const ackAt = [...(current ? triggerNode.reactions.nodes.filter((r) => r.createdAt >= since) : []), ...bodyReactions]
+    .filter((r) => isBot(r) && r.content === 'EYES').map((r) => r.createdAt).sort()[0];
   const botComments = pr.comments.nodes.filter((c) => isBot(c) && c.createdAt >= since && (started || trusted(c)));
-  const summaries = [...botReviews.map((r) => ({ at: r.submittedAt, body: r.body, local: trusted(r) })), ...botComments.map((c) => ({ at: c.createdAt, body: c.body, local: trusted(c) }))]
+  const summaries = [...botReviews.map((r) => ({ at: r.submittedAt, body: r.body, local: trusted(r), acked: true })),
+    ...botComments.map((c) => ({ at: c.createdAt, body: c.body, local: trusted(c), acked: !!ackAt && c.createdAt >= ackAt }))]
     .filter((s) => s.body);
   for (const s of summaries) {
-    if (s.local ? s.body.includes(localCleanBody(head)) : cfg.clean.test(s.body)) signals.push({ at: s.at, state: 'clean' });
+    if (s.local ? s.body.includes(localCleanBody(head)) : s.acked && cfg.clean.test(s.body)) signals.push({ at: s.at, state: 'clean' });
     else if (!s.local && cfg.unavailable.test(s.body)) signals.push({ at: s.at, state: 'unavailable' });
   }
   const newFindings = threads.filter((t) => t.fromReviewer && t.createdAt >= since);
@@ -634,6 +639,8 @@ async function runFixAgent(cfg, prompt, cwd) {
 export function checkWorktree(cwd, s) {
   if (tryGit(['branch', '--show-current'], cwd) !== s.branch) return `worktree ${cwd} does not have ${s.branch} checked out`;
   if (tryGit(['rev-parse', 'HEAD'], cwd) !== s.head) return `worktree ${cwd} HEAD is not PR head ${short(s.head)}: push or pull first`;
+  // Pre-existing changes would be committed and pushed by the fix agent along with its own.
+  if (tryGit(['status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none'], cwd) !== '') return `worktree ${cwd} has uncommitted changes: commit, stash or clean them first`;
   return null;
 }
 
@@ -697,7 +704,7 @@ export async function runAll(opts, cfg) {
   async function step(st) {
     let raw, s;
     try { raw = fetchPr(repo, st.pr); s = classify(raw, cfg); st.failures = 0; } catch (e) {
-      if (++st.failures >= 3) block(st, `GitHub read failed: ${String(e.stderr || e.message).slice(0, 300)}`);
+      if ((st.failures = (st.failures ?? 0) + 1) >= 3) block(st, `GitHub read failed: ${String(e.stderr || e.message).slice(0, 300)}`);
       return;
     }
     st.head = s.head;
