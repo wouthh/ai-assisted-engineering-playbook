@@ -464,6 +464,8 @@ test('the fix prompt carries only the trigger data and the contract', () => {
   for (const part of ['PR #7 in example-org/example-repo', 'branch feat/x', 'head abc123', 'worktree /work/x', 'Trigger: findings',
     '- T1 src/a.js:3 P1 Off by one', 'runs the gate (npm test)', 'reusing exactly:\n@codex review', '"status":"requested|blocked|nothing_to_do"',
     'Never wait for or poll reviews']) assert.ok(p.includes(part), part);
+  assert.match(buildPrompt({ repo: 'o/n', pr: 1, trigger: 'local_review', findings: [], summaries: ['[local review] 1 finding(s) on x.\n- README.md [P3] Stale flag'] }),
+    /Reviewer summary[\s\S]*README\.md \[P3\] Stale flag/);
   assert.match(buildPrompt({ repo: 'o/n', pr: 1, trigger: 'conflict', conflicts: ['a.txt'], localReview: true }), /Conflicted files: a\.txt[\s\S]*Do not post a review request/);
 });
 
@@ -475,6 +477,7 @@ test('run --status reads state files and the latest events without GitHub', (t) 
   t.after(() => { if (old === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = old; });
   mkdirSync(join(dir, 'prloop'));
   writeFileSync(join(dir, 'prloop', 'example-org__example-repo__7.json'), JSON.stringify({ repo: 'example-org/example-repo', pr: 7, phase: 'waiting', head: 'abcdef1234', rounds: 2 }));
+  writeFileSync(join(dir, 'prloop', 'heads.json'), '{}'); // metadata, not a PR
   writeFileSync(join(dir, 'prloop', 'run-2026-01-01T10-00-00-000Z.jsonl'), '{"pr":7,"phase":"agent"}\n{"pr":7,"phase":"waiting"}\n');
   const st = runStatus();
   assert.deepEqual(st.prs.map((p) => [p.pr, p.phase, p.head, p.rounds]), [[7, 'waiting', 'abcdef1', 2]]);
@@ -513,4 +516,19 @@ test('a SHA that returns as the head gets a fresh observation time', async (t) =
   headSeenAt('o/n#7', 'X');
   await tick();
   assert.ok(headSeenAt('o/n#7', 'S') > first); // rewound and fast-forwarded back
+});
+
+test('sync merges the reported base commit, not extra commits on the remote branch', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.commit('feature', { 'app.txt': 'feature\n' });
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  divergeOnMain(r, { 'log.csv': 'id\na\nbase\n' });
+  const baseOid = r.run(r.work, 'rev-parse', 'main');
+  divergeOnMain(r, { 'extra.txt': 'not in the PR base\n' });
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', baseOid, head, settings: { merge: true } });
+  assert.equal(v.verdict, 'synced', JSON.stringify(v));
+  assert.equal(r.run(r.work, 'merge-base', '--is-ancestor', baseOid, 'HEAD'), '');
+  assert.throws(() => r.run(r.work, 'cat-file', '-e', 'HEAD:extra.txt'));
 });
