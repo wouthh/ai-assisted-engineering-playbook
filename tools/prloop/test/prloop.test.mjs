@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import {
-  buildPrompt, classify, plain, config, globToRegex, isTested, parseAgentResult, readyGate, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, syncBranch, unionLines, waitFor,
+  buildPrompt, classify, headSeenAt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, syncBranch, unionLines, waitFor,
 } from '../prloop.mjs';
 
 const fixture = () => JSON.parse(readFileSync(new URL('./pr-fixture.json', import.meta.url), 'utf8'));
@@ -499,4 +499,18 @@ test('sync pushes a fork branch to its own remote, not to origin', (t) => {
   assert.equal(v.verdict, 'synced', JSON.stringify(v));
   assert.equal(r.run(fork, 'rev-parse', 'feat'), v.head);
   assert.equal(r.run(r.work, 'ls-remote', 'origin', 'feat'), '');
+});
+
+test('a SHA that returns as the head gets a fresh observation time', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'prloop-state-'));
+  const old = process.env.XDG_STATE_HOME;
+  process.env.XDG_STATE_HOME = dir;
+  t.after(() => { rmSync(dir, { recursive: true, force: true }); if (old === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = old; });
+  const tick = () => new Promise((r) => setTimeout(r, 5));
+  const first = headSeenAt('o/n#7', 'S');
+  await tick();
+  assert.equal(headSeenAt('o/n#7', 'S'), first); // unchanged head keeps its time
+  headSeenAt('o/n#7', 'X');
+  await tick();
+  assert.ok(headSeenAt('o/n#7', 'S') > first); // rewound and fast-forwarded back
 });
