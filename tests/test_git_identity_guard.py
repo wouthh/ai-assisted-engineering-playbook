@@ -208,7 +208,21 @@ class MessageTests(GuardFixture):
 
     def test_address_folded_across_lines_is_refused(self) -> None:
         path = self.message("Add feature\n\nCo-authored-by: Synthetic <wrong\n@\nsynthetic-mail.net>\n")
+        self.assert_refused(self.guard("--commit-msg", path), "line 3")
+        path = self.message("Add feature\n\nSee wrong\n@\nsynthetic-mail.net\n")
         self.assert_refused(self.guard("--commit-msg", path), "line 4")
+
+    def test_bracketed_split_single_label_address_is_refused(self) -> None:
+        path = self.message("Add feature\n\nCo-authored-by: Synthetic <wrong @localhost>\n")
+        self.assert_refused(self.guard("--commit-msg", path), "line 3")
+
+    def test_exact_unusual_allowlisted_addresses_pass_in_brackets(self) -> None:
+        unusual = ["user@[192.0.2.1]", '"quoted"@synthetic-mail.net']
+        self.write_config({"expected_email": EXPECTED, "allowed_message_emails": unusual})
+        path = self.message("Add feature\n\n" + "".join(
+            f"Co-authored-by: Synthetic <{address}>\n" for address in unusual))
+        result = self.guard("--commit-msg", path)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_package_versions_are_not_email(self) -> None:
         path = self.message("Bump zod@4.6.5, react@19.3.0 and pkg@1.2.3-beta.1\n\n"

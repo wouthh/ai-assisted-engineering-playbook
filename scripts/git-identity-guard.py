@@ -232,15 +232,29 @@ def message_email_allowed(email: str, allowed: set[str]) -> bool:
 def message_addresses(text: str) -> list[tuple[int, str]]:
     """(line number, word) pairs that must be treated as addresses.
 
-    The whole message is tokenized at once so that an address folded around
-    a standalone at-sign, even across lines, is rejoined before checking.
+    The whole message is tokenized at once. Text between < and >, the form Git
+    trailers use, is rejoined exactly across whitespace and lines and checked
+    as one address without exemptions. Elsewhere a standalone at-sign is
+    checked together with its neighbouring words.
     """
     raw = [(text.count("\n", 0, match.start()) + 1, match.group())
            for match in re.finditer(r"[^\s,;]+", text)]
-    words = [(number, token.lstrip(LEADING_EDGE).rstrip(TRAILING_EDGE))
-             for number, token in raw]
     found = []
-    for index, (number, word) in enumerate(words):
+    index = 0
+    while index < len(raw):
+        number, token = raw[index]
+        if token.startswith("<"):
+            parts = [token]
+            while ">" not in parts[-1] and index + 1 < len(raw):
+                index += 1
+                parts.append(raw[index][1])
+            joined = "".join(parts)
+            inner = joined[1:joined.index(">")] if ">" in joined else joined[1:]
+            if "@" in inner:
+                found.append((number, inner))
+            index += 1
+            continue
+        word = token.lstrip(LEADING_EDGE).rstrip(TRAILING_EDGE)
         if word == "@":
             # "name @ domain" is one folded address; check it as a whole.
             before = raw[index - 1][1] if index > 0 else ""
@@ -252,7 +266,9 @@ def message_addresses(text: str) -> list[tuple[int, str]]:
             else:
                 found.append((number, f"{before.lstrip(LEADING_EDGE)}@"
                                       f"{after.rstrip(TRAILING_EDGE)}"))
+            index += 1
             continue
+        index += 1
         if "@" not in word:
             continue
         # Exemptions apply only when the whole word has exactly that shape.
