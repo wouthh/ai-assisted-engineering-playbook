@@ -2,7 +2,7 @@
 
 `prloop` waits for an external pull-request reviewer bot so a coding agent does not have to. It polls GitHub quietly, then prints one compact JSON verdict and exits with a code the agent can branch on. The agent still does the work: fixing code, running tests, replying to and resolving threads, and posting the review request.
 
-The default reviewer is the Codex GitHub connector (login matching `/codex/i`, triggered by a `@codex review` comment). Any bot with a similar request-and-react pattern can be configured.
+The default reviewer is the Codex GitHub connector (login `chatgpt-codex-connector`, triggered by a `@codex review` comment). Any bot with a similar request-and-react pattern can be configured.
 
 The tool is one Node.js ES module with no dependencies. It needs Node 20+, Git and an authenticated [GitHub CLI](https://cli.github.com/) (`gh`).
 
@@ -102,20 +102,20 @@ State (rounds, seen findings, last verdict) lives in `${XDG_STATE_HOME:-~/.local
 
 The local review is a separate, read-only agent run (`--agent claude` by default with `--permission-mode dontAsk` and only read and `git diff/log/show` tools; `--agent codex` uses `codex exec --sandbox read-only`), never the run that wrote the fix. It needs the same gate as a request: no unresolved threads, a tested head, and `wait` running inside a clean, pushed checkout of the PR branch. It returns structured findings (path, line, severity P0-P3, body), which prloop posts with `gh` under your account (only results posted by the authenticated `gh` user count, so a copied prefix from someone else is ignored) as a normal PR review with inline comments, each prefixed `[local review]`; findings outside the diff go in the review body. A clean result posts `[local review] No issues found on <sha>.` The next poll classifies these exactly like bot results.
 
-Failsafes: one local review per head, at most `--max-local-reviews` (3) per PR, and any reviewer failure, malformed output, change to the checkout or posting error ends in `blocked` with the reason instead of a retry.
+Failsafes: one local review per head, a fetched and verified base branch, at most `--max-local-reviews` (3) per PR, and any reviewer failure, malformed output, change to the checkout or posting error ends in `blocked` with the reason instead of a retry.
 
 ## Another reviewer bot
 
 | Flag | Environment | Default |
 |---|---|---|
-| `--reviewer-login <regex>` | `PRLOOP_REVIEWER_LOGIN` | `codex` |
+| `--reviewer-login <regex>` | `PRLOOP_REVIEWER_LOGIN` | `^chatgpt-codex-connector(\[bot\])?$` |
 | `--trigger <text>` | `PRLOOP_TRIGGER` | `@codex review` |
 | `--clean-regex <regex>` | `PRLOOP_CLEAN_REGEX` | `didn.t find any major issues` |
 | `--timeout <dur>` | `PRLOOP_TIMEOUT` | `40m` |
 | `--ack-timeout <dur>` | `PRLOOP_ACK_TIMEOUT` | `3m` |
 | `--interval <dur>` | `PRLOOP_INTERVAL` | `75s` |
 
-The bot must react 👀 while working and either react 👍 on the request or post a comment or review matching the clean regex. Review threads it opens count as findings. For example:
+Anchor the login regex: any account whose login merely contains the bot's name could otherwise mark a head clean. The bot must react 👀 while working and either react 👍 on the request or post a comment or review matching the clean regex. Review threads it opens count as findings. For example:
 
 ```bash
 export PRLOOP_REVIEWER_LOGIN='^example-review-bot' PRLOOP_TRIGGER='/review' PRLOOP_CLEAN_REGEX='no issues found'
@@ -124,6 +124,6 @@ export PRLOOP_REVIEWER_LOGIN='^example-review-bot' PRLOOP_TRIGGER='/review' PRLO
 ## Limits
 
 - "After the head" uses the later of the head commit's committer date and the last force-push event; GitHub exposes no push time. A fast-forward to a commit dated before an existing request is not detected, which `ready` avoids by requiring a pushed head before each request.
-- Reads the latest 100 review threads and comments and 50 reviews; very long PRs may need a fresh PR.
+- Reads up to 100 review threads, the latest 100 comments and the latest 50 reviews. More threads fail closed; on a longer history a local review is refused because its limits cannot be verified.
 - Transient GitHub errors are retried; three failed polls in a row end `wait` with `error`.
 - Outdated threads are flagged `outdated: true` but still count as unresolved: a moved anchor does not prove the finding is fixed.
