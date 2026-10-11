@@ -335,7 +335,7 @@ test('wait runs one local review on fallback, then classifies the posted result'
   pr.comments.nodes.push(botComment('IC_q', QUOTA, '10:06'));
   let calls = 0;
   const v = await waitFor('example-org/example-repo', 7, cfg, {
-    interval: 1, now: () => NOW, pause: async () => {}, fetch: () => pr,
+    interval: 1, now: () => NOW, pause: async () => {}, fetch: () => pr, metrics: idle().metrics,
     runLocal: (repo, s) => {
       calls++;
       pr.comments.nodes.push({ id: 'IC_l', databaseId: 951, body: localCleanBody(s.head), createdAt: at('10:07'), author: { login: 'example-dev' }, reactions: { nodes: [] } });
@@ -344,6 +344,23 @@ test('wait runs one local review on fallback, then classifies the posted result'
   });
   assert.equal(calls, 1);
   assert.equal(v.verdict, 'clean');
+});
+
+test('wait admits a local review only when load and memory allow', async () => {
+  const pr = fixture();
+  request(pr).reactions.nodes.push({ content: 'EYES', createdAt: at('10:05'), user: BOT });
+  pr.comments.nodes.push(botComment('IC_q', QUOTA, '10:06'));
+  const x = idle({ load: 7 }); // above 0.75 x 8 cores
+  const c = { ...cfg, interval: 1000, resourceWait: 60e3, timeout: 24 * 3600e3, ackTimeout: 24 * 3600e3 };
+  let startedAt;
+  const v = await waitFor('example-org/example-repo', 7, c, {
+    interval: c.interval, fetch: () => pr, metrics: x.metrics, log: x.log,
+    now: () => NOW + x.clock.t, pause: async (ms) => { x.clock.t += ms; if (x.clock.t >= 5000) x.m.load = 2; },
+    runLocal: (repo, s) => { startedAt = x.clock.t; return { verdict: 'error', error: 'stop' }; },
+  });
+  assert.equal(v.error, 'stop');
+  assert.equal(startedAt, 5000);
+  assert.deepEqual(x.events.map((e) => e.event), ['waiting_for_resources']);
 });
 
 test('local review payload: inline comments with a prefix, body fallback without a line', () => {

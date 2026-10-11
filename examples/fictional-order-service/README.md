@@ -61,6 +61,17 @@ If a correction changes behavior, add a normal follow-up commit, rerun the focus
 
 After validation and authorized publication, open a ready PR. Check the automatic Codex review first, including reactions on the PR body. A current-cycle bot thumbs-up may be its clean result without a comment, but eyes, silence, and stale reactions are not completion. Inspect every feedback surface, reply and resolve only addressed findings, and repeat on substantive heads until clean. An unavailable review produces an exact-head handoff, not a claim of success. These are illustrative steps; no actual cloud review was run for this fictional service. A real review record identifies the reviewer or tool, automated or human review type, exact head, scope and coverage, outcome, and remaining findings. For this example those fields are not applicable because no review occurred.
 
+With [`prloop`](../../tools/prloop/README.md), the same gate and review wait could run unattended. A hypothetical PR 12 for this change on a shared 8-core build machine with 32 GiB of RAM:
+
+```bash
+prloop run --repo example-org/order-service --pr 12 \
+  --gate "python3 -m unittest discover -s examples/fictional-order-service/tests" \
+  --gate-tmpdir /var/tmp &
+prloop run --status --repo example-org/order-service
+```
+
+The resource defaults apply without extra flags: the gate takes one of two machine-wide gate slots, and no gate, fix agent or local review starts while the 1-minute load average exceeds 6 (0.75 x 8 cores) or available memory is below 4 GiB (the larger of 4 GiB and 10% of RAM). The waits show up as `waiting_for_gate_slot` or `waiting_for_resources` in the run log and as a `machine` line in `--status`; after 30 minutes the run proceeds with one slot only rather than stall. A manual `prloop ready 12` or `prloop wait 12 --reviewer auto` applies the same limits to its gate and to a fallback local review. The suite's scratch files go to a private directory under `/var/tmp` that is deleted afterwards. These numbers are illustrative; no prloop run was made for this fictional service.
+
 ## 6. Delivery and rollback
 
 This example has no deployment. In a real repository, leave the PR for human review unless merging is authorized. Then merge through GitHub only after the exact validated head has a clean review and all other gates pass; re-query before merging and verify the live target afterward.

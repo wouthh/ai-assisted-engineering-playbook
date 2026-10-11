@@ -645,7 +645,8 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
 
 // Polls until the snapshot is no longer pending. Terminates because a request goes stale after
 // `cfg.timeout`; transient GitHub errors are retried until three fail in a row.
-export async function waitFor(repo, prNum, cfg, { interval, fetch = fetchPr, now = Date.now, pause = sleep, cwd = process.cwd(), runLocal = localReview }) {
+export async function waitFor(repo, prNum, cfg, { interval, fetch = fetchPr, now = Date.now, pause = sleep, cwd = process.cwd(), runLocal = localReview, metrics = machineMetrics, log = logStderr }) {
+  const resources = {}; // one resource wait across polls, as in `run`
   for (let failures = 0; ; await pause(interval)) {
     let s;
     try { s = classify(fetch(repo, prNum), cfg, now()); failures = 0; } catch (e) {
@@ -655,6 +656,7 @@ export async function waitFor(repo, prNum, cfg, { interval, fetch = fetchPr, now
     const plan = reviewPlan(s, cfg);
     if (plan.blocked) return { verdict: 'blocked', pr: s.pr, head: s.head, reason: plan.blocked };
     if (plan.local) {
+      await admit(cfg, { metrics, now, pause, log }, resources);
       const r = await runLocal(repo, s, cfg, cwd);
       if (r) return r; // gate missing or reviewer failed; otherwise the posted result is classified next poll
       continue;
