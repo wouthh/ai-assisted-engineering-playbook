@@ -2,7 +2,7 @@
 // prloop: wait for an external PR reviewer bot and tell the agent what to do next.
 // Single file, no dependencies. Needs Node 20+, git and an authenticated `gh`.
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -90,6 +90,9 @@ export function config(opts, env = process.env) {
   const agent = String(opts.agent ?? env.PRLOOP_AGENT ?? 'claude');
   // Any other value would fall through to the write-enabled Claude agent.
   if (!['claude', 'codex', 'none'].includes(agent)) throw new Error(`--agent must be claude, codex or none, not ${agent}`);
+  const maxLocal = String(opts.maxLocalReviews ?? env.PRLOOP_MAX_LOCAL_REVIEWS ?? 3);
+  // NaN would make the cap check always false and silently lift it.
+  if (!/^\d+$/.test(maxLocal)) throw new Error(`--max-local-reviews must be a nonnegative integer, not ${maxLocal}`);
   return {
     mode: String(opts.reviewer ?? env.PRLOOP_REVIEWER ?? 'auto'),
     // Anchored: any account whose login merely contains the bot's name could otherwise approve.
@@ -97,7 +100,7 @@ export function config(opts, env = process.env) {
     // Phrasings seen from the Codex connector when it cannot review.
     unavailable: new RegExp(opts.unavailableRegex ?? env.PRLOOP_UNAVAILABLE_REGEX
       ?? 'reached your .*usage limits|couldn.t complete this request|unable to review|quota', 'i'),
-    maxLocal: Number(opts.maxLocalReviews ?? env.PRLOOP_MAX_LOCAL_REVIEWS ?? 3),
+    maxLocal: Number(maxLocal),
     agent,
     model: opts.model ?? env.PRLOOP_MODEL,
     effort: opts.effort ?? env.PRLOOP_EFFORT,
@@ -215,8 +218,8 @@ export function classify(pr, cfg, nowMs = Date.now()) {
     .filter((r) => isBot(r) && r.createdAt >= since && (r.content === 'EYES' || r.content === 'THUMBS_UP'))
     .map((r) => ({ at: r.createdAt, state: r.content === 'EYES' ? 'reviewing' : 'clean' }));
   const botReviews = pr.reviews.nodes.filter((r) => isBot(r) && r.commit?.oid === head && r.submittedAt >= since);
-  // Issue comments carry no commit: they count only after a request or a 👀 on this head, and a clean one only
-  // after the bot acknowledged this cycle (👀 on the current request or on the PR body after this head), so a
+  // Issue comments carry no commit: they count only after a request or a 👀 on this head, and a clean or
+  // failure one only after the bot acknowledged this cycle (👀 on the current request or on the PR body after this head), so a
   // delayed comment about the previous head cannot clear this one, even after a new request. Local clean
   // bodies name the head.
   const started = current || bodyReactions.some((r) => r.content === 'EYES');
@@ -228,7 +231,7 @@ export function classify(pr, cfg, nowMs = Date.now()) {
     .filter((s) => s.body);
   for (const s of summaries) {
     if (s.local ? s.body.includes(localCleanBody(head)) : s.acked && cfg.clean.test(s.body)) signals.push({ at: s.at, state: 'clean' });
-    else if (!s.local && cfg.unavailable.test(s.body)) signals.push({ at: s.at, state: 'unavailable' });
+    else if (!s.local && s.acked && cfg.unavailable.test(s.body)) signals.push({ at: s.at, state: 'unavailable' });
   }
   const newFindings = threads.filter((t) => t.fromReviewer && t.createdAt >= since);
   // A local review whose findings could not be anchored inline carries them in its body.
@@ -351,6 +354,9 @@ export function resolveUnion(cwd, globs, baseStage) {
     const stage = (n) => tryGit(['show', `:${n}:${f}`], cwd);
     const base = stage(baseStage), branch = stage(baseStage === 2 ? 3 : 2);
     if (base === null || branch === null) return [f]; // delete/modify: needs a human
+    // A symlink side would make the write follow the link and stage the link instead of the union.
+    const modes = git(['ls-files', '-u', '--', f], cwd).split('\n').map((l) => l.split(' ')[0]);
+    if (modes.some((m) => m !== '100644' && m !== '100755') || lstatSync(join(cwd, f)).isSymbolicLink()) return [f];
     writeFileSync(join(cwd, f), unionLines(base, branch));
     git(['add', '--', f], cwd);
   }
