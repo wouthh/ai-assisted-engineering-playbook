@@ -5,9 +5,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import {
-  EXIT, main, buildPrompt, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, syncBranch, unionLines, waitFor,
+  EXIT, main, buildPrompt, patchId, recordCarry, resetRounds, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, syncBranch, unionLines, waitFor,
 } from '../prloop.mjs';
 
+const pick = (o, keys) => Object.fromEntries(keys.map((k) => [k, o[k]]));
 const fixture = () => JSON.parse(readFileSync(new URL('./pr-fixture.json', import.meta.url), 'utf8'));
 const cfg = config({}, {});
 const NOW = Date.parse('2026-01-01T10:06:00Z'); // one minute after the current request
@@ -536,21 +537,36 @@ test('the fix prompt carries only the trigger data and the contract', () => {
   assert.match(buildPrompt({ repo: 'o/n', pr: 1, trigger: 'conflict', conflicts: ['a.txt'], localReview: true }), /Conflicted files: a\.txt[\s\S]*Do not post a review request/);
 });
 
-test('run --status reads state files and the latest events without GitHub', (t) => {
+// Points the state directory at a temporary one for the duration of a test.
+function tempState(t) {
   const dir = mkdtempSync(join(tmpdir(), 'prloop-state-'));
-  t.after(() => rmSync(dir, { recursive: true, force: true }));
   const old = process.env.XDG_STATE_HOME;
   process.env.XDG_STATE_HOME = dir;
-  t.after(() => { if (old === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = old; });
+  t.after(() => { rmSync(dir, { recursive: true, force: true }); if (old === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = old; });
   mkdirSync(join(dir, 'prloop'));
-  writeFileSync(join(dir, 'prloop', 'example-org__example-repo__7.json'), JSON.stringify({ repo: 'example-org/example-repo', pr: 7, phase: 'waiting', head: 'abcdef1234', rounds: 2 }));
-  writeFileSync(join(dir, 'prloop', 'heads.json'), '{}'); // metadata, not a PR
-  writeFileSync(join(dir, 'prloop', 'run-2026-01-01T10-00-00-000Z.jsonl'), '{"repo":"example-org/example-repo","pr":7,"phase":"agent"}\n{"repo":"example-org/example-repo","pr":7,"phase":"waiting"}\n');
-  writeFileSync(join(dir, 'prloop', 'run-2026-01-02T10-00-00-000Z.jsonl'), '{"repo":"example-org/other-repo","pr":7,"phase":"blocked"}\n');
+  return join(dir, 'prloop');
+}
+
+test('run --status shows each PR\'s last events from its run log, also legacy lines without a repo', (t) => {
+  const dir = tempState(t);
+  const log = join(dir, 'run-2026-01-01T10-00-00-000Z.jsonl');
+  writeFileSync(join(dir, 'example-org__example-repo__7.json'), JSON.stringify({ repo: 'example-org/example-repo', pr: 7, phase: 'waiting', head: 'abcdef1234', rounds: 2, log }));
+  writeFileSync(join(dir, 'heads.json'), '{}'); // metadata, not a PR
+  const lines = [{ pr: 7, phase: 'agent' }, { pr: 8, phase: 'agent' }, ...Array.from({ length: 6 }, (_, i) => ({ pr: 7, phase: `p${i}` }))];
+  writeFileSync(log, `${lines.map((l) => JSON.stringify(l)).join('\n')}\n`); // written before events carried a repo
+  writeFileSync(join(dir, 'run-2026-01-02T10-00-00-000Z.jsonl'), '{"repo":"example-org/other-repo","pr":7,"phase":"blocked"}\n');
   const st = runStatus('example-org/example-repo');
   assert.deepEqual(st.prs.map((p) => [p.pr, p.phase, p.head, p.rounds]), [[7, 'waiting', 'abcdef1', 2]]);
-  assert.deepEqual(st.events.map((e) => e.phase), ['agent', 'waiting']); // not the newer other-repo log
-  assert.equal(runStatus().events.at(-1).phase, 'blocked');
+  assert.deepEqual(st.prs[0].events.map((e) => e.phase), ['p1', 'p2', 'p3', 'p4', 'p5']); // not PR 8, not the other repo
+});
+
+test('reset-rounds resets the counter once, logs it, and refuses a second reset', (t) => {
+  const dir = tempState(t);
+  writeFileSync(join(dir, 'example-org__example-repo__7.json'), JSON.stringify({ repo: 'example-org/example-repo', pr: 7, phase: 'blocked', rounds: 7, seen: { a: ['T1'] } }));
+  assert.deepEqual(pick(resetRounds('example-org/example-repo', 7), ['previousRounds', 'rounds']), { previousRounds: 7, rounds: 0 });
+  const [pr] = runStatus('example-org/example-repo').prs;
+  assert.deepEqual([pr.rounds, pr.roundResets, pr.events.at(-1).phase], [0, 1, 'rounds_reset']);
+  assert.throws(() => resetRounds('example-org/example-repo', 7), /already reset once/);
 });
 
 test('configuration errors are JSON errors, and an unknown --agent is rejected', async (t) => {
@@ -559,11 +575,17 @@ test('configuration errors are JSON errors, and an unknown --agent is rejected',
   assert.throws(() => config({ maxLocalReviews: 'three' }, {}), /--max-local-reviews must be/);
   assert.throws(() => config({}, { PRLOOP_MAX_LOCAL_REVIEWS: '-1' }), /--max-local-reviews must be/);
   assert.equal(config({ maxLocalReviews: '0' }, {}).maxLocal, 0);
+  for (const [k, v] of [['maxRounds', 'eight'], ['maxRounds', 'Infinity'], ['maxRounds', '0'], ['maxAgents', '0'], ['maxAgents', '1.5'],
+    ['deadline', '0'], ['deadline', 'soon'], ['interval', '0s'], ['timeout', '-5m'], ['ackTimeout', 'NaN']]) {
+    assert.throws(() => config({ [k]: v }, {}), /must be a positive/, `${k}=${v}`);
+  }
+  assert.deepEqual(pick(config({}, {}), ['maxRounds', 'maxAgents', 'deadline']), { maxRounds: 6, maxAgents: 2, deadline: 6 * 36e5 });
   const logs = [];
   t.mock.method(console, 'log', (l) => logs.push(JSON.parse(l)));
   assert.equal(await main(['status', '7', '--repo', 'example-org/example-repo', '--timeout', 'bad']), EXIT.error);
   assert.equal(await main(['run', '--repo', 'example-org/example-repo', '--pr', '7', '--agent', 'nonee']), EXIT.error);
-  assert.deepEqual(logs.map((l) => l.verdict), ['error', 'error']);
+  assert.equal(await main(['run', '--repo', 'example-org/example-repo', '--pr', '7', '--max-rounds', 'x']), EXIT.error);
+  assert.deepEqual(logs.map((l) => l.verdict), ['error', 'error', 'error']);
   assert.match(logs[1].error, /--agent must be/);
 });
 
@@ -676,4 +698,138 @@ test('sync clears only the old head marker, not other PR heads', (t) => {
   assert.equal(v.verdict, 'synced', JSON.stringify(v));
   assert.equal(isTested(head, r.work), false);
   assert.equal(isTested(other, r.work), true);
+});
+
+test('a dismissed bot review is neither a clean nor a findings signal', () => {
+  const pr = fixture();
+  pr.reviews.nodes.push({ id: 'R1', body: "Didn't find any major issues.", state: 'DISMISSED', submittedAt: at('10:20'), author: BOT, commit: { oid: pr.headRefOid } });
+  assert.equal(classify(pr, cfg, NOW).verdict, 'pending');
+  pr.reviews.nodes[0].state = 'COMMENTED';
+  assert.equal(classify(pr, cfg, NOW).verdict, 'clean');
+});
+
+// ---------- saving cloud reviews ----------
+
+test('a carried clean verdict counts on the synced head only, and a real finding overrides it', () => {
+  const pr = fixture();
+  pr.comments.nodes.pop(); // no request on the synced head
+  pr.carry = { from: '0'.repeat(40), to: pr.headRefOid, patchId: 'p' };
+  const s = classify(pr, cfg, NOW);
+  assert.equal(s.verdict, 'clean');
+  assert.match(s.reasons.join(), /carried from 0000000/);
+  assert.equal(classify({ ...pr, carry: { ...pr.carry, to: 'f'.repeat(40) } }, cfg, NOW).verdict, 'not_requested');
+  pr.reviewThreads.nodes.push(thread('T1', at('10:20')));
+  assert.equal(classify(pr, cfg, NOW).verdict, 'findings');
+});
+
+for (const settings of [{ merge: true, squash: true }, { merge: false, squash: false }]) {
+  const method = settings.merge ? 'merge' : 'rebase';
+
+  test(`sync (${method}) reports the PR's own change unchanged, including union-merged files`, (t) => {
+    const r = gitRepo();
+    t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+    r.commit('feature', { 'app.txt': 'feature\n', 'log.csv': 'id\na\nfeature\n' });
+    r.run(r.work, 'push', '-q', 'origin', 'feat');
+    divergeOnMain(r, { 'other.txt': 'base\n', 'log.csv': 'id\na\nbase\n' });
+    const head = r.run(r.work, 'rev-parse', 'HEAD');
+    const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings, union: ['*.csv'] });
+    assert.equal(v.verdict, 'synced', JSON.stringify(v));
+    assert.deepEqual(v.unioned, ['log.csv']);
+    assert.equal(v.unchanged, true);
+    assert.equal(v.patchId, patchId(r.work, 'origin/main', head, ['log.csv']));
+  });
+
+  test(`sync (${method}) reports a changed patch-id when the base changes the PR's context`, (t) => {
+    const r = gitRepo();
+    t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+    const lines = (over) => `${Array.from({ length: 10 }, (_, i) => over[i] ?? `line ${i}`).join('\n')}\n`;
+    divergeOnMain(r, { 'app.txt': lines({}) });
+    r.run(r.work, 'merge', '-q', '--ff-only', 'main');
+    r.commit('feature', { 'app.txt': lines({ 4: 'feature' }) });
+    r.run(r.work, 'push', '-q', 'origin', 'feat');
+    divergeOnMain(r, { 'app.txt': lines({ 6: 'base' }) }); // merges cleanly, but inside the PR hunk's context
+    const head = r.run(r.work, 'rev-parse', 'HEAD');
+    const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings });
+    assert.equal(v.verdict, 'synced', JSON.stringify(v));
+    assert.equal(v.unchanged, false);
+  });
+}
+
+test('a recorded carry-over lands in the state file and the event log', (t) => {
+  const dir = tempState(t);
+  const carry = recordCarry('example-org/example-repo', 7, 'a'.repeat(40), { head: 'b'.repeat(40), patchId: 'p1' });
+  assert.deepEqual(pick(carry, ['from', 'to', 'patchId']), { from: 'a'.repeat(40), to: 'b'.repeat(40), patchId: 'p1' });
+  const st = JSON.parse(readFileSync(join(dir, 'example-org__example-repo__7.json'), 'utf8'));
+  assert.equal(st.carry.to, 'b'.repeat(40));
+  const [pr] = runStatus('example-org/example-repo').prs;
+  assert.deepEqual(pick(pr.events.at(-1), ['phase', 'from', 'to', 'patchId']), { phase: 'carried', from: 'aaaaaaa', to: 'bbbbbbb', patchId: 'p1' });
+});
+
+// A fake `gh` serving one PR snapshot from a file; `gh pr merge` marks it merged. Every call is logged.
+function fakeGh(t, dir, pr) {
+  const old = process.env.PATH;
+  t.after(() => { process.env.PATH = old; });
+  mkdirSync(join(dir, 'bin'));
+  const reply = (p) => JSON.stringify({ data: { viewer: { login: 'example-dev' }, repository: { mergeCommitAllowed: true, squashMergeAllowed: true, rebaseMergeAllowed: true, pullRequest: p } } });
+  writeFileSync(join(dir, 'pr.json'), reply(pr));
+  writeFileSync(join(dir, 'merged.json'), reply({ ...pr, state: 'MERGED', mergeCommit: { oid: 'c'.repeat(40) } }));
+  writeFileSync(join(dir, 'bin', 'gh'), `#!/bin/sh
+if [ "$1" = api ]; then echo "api $2"; else echo "$*"; fi >> "${dir}/calls.log"
+case "$1 $2" in
+  "pr merge") cp "${dir}/merged.json" "${dir}/pr.json" ;;
+  *) cat "${dir}/pr.json" ;;
+esac
+`, { mode: 0o755 });
+  process.env.PATH = `${join(dir, 'bin')}:${old}`;
+  return () => readFileSync(join(dir, 'calls.log'), 'utf8').trim().split('\n');
+}
+
+test('run merges a behind but mergeable, reviewed-clean head directly, without a sync or a new request', async (t) => {
+  const state = tempState(t);
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.commit('feature', { 'app.txt': 'feature\n' });
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  divergeOnMain(r, { 'other.txt': 'base\n' });
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  markTested(head, r.work);
+  writeFileSync(join(state, 'heads.json'), JSON.stringify({ 'example-org/example-repo#7': { sha: head, at: at('09:00') } }));
+  const pr = fixture();
+  Object.assign(pr, { headRefName: 'feat', headRefOid: head, mergeStateStatus: 'BEHIND', mergeable: 'MERGEABLE' });
+  request(pr).reactions.nodes.push({ content: 'THUMBS_UP', createdAt: at('10:20'), user: BOT });
+  const calls = fakeGh(t, r.dir, pr);
+  const [res] = await runAll({ repo: 'example-org/example-repo', pr: '7', worktree: r.work, merge: 'squash' }, { ...cfg, interval: 1 });
+  assert.equal(res.verdict, 'merged', JSON.stringify(res));
+  assert.equal(r.run(r.work, 'rev-parse', 'HEAD'), head); // no sync
+  assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head); // nothing pushed
+  assert.deepEqual(calls().filter((c) => !c.startsWith('api graphql')), [`pr merge 7 --repo example-org/example-repo --squash --match-head-commit ${head}`]);
+});
+
+test('run carries a clean verdict across a sync that leaves the PR unchanged', async (t) => {
+  const state = tempState(t);
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.commit('feature', { 'app.txt': 'feature\n' });
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  divergeOnMain(r, { 'other.txt': 'base\n' });
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  writeFileSync(join(state, 'heads.json'), JSON.stringify({ 'example-org/example-repo#7': { sha: head, at: at('09:00') } }));
+  const pr = fixture();
+  Object.assign(pr, { headRefName: 'feat', headRefOid: head, mergeStateStatus: 'BEHIND', mergeable: 'CONFLICTING' }); // forces a sync
+  request(pr).reactions.nodes.push({ content: 'THUMBS_UP', createdAt: at('10:20'), user: BOT });
+  const calls = fakeGh(t, r.dir, pr);
+  // After the sync GitHub reports the new head, with no review on it.
+  const runP = runAll({ repo: 'example-org/example-repo', pr: '7', worktree: r.work, deadline: '1h' }, { ...cfg, interval: 1 });
+  for (let i = 0; i < 200 && r.run(r.work, 'rev-parse', 'HEAD') === head; i++) await new Promise((d) => setTimeout(d, 5));
+  const synced = r.run(r.work, 'rev-parse', 'HEAD');
+  const after = { ...fixture(), headRefName: 'feat', headRefOid: synced, mergeStateStatus: 'CLEAN' };
+  after.comments.nodes.pop();
+  writeFileSync(join(r.dir, 'pr.json'), JSON.stringify({ data: { viewer: { login: 'example-dev' }, repository: { mergeCommitAllowed: true, squashMergeAllowed: true, rebaseMergeAllowed: true, pullRequest: after } } }));
+  const [res] = await runP;
+  assert.notEqual(synced, head);
+  assert.equal(res.verdict, 'clean', JSON.stringify(res));
+  assert.equal(res.head, synced);
+  const st = JSON.parse(readFileSync(join(state, 'example-org__example-repo__7.json'), 'utf8'));
+  assert.deepEqual([st.carry.from, st.carry.to], [head, synced]);
+  assert.ok(calls().every((c) => c.startsWith('api graphql')), 'no review request or other write');
 });

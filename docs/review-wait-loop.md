@@ -10,7 +10,7 @@ An external review bot can take minutes to answer. An agent that polls GitHub it
 4. **Wait**: prloop polls quietly until one verdict: `clean`, `findings`, `not_requested`, `requested_while_unresolved`, or `timeout` with the previous request text to repost. When the bot is unavailable, the default `auto` mode runs one read-only local review of the head and posts it, so the loop continues.
 5. **Fix**: for findings, fix valid ones, reply with evidence to invalid ones, resolve addressed threads, and go back to step 2.
 
-When GitHub reports the branch behind or conflicting with its base, `prloop sync <pr>` updates it with the method the repository allows. Append-only files can be merged as a union of lines; any other conflict is aborted and handed back to an agent with the file list.
+When GitHub reports the branch behind or conflicting with its base, `prloop sync <pr>` updates it with the method the repository allows. Append-only files can be merged as a union of lines; any other conflict is aborted and handed back to an agent with the file list. A sync that needed no manual resolution and leaves the PR's own change identical (equal `git patch-id --stable`) carries the previous clean review to the new head, and `prloop run --merge` merges a behind but mergeable clean head directly instead of syncing it, so neither costs a new cloud review.
 
 The recommended way to run the loop is one background supervisor: `prloop run --repo <owner/name> --pr <N,...> --gate "<cmd>"`. It polls all PRs round-robin without a model, spawns a fresh agent only when there is work, and each agent does one step (fix, gate through `prloop ready`, reply and resolve, request) and exits. A coordinator checks in with `prloop run --status`, which reads local state and an event log instead of GitHub. Agents running `prloop wait` themselves is the manual alternative.
 
@@ -19,7 +19,7 @@ The recommended way to run the loop is one background supervisor: `prloop run --
 - **Fewer tokens.** Polling, gating and syncing cost no model tokens. Agents start only when there is work, see only the current trigger, and exit after one step; a coordinator reads one compact status object.
 - **Current-head evidence.** Only reactions, comments and reviews newer than the head commit or the current request count, matching [review signal interpretation](validation-and-review.md#codex-cloud-review-signals). Eyes, silence and an older thumbs-up are not a clean review.
 - **No duplicate requests.** `ready` refuses while a request on the current head is still running; a request becomes repeatable only after it times out.
-- **No infinite loops.** The optional `prloop run` supervisor stops with a `blocked` reason on a round limit, an overall deadline, an agent that makes no progress or reports a permission denial, or the same finding returning after two fixes.
+- **No infinite loops.** The optional `prloop run` supervisor stops with a `blocked` reason on a round limit (6 by default; at the cap the coordinator judges the remaining findings by real impact, merges low-risk leftovers as deferred, or resets the rounds once with `prloop reset-rounds` for important defects before handing over to a human), an overall deadline, an agent that makes no progress or reports a permission denial, or the same finding returning after two fixes.
 
 Merging remains a separate, explicitly authorized step. `prloop run --merge` only merges a clean current head that GitHub reports mergeable, pinned with `--match-head-commit`.
 

@@ -24,9 +24,16 @@ prloop run --repo owner/name --pr 42,43,44 --gate "npm test" --merge squash &   
 prloop run --status --repo owner/name                                          # cheap check-in, no GitHub calls
 ```
 
-`run` polls every PR round-robin every `--interval`, in one process. It syncs a branch that GitHub reports behind or conflicting, waits for the reviewer, runs local reviews when needed, and spawns a fix agent only for findings, a manual conflict, a missing request, a timed-out request or a local-review gate gap. At most `--max-agents` (2) agents or local reviews run at once. It never needs the coordinator between steps and exits only when every PR is `merged`, `merge_pending`, `clean` (without `--merge`), `blocked`, `needs_human`, `needs_agent` (with `--agent none`) or past the `--deadline` (6h). It then prints one JSON line per PR: `verdict`, `reason`, last `head`, `rounds`, and `next`, what a human or the coordinator must do.
+`run` polls every PR round-robin every `--interval`, in one process. It syncs a branch that GitHub reports behind or conflicting (see [Saving cloud reviews](#saving-cloud-reviews)), waits for the reviewer, runs local reviews when needed, and spawns a fix agent only for findings, a manual conflict, a missing request, a timed-out request or a local-review gate gap. At most `--max-agents` (2) agents or local reviews run at once. It never needs the coordinator between steps and exits only when every PR is `merged`, `merge_pending`, `clean` (without `--merge`), `blocked`, `needs_human`, `needs_agent` (with `--agent none`) or past the `--deadline` (6h). It then prints one JSON line per PR: `verdict`, `reason`, last `head`, `rounds`, and `next`, what a human or the coordinator must do.
 
-Each PR's state lives in `${XDG_STATE_HOME:-~/.local/state}/prloop/<owner>__<name>__<pr>.json`, and every state change is appended to that run's `run-<time>.jsonl` event log in the same directory. `prloop run --status` prints all PR states and the latest events as one JSON object. Rounds and seen findings persist across runs on purpose; delete a PR's state file to reset them.
+Each PR's state lives in `${XDG_STATE_HOME:-~/.local/state}/prloop/<owner>__<name>__<pr>.json`, and every state change is appended to that run's `run-<time>.jsonl` event log in the same directory. `prloop run --status` prints all PR states as one JSON object, each with its last five events from the run log that state names. Rounds and seen findings persist across runs on purpose; `prloop reset-rounds <pr>` resets the rounds once (see [At the round cap](#at-the-round-cap)), and deleting a PR's state file resets everything.
+
+### Saving cloud reviews
+
+Every cloud review costs quota, so `run` avoids requesting one when the PR's own change has not changed:
+
+- **Behind but mergeable.** When GitHub reports a PR `BEHIND` its base but `MERGEABLE` with no conflicts, and its current head is reviewed clean, `run` does not sync it. With `--merge` it merges the head directly (`--match-head-commit`); GitHub's merge or rebase replays it onto the base. If that merge is refused (for example because branch protection requires an up-to-date branch), `run` falls back to a sync. Without `--merge` the PR simply ends `clean`.
+- **Carry-over after a sync.** When `sync` (or `run` calling it) updates a branch without any manual conflict resolution and the previous head was reviewed clean, it compares `git patch-id --stable` of the PR's own change (`<base>...<head>`) before and after. If they are equal, the clean verdict carries over to the new head instead of a new review request. Files merged as a union (`--union`) are compared without context lines, so the base's appended lines do not count as a change, while a line the union brought back does. The carry-over (old head, new head, patch-id) is recorded in the PR's state file and the event log, and `status`, `wait`, `ready` and `run` treat the new head as reviewed clean until a real review of that head says otherwise. A manual conflict resolution, a changed patch-id or new findings still need a new review. The new head still needs the gate (`prloop ready`) before a merge.
 
 ### Fix agents
 
@@ -50,10 +57,26 @@ Fix agents never wait for or poll reviews, merge, touch other PRs, rewrite histo
 | `--agent none` | | Stops the PR at `needs_agent` with the generated `prompt` in its summary, so the coordinator can spawn its own agent and rerun `run`. A needed local review stops the PR at `blocked` instead of running a reviewer. |
 | `--model`, `--effort` | | Override the agent model and effort (`PRLOOP_MODEL`, `PRLOOP_EFFORT`). |
 | `--max-agents 2` | 2 | Agents and local reviews running at the same time. |
+| `--max-rounds 6` | 6 | Fix-agent rounds per PR, across runs. |
+| `--deadline 6h` | 6h | Overall run deadline. |
 | `--merge rebase\|squash\|merge` | off | Merges only a head whose fresh snapshot is clean with no unresolved threads, marked tested in the PR worktree with a clean pushed tree, and reported mergeable, using `gh pr merge --match-head-commit <sha>`. A clean but untested head goes to an agent for the gate only. The result is `merged`, or `merge_pending` (exit 50) when a merge queue or auto-merge accepted it without merging yet. |
 | `--union <glob>` | | Passed to sync. Reviewer and timing options apply as for `wait`. |
 
-Failsafes end a PR in `blocked` (or `needs_human` for disputed findings) with a reason, never in a loop: maximum rounds per PR (`--max-rounds 8`), an agent that exits non-zero, prints no parseable result line, reports `blocked` or a permission denial, or makes no progress (no new commit, resolved thread, request or tested head), the same finding (path plus normalized first line) returning after two fixes, the overall deadline, and every local-review failsafe.
+Failsafes end a PR in `blocked` (or `needs_human` for disputed findings) with a reason, never in a loop: maximum rounds per PR (`--max-rounds 6`), an agent that exits non-zero, prints no parseable result line, reports `blocked` or a permission denial, or makes no progress (no new commit, resolved thread, request or tested head), the same finding (path plus normalized first line) returning after two fixes, the overall deadline, and every local-review failsafe.
+
+Every count (`--max-rounds`, `--max-agents`) must be a positive integer and every duration (`--deadline`, `--interval`, `--timeout`, `--ack-timeout`) a positive `90s`/`40m`/`6h` value; anything else, such as `NaN`, `Infinity` or `0`, is a usage error (exit 40) instead of an unbounded loop. `--max-local-reviews` is a nonnegative integer: 0 disables local reviews.
+
+### At the round cap
+
+A PR that reaches `--max-rounds` stops as `blocked` with `max rounds (N) reached`. The coordinator then decides, without another automatic round:
+
+1. Judge each remaining finding by its real impact on this change, not by the reviewer's severity label, and check the edge cases yourself: read the code path, the inputs that reach it, and whether a test covers it.
+2. **Low-risk leftovers** (unlikely edge cases, hardening, wording): merge when authorized, reply on each thread that it is deferred and why, and record a follow-up (an issue or the next PR's task list).
+3. **Important defects** (wrong results, data loss, security, broken contracts on a realistic path): run `prloop reset-rounds <pr> --repo owner/name` once and rerun `prloop run` for another full cap. The command only rewrites the PR's state file (`rounds: 0`, `roundResets: 1`) and logs a `rounds_reset` event; run it while no `run` is supervising that PR. A second reset is refused: if important defects still remain, hand the PR over to a human with the open threads.
+
+### Agent memory in worktrees
+
+Fix agents and local reviewers run in the PR's worktree, which may live outside the main checkout. With `--agent claude` this keeps the same per-project memory: Claude Code derives its auto-memory directory from the Git repository, so all worktrees of a repository share one. Instructions load from the worktree's own checked-out `CLAUDE.md` or `AGENTS.md`. Two things do not follow the agent into a worktree outside the main checkout: an untracked, gitignored `CLAUDE.local.md` (it exists only where it was created; import a file from your home directory instead) and instruction files in directories above the main checkout. Keep project rules in tracked files.
 
 ## Agent-in-the-loop commands
 
@@ -66,12 +89,13 @@ The manual alternative, for an agent that drives one PR itself. Every command pr
 | `prloop mark-tested [--sha <sha>]` | Manual escape hatch for projects without a gate command: records that the gate passed for `HEAD` (or `--sha`). Stored as `prloop-tested` in the Git common directory; never pushed. | 0, 40 |
 | `prloop wait <pr>` | Polls every `--interval` (75s) until a verdict. A 👀 reaction means the bot is still reviewing. Posts nothing except a [local review](#local-reviewer-fallback) when one is needed. | see below |
 | `prloop sync <pr> [--union <glob>]...` | Brings the PR branch up to date with its base, inside the PR checkout. See [Syncing with the base](#syncing-with-the-base). | 0, 40, 41 |
+| `prloop reset-rounds <pr>` | Resets the PR's round counter once, in the state file only, and logs it. See [At the round cap](#at-the-round-cap). | 0, 40 |
 
 `wait` verdicts:
 
 | Verdict | Exit | Meaning |
 |---|---|---|
-| `clean` | 0 | 👍 by the bot on the current request, or (for an automatic review without a request) on the PR body after a 👀 there on this head, or a bot review on the head, or a bot comment matching the clean regex posted after the bot's 👀 on the current request or on the PR body after this head (issue comments carry no commit, so a request alone does not bind a comment to this head). When the bot reacts more than once, the latest reaction wins. |
+| `clean` | 0 | A [carried-over](#saving-cloud-reviews) clean verdict, or 👍 by the bot on the current request, or (for an automatic review without a request) on the PR body after a 👀 there on this head, or a bot review on the head, or a bot comment matching the clean regex posted after the bot's 👀 on the current request or on the PR body after this head (issue comments carry no commit, so a request alone does not bind a comment to this head). When the bot reacts more than once, the latest reaction wins. |
 | `findings` | 10 | Unresolved threads (path, line, up to 2000 characters of body) plus any reviewer summary on this head. |
 | `not_requested` | 20 | No trigger comment after the current head commit. Run `prloop ready`, then request a review. |
 | `requested_while_unresolved` | 21 | A request was posted while older threads were still open. |
@@ -101,7 +125,7 @@ esac
 
 Conflicts in files matching `--union` globs (append-only changelogs, CSV ledgers) are resolved as a union of both sides, base lines first, with identical lines kept once. A matching file that is a symlink on either side is never resolved this way. Any other conflict aborts the merge or rebase, leaves the checkout as it was, and exits 41 with `verdict: "conflict"` and the conflicted files, for the agent to resolve by hand. Union resolution suits files where every line is an independent record; do not use it for files whose lines depend on order or on each other.
 
-A successful sync changes the head, so it clears the tested marker of the old head (markers of other PR heads stay): run `prloop ready` (which reruns the gate), then request a review.
+A successful sync changes the head, so it clears the tested marker of the old head (markers of other PR heads stay): run `prloop ready` (which reruns the gate). Its output reports `patchId`, `unchanged` and the union-merged files; when the old head was reviewed clean and `unchanged` is true it also reports the recorded `carry` and no new review is needed. Otherwise request a review.
 
 ## Local reviewer fallback
 
@@ -138,6 +162,7 @@ export PRLOOP_REVIEWER_LOGIN='^example-review-bot' PRLOOP_TRIGGER='/review' PRLO
 ## Limits
 
 - GitHub exposes no push time, so "after the head" uses the latest of the head commit's committer date, the last force-push event, and when prloop first saw this head become the PR head (kept per PR in `heads.json` in the state directory). A signal posted before prloop noticed a head change is ignored, which can cost a re-request but never accepts a review of another head.
+- Dismissed bot reviews are ignored: they are neither clean nor findings signals.
 - Reads up to 100 review threads, the latest 100 comments and the latest 50 reviews. More threads fail closed; on a longer history a local review is refused because its limits cannot be verified.
 - Transient GitHub errors are retried; three failed polls in a row end `wait` with `error`.
 - Outdated threads are flagged `outdated: true` but still count as unresolved: a moved anchor does not prove the finding is fixed.
