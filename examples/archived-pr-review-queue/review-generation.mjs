@@ -1671,7 +1671,7 @@ export function validateGenerationCompletionAttestation(
     expectedPrNumber = null,
     expectedHeadSha = null,
     expectedGitTreeHash = null,
-    expectedMembershipFingerprints,
+    expectedClusters,
   } = {},
 ) {
   const record = asRecord(attestation, "generation completion attestation");
@@ -1720,21 +1720,31 @@ export function validateGenerationCompletionAttestation(
       { mismatches, expected, actual },
     );
   }
-  // The attested clusters must be exactly the generation's assigned clusters,
-  // so a worker cannot drop a cluster and still pass.
-  const expectedMembership = [
-    ...new Set(
-      stringList(expectedMembershipFingerprints, "expectedMembershipFingerprints"),
-    ),
-  ].sort();
-  const attestedMembership = normalized.clusters
-    .map((cluster) => cluster.membership_fingerprint)
+  // The attested clusters must be exactly the generation's assigned clusters
+  // with their assigned member threads, so a worker cannot drop a cluster or
+  // empty its members and still pass.
+  if (!Array.isArray(expectedClusters)) {
+    fail("invalid_generation_contract", "expectedClusters must be an array");
+  }
+  const describe = (cluster, label) => {
+    const record = asRecord(cluster, label);
+    return JSON.stringify([
+      requiredString(record.membership_fingerprint, `${label}.membership_fingerprint`),
+      requiredString(record.cluster_id, `${label}.cluster_id`),
+      [...stringList(record.member_thread_ids ?? [], `${label}.member_thread_ids`)].sort(),
+    ]);
+  };
+  const expectedSet = expectedClusters
+    .map((cluster, index) => describe(cluster, `expectedClusters[${index}]`))
     .sort();
-  if (JSON.stringify(expectedMembership) !== JSON.stringify(attestedMembership)) {
+  const attestedSet = normalized.clusters
+    .map((cluster, index) => describe(cluster, `clusters[${index}]`))
+    .sort();
+  if (JSON.stringify(expectedSet) !== JSON.stringify(attestedSet)) {
     fail(
       "generation_attestation_mismatch",
-      "generation completion attestation does not cover the assigned clusters",
-      { expected: expectedMembership, actual: attestedMembership },
+      "generation completion attestation does not match the assigned clusters and members",
+      { expected: expectedSet, actual: attestedSet },
     );
   }
   return {
@@ -1753,7 +1763,7 @@ export function evaluateGenerationCompletionAttestationReuse({
   prNumber,
   currentHeadSha,
   currentGitTreeHash,
-  expectedMembershipFingerprints,
+  expectedClusters,
   reason,
 } = {}) {
   if (reason !== "review_timeout") {
@@ -1767,7 +1777,7 @@ export function evaluateGenerationCompletionAttestationReuse({
     expectedPrNumber: prNumber,
     expectedHeadSha: currentHeadSha,
     expectedGitTreeHash: currentGitTreeHash,
-    expectedMembershipFingerprints,
+    expectedClusters,
   });
   return {
     status: "reusable_after_review_timeout",

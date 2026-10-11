@@ -353,11 +353,12 @@ export function isNoFindingsReviewerMessage(body) {
     return false;
   }
 
-  // Clean phrases must end the message so a qualified statement such as
+  // A clean phrase must be the whole message so a qualified statement such as
   // "No issues with X, but Y is broken" stays actionable.
   if (
-    /\bgenerated no new comments\.?$/i.test(stripped) ||
-    /\bno new comments were generated\.?$/i.test(stripped)
+    /^\w+ reviewed \d+ out of \d+ changed files in this pull request and generated no new comments\.?$/iu.test(
+      stripped,
+    )
   ) {
     return true;
   }
