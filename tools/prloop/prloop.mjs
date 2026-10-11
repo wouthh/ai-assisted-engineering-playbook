@@ -3,7 +3,7 @@
 // Single file, no dependencies. Needs Node 20+, git and an authenticated `gh`.
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { appendFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { availableParallelism, freemem, homedir, loadavg, tmpdir, totalmem } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -579,19 +579,36 @@ function forgetGatePass(key) {
 // tested (or always with --force-gate); a pass marks the head tested and a failure unmarks it. Returns null
 // when nothing ran. `deps` injects the machine metrics, slot directory, clock and logger (see runGate).
 export async function readyGate(s, cfg, cwd, deps = {}) {
-  if (!cfg.gate || (isTested(s.head, cwd) && !cfg.forceGate) || localGate(s, cwd).some((r) => !r.includes('not marked tested'))) return null;
-  const cached = !cfg.forceGate && gatePassed(cfg.gate, cwd);
-  if (cached) { markTested(s.head, cwd); return { ok: true, cached }; }
+  if (!cfg.gate || localGate(s, cwd).some((r) => !r.includes('not marked tested'))) return null;
+  // Only an exact cached pass of this command on this head skips the gate: a marker left by another gate never does.
   const key = gateKey(cfg.gate, cwd);
-  const r = await runGate(cfg.gate, cwd, cfg, deps);
-  if (r.status === 0) {
-    if (key && gateKey(cfg.gate, cwd) === key) recordGatePass(cfg.gate, cwd, key); // the gate left the tree as it found it
-    markTested(s.head, cwd);
-    return { ok: true };
+  const release = key ? await gateKeyLock(key, deps.pause ?? sleep) : () => {};
+  try {
+    const cached = !cfg.forceGate && gatePassed(cfg.gate, cwd);
+    if (cached) { markTested(s.head, cwd); return { ok: true, cached }; }
+    const r = await runGate(cfg.gate, cwd, cfg, deps);
+    if (r.status === 0) {
+      if (key && gateKey(cfg.gate, cwd) === key) recordGatePass(cfg.gate, cwd, key); // the gate left the tree as it found it
+      markTested(s.head, cwd);
+      return { ok: true };
+    }
+    unmarkTested(s.head, cwd); // a forced rerun that fails withdraws the earlier validation, cached pass included
+    forgetGatePass(key);
+    return { ok: false, status: r.status, tail: String(r.stdout || r.stderr).trimEnd().split('\n').slice(-60).join('\n') };
+  } finally { release(); }
+}
+
+// Single-flight per gate-cache key: concurrent `ready` runs for the same head and command check, run and record
+// one at a time, so the second finds the first's pass instead of running the gate again. The lock is a one-slot
+// claim directory (see acquireSlot) removed when free; a claim attempt that loses that race to rmdir retries.
+async function gateKeyLock(key, pause) {
+  const dir = join(stateDir(), 'gate-locks', key.replace(' ', '-'));
+  for (;;) {
+    let release = null;
+    try { release = acquireSlot(dir, 1); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+    if (release) return () => { release(); try { rmdirSync(dir); } catch {} };
+    await pause(SLOT_POLL);
   }
-  unmarkTested(s.head, cwd); // a forced rerun that fails withdraws the earlier validation, cached pass included
-  forgetGatePass(key);
-  return { ok: false, status: r.status, tail: String(r.stdout || r.stderr).trimEnd().split('\n').slice(-60).join('\n') };
 }
 
 // Drops only `sha`, so syncing one PR keeps the markers of other PR heads in the same repository.
@@ -600,7 +617,8 @@ export function unmarkTested(sha, cwd) {
   if (f && existsSync(f)) editLines(f, (lines) => lines.filter((l) => l !== sha));
 }
 
-export function localGate(s, cwd) {
+// With `gate`, the head counts as tested only by an exact cached pass of that command, never by another gate's marker.
+export function localGate(s, cwd, gate) {
   const reasons = [];
   const branch = tryGit(['branch', '--show-current'], cwd);
   if (branch !== s.branch) reasons.push(`not in a checkout of ${s.branch} (current: ${branch || 'none'}): run this inside the PR checkout`);
@@ -609,7 +627,7 @@ export function localGate(s, cwd) {
     const local = git(['rev-parse', 'HEAD'], cwd);
     if (local !== s.head) reasons.push(`local HEAD ${short(local)} differs from remote PR head ${short(s.head)}: push or pull first`);
   }
-  if (!isTested(s.head, cwd)) reasons.push(`head ${short(s.head)} not marked tested: run \`prloop ready --gate "<cmd>"\` (or your gate, then \`prloop mark-tested\`)`);
+  if (gate ? gatePassed(gate, cwd) !== s.head : !isTested(s.head, cwd)) reasons.push(`head ${short(s.head)} not marked tested: run \`prloop ready --gate "<cmd>"\` (or your gate, then \`prloop mark-tested\`)`);
   return reasons;
 }
 
@@ -679,9 +697,11 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
   if (git(['rev-parse', 'HEAD'], cwd) !== head) return { verdict: 'error', error: `local HEAD differs from remote PR head ${short(head)}: push or pull first` };
   // Sync to the exact base commit GitHub reports, not to whatever else the remote branch holds.
   const target = baseOid ?? `${remote}/${base}`;
-  if (tryGit(['merge-base', '--is-ancestor', target, 'HEAD'], cwd) !== null) return { verdict: 'up_to_date', head };
   // ponytail: merge whenever merge or squash merges are allowed; rebase only for rebase-only repos.
   const rebase = !settings.merge && !settings.squash;
+  // A rebase-only repository refuses a branch with merge commits even when it contains the base: linearize it.
+  const merges = rebase && !!git(['rev-list', '--merges', `${target}..HEAD`], cwd);
+  if (!merges && tryGit(['merge-base', '--is-ancestor', target, 'HEAD'], cwd) !== null) return { verdict: 'up_to_date', head };
   const env = { ...process.env, GIT_EDITOR: 'true' };
   const step = (args) => spawnSync('git', args, { cwd, env, encoding: 'utf8' }).status === 0;
   const unioned = new Set();
@@ -709,7 +729,8 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
   // No manual resolution happened here (that aborts above); any difference in the PR's own change needs a new review.
   const before = patchId(cwd, target, head, [...unioned]), after = patchId(cwd, target, newHead, [...unioned]);
   const unchanged = !!before && before === after;
-  return { verdict: 'synced', method: rebase ? 'rebase' : 'merge', head: newHead, previousHead: head, patchId: after, unchanged, unioned: [...unioned],
+  const treeUnchanged = git(['rev-parse', `${head}^{tree}`], cwd) === git(['rev-parse', 'HEAD^{tree}'], cwd);
+  return { verdict: 'synced', method: rebase ? 'rebase' : 'merge', ...(merges ? { linearized: true } : {}), head: newHead, previousHead: head, patchId: after, unchanged, treeUnchanged, unioned: [...unioned],
     next: unchanged ? 'head changed but the PR\'s own change did not: run your gate; a previous clean review carries over'
       : 'head changed: run your gate, `prloop mark-tested`, then request a review' };
 }
@@ -1209,7 +1230,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     if (s.verdict === 'clean' && !opts.merge) return event(st, 'clean', { next: 'the current head is reviewed clean; merge when authorized' });
     if (s.verdict === 'clean') {
       if (s.unresolvedThreads.length) return; // classify reports findings in that case; defensive
-      const missing = cwd ? localGate(s, cwd) : [`no worktree for ${s.branch} to confirm the head was tested; pass --worktree`];
+      const missing = cwd ? localGate(s, cwd, cfg.gate) : [`no worktree for ${s.branch} to confirm the head was tested; pass --worktree`];
       if (!cwd) return block(st, missing[0]);
       if (missing.length) return slot() && fix(st, s, cwd, { verdict: 'not_tested', trigger: 'not_requested', missing,
         note: 'The head is already reviewed clean and only needs the gate: run `prloop ready`, which runs the gate and marks the head tested, then reports that the head is already reviewed clean. That report is expected: skip the review request and report status nothing_to_do.' });
@@ -1349,7 +1370,7 @@ export async function main(argv) {
         next: 'rerun the failing tests or step with its focused command, fix until it passes, then run `prloop ready` again' }, EXIT.blocked);
       // Waiting for admission or a slot can outlast a push from elsewhere: judge the PR as it is now, not the gated snapshot.
       if (gate) s = classify(fetchPr(repo, prArg), cfg);
-      const missing = [...s.reasons, ...localGate(s, process.cwd())];
+      const missing = [...s.reasons, ...localGate(s, process.cwd(), cfg.gate)];
       return out({ ready: !missing.length, pr: s.pr, head: s.head, missing, trigger: cfg.trigger }, missing.length ? EXIT.blocked : 0);
     }
     if (cmd === 'wait') {

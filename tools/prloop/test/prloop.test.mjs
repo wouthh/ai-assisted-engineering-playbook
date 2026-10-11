@@ -637,7 +637,7 @@ test('ready runs the gate: a failure returns the tail, a pass marks the head tes
   assert.equal(isTested(head, r.work), false);
   assert.deepEqual(await readyGate(s, { ...cfg, gate: 'true' }, r.work, deps), { ok: true });
   assert.equal(isTested(head, r.work), true);
-  assert.equal(await readyGate(s, { ...cfg, gate: 'exit 1' }, r.work, deps), null); // already tested: the gate does not rerun
+  assert.deepEqual(await readyGate(s, { ...cfg, gate: 'true' }, r.work, deps), { ok: true, cached: head }); // the same gate does not rerun
   assert.deepEqual(readdirSync(deps.dir), []); // the gate slot was released
 });
 
@@ -964,6 +964,54 @@ test('a passed gate is cached by exact clean head, repository and command: no se
   const res = spawnSync(process.execPath, [PRLOOP, 'mark-tested', '--gate', other], { cwd: r.work, encoding: 'utf8', env: { ...process.env, PRLOOP_LOCK_TOKEN: '' } });
   assert.equal(JSON.parse(res.stdout).gatePassedHead, head, res.stderr);
   assert.equal(gatePassed(other, r.work), head);
+});
+
+test('a head tested by gate A is not tested for gate B: ready --gate B runs B', async (t) => {
+  tempState(t);
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  const runs = join(r.dir, 'runs');
+  const s = { branch: 'feat', head: r.run(r.work, 'rev-parse', 'HEAD') };
+  const deps = { ...idle(), dir: join(r.dir, 'slots') };
+  const a = `echo A >> "${runs}"`, b = `echo B >> "${runs}"`;
+  assert.deepEqual(await readyGate(s, { ...cfg, gate: a }, r.work, deps), { ok: true });
+  assert.deepEqual(localGate(s, r.work, a), []);
+  assert.match(localGate(s, r.work, b).join(), /not marked tested/); // A's marker is no evidence for B
+  assert.deepEqual(await readyGate(s, { ...cfg, gate: b }, r.work, deps), { ok: true });
+  assert.equal(readFileSync(runs, 'utf8'), 'A\nB\n');
+  assert.deepEqual(localGate(s, r.work, b), []);
+  assert.equal((await readyGate(s, { ...cfg, gate: 'false' }, r.work, deps)).ok, false); // a failing gate C is never skipped
+});
+
+test('concurrent ready runs for the same head and gate run the gate once', async (t) => {
+  const state = tempState(t);
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  const runs = join(r.dir, 'runs');
+  const s = { branch: 'feat', head: r.run(r.work, 'rev-parse', 'HEAD') };
+  const deps = { ...idle(), dir: join(r.dir, 'slots'), pause: () => new Promise((res) => setImmediate(res)) };
+  const c = { ...cfg, gate: `echo run >> "${runs}"` };
+  const results = await Promise.all([readyGate(s, c, r.work, deps), readyGate(s, c, r.work, deps), readyGate(s, c, r.work, deps)]);
+  assert.equal(readFileSync(runs, 'utf8'), 'run\n');
+  assert.deepEqual(results, [{ ok: true }, { ok: true, cached: s.head }, { ok: true, cached: s.head }]);
+  assert.deepEqual(readdirSync(join(state, 'gate-locks')), []); // the per-key lock is removed when free
+});
+
+test('sync linearizes a branch with merge commits on a rebase-only repository and reports the tree', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.commit('feature', { 'app.txt': 'feature\n' });
+  divergeOnMain(r, { 'log.csv': 'id\na\nbase\n' });
+  r.run(r.work, 'merge', '-q', '--no-edit', 'main'); // contains the base, but through a merge commit
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  assert.equal(syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true } }).verdict, 'up_to_date');
+  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: false, squash: false } });
+  assert.deepEqual(pick(v, ['verdict', 'method', 'linearized', 'treeUnchanged', 'unchanged']),
+    { verdict: 'synced', method: 'rebase', linearized: true, treeUnchanged: true, unchanged: true });
+  assert.equal(r.run(r.work, 'rev-list', '--merges', 'origin/main..origin/feat'), '');
+  assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), v.head);
+  assert.equal(syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head: v.head, settings: { merge: false, squash: false } }).verdict, 'up_to_date');
 });
 
 test('validation state edits are serialized: a writer waits for a live lock and takes over a dead one', async (t) => {
