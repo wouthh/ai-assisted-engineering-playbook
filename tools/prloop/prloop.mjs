@@ -3,7 +3,7 @@
 // Single file, no dependencies. Needs Node 20+, git and an authenticated `gh`.
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { appendFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { availableParallelism, freemem, homedir, loadavg, tmpdir, totalmem } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -383,7 +383,17 @@ const alive = (pid, start) => {
   try { process.kill(pid, 0); } catch (e) { if (e.code !== 'EPERM') return false; }
   return !start || procStart(pid) === null || procStart(pid) === start;
 };
-const claimStart = (file) => { try { return readFileSync(file, 'utf8').trim() || null; } catch { return null; } };
+// A claim also lists the children its owner spawned (a gate shell, an agent): a child outlives a killed prloop,
+// so the claim stays live while the owner or any listed child runs.
+const anyAlive = (children = []) => children.some((c) => alive(c.pid, c.start));
+const child = (pid) => ({ pid, start: procStart(pid) });
+// Slot claim content: the owner's start time, then one `<pid> <start>` line per child.
+const slotClaimAlive = (file, pid) => {
+  let lines;
+  try { lines = readFileSync(file, 'utf8').split('\n'); } catch { lines = ['']; }
+  const kids = lines.slice(1).filter(Boolean).map((l) => { const [p, st] = l.split(' '); return { pid: Number(p), start: st || null }; });
+  return alive(pid, lines[0].trim() || null) || anyAlive(kids);
+};
 
 function ensureSlotDir(dir) {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -399,12 +409,12 @@ let claims = 0;
 const liveClaims = (dir, i, mine) => readdirSync(dir).filter((f) => {
   const m = /^slot-(\d+)\.(\d+)\.\d+$/.exec(f);
   if (!m || Number(m[1]) !== i || f === mine) return false;
-  if (alive(Number(m[2]), claimStart(join(dir, f)))) return true;
+  if (slotClaimAlive(join(dir, f), Number(m[2]))) return true;
   rmSync(join(dir, f), { force: true });
   return false;
 });
 
-// Takes the first free of `slots` slots; returns a release function or null. A process writes its claim and then
+// Takes the first free of `slots` slots; returns a release function, whose adopt(pid) adds a child, or null. A process writes its claim and then
 // keeps it only if no other live claim exists for that slot: of two racing claims, the later check always sees
 // the earlier claim, so at most one keeps the slot (both may back off and retry on the next poll).
 export function acquireSlot(dir, slots, pid = process.pid) {
@@ -413,7 +423,11 @@ export function acquireSlot(dir, slots, pid = process.pid) {
     if (liveClaims(dir, i).length) continue;
     const name = `slot-${i}.${pid}.${claims++}`;
     writeFileSync(join(dir, name), procStart(pid) ?? '', { flag: 'wx' });
-    if (!liveClaims(dir, i, name).length) return () => rmSync(join(dir, name), { force: true });
+    if (!liveClaims(dir, i, name).length) {
+      const release = () => rmSync(join(dir, name), { force: true });
+      release.adopt = (pid) => { const c = child(pid); appendFileSync(join(dir, name), `\n${c.pid} ${c.start ?? ''}`); };
+      return release;
+    }
     rmSync(join(dir, name), { force: true });
   }
   return null;
@@ -426,15 +440,15 @@ export function acquireSlot(dir, slots, pid = process.pid) {
 // The token reaches a spawned agent as PRLOOP_LOCK_TOKEN, so its own `ready`, `sync` and `mark-tested` calls pass.
 const lockDir = (cwd) => { const g = tryGit(['rev-parse', '--absolute-git-dir'], cwd); return g && join(g, 'prloop-lock'); };
 const lockClaims = (dir, mine) => (existsSync(dir) ? readdirSync(dir) : []).flatMap((f) => {
-  if (f === mine) return [];
+  if (f === mine || f.startsWith('.')) return [];
   let c;
   try { c = JSON.parse(readFileSync(join(dir, f), 'utf8')); } catch { c = { pid: Number(f.split('.')[0]) }; } // still being written
-  if (alive(c.pid, c.start)) return [c];
+  if (alive(c.pid, c.start) || anyAlive(c.children)) return [c];
   rmSync(join(dir, f), { force: true });
   return [];
 });
 
-// Returns { token, release } or { holder } when another live process holds the worktree.
+// Returns { token, release, adopt(pid) } or { holder } when another live process holds the worktree.
 export function takeLock(cwd, purpose, pid = process.pid) {
   const dir = lockDir(cwd);
   if (!dir) throw new Error(`${cwd} is not a Git worktree`);
@@ -442,10 +456,13 @@ export function takeLock(cwd, purpose, pid = process.pid) {
   const [held] = lockClaims(dir);
   if (held) return { holder: held };
   const name = `${pid}.${claims++}`, token = randomUUID();
-  writeFileSync(join(dir, name), JSON.stringify({ pid, start: procStart(pid), startedAt: new Date().toISOString(), purpose, token }), { flag: 'wx', mode: 0o600 });
+  const claim = { pid, start: procStart(pid), startedAt: new Date().toISOString(), purpose, token, children: [] };
+  writeFileSync(join(dir, name), JSON.stringify(claim), { flag: 'wx', mode: 0o600 });
   const [other] = lockClaims(dir, name);
   if (other) { rmSync(join(dir, name), { force: true }); return { holder: other }; }
-  return { token, release: () => rmSync(join(dir, name), { force: true }) };
+  // Written to a new file and renamed, so a reader never sees a partial claim.
+  const adopt = (kid) => { claim.children.push(child(kid)); writeFileSync(join(dir, `.${name}`), JSON.stringify(claim), { mode: 0o600 }); renameSync(join(dir, `.${name}`), join(dir, name)); };
+  return { token, adopt, release: () => rmSync(join(dir, name), { force: true }) };
 }
 
 // The live claim on `cwd` that `token` does not match, or null.
@@ -457,12 +474,13 @@ export function lockHolder(cwd, token = process.env.PRLOOP_LOCK_TOKEN) {
 export const lockMessage = (cwd, h) => `worktree ${cwd} is locked by prloop process ${h.pid} (${h.purpose ?? 'unknown purpose'}, since ${h.startedAt ?? 'unknown'}): wait until it finishes`;
 
 export const slotsInUse = (dir) => {
-  try { return new Set(readdirSync(dir).flatMap((f) => { const m = /^slot-(\d+)\.(\d+)\.\d+$/.exec(f); return m && alive(Number(m[2]), claimStart(join(dir, f))) ? [m[1]] : []; })).size; } catch { return 0; }
+  try { return new Set(readdirSync(dir).flatMap((f) => { const m = /^slot-(\d+)\.(\d+)\.\d+$/.exec(f); return m && slotClaimAlive(join(dir, f), Number(m[2])) ? [m[1]] : []; })).size; } catch { return 0; }
 };
 
 // Runs `gate` after admission, holding a machine-wide slot, optionally with a private TMPDIR that is removed
 // afterwards (a full test suite can fill a small tmpfs /tmp). Admission is rechecked on every slot poll, so a
-// gate never starts on a machine that became busy while it waited. Returns spawnSync's result.
+// gate never starts on a machine that became busy while it waited. The slot claim adopts the gate shell, so the
+// slot stays taken while a gate whose prloop was killed still runs. Returns { status, stdout, stderr }.
 export async function runGate(gate, cwd, cfg, deps = {}) {
   const { dir = slotDir(), pause = sleep, log = logStderr } = deps;
   const w = {};
@@ -477,7 +495,7 @@ export async function runGate(gate, cwd, cfg, deps = {}) {
   try {
     const env = { ...process.env };
     if (cfg.gateTmpdir) { mkdirSync(cfg.gateTmpdir, { recursive: true }); env.TMPDIR = tmp = mkdtempSync(join(cfg.gateTmpdir, 'prloop-gate-')); }
-    return spawnSync('sh', ['-c', `(${gate}) 2>&1`], { cwd, env, encoding: 'utf8', maxBuffer: 256 << 20 });
+    return await spawnAsync('sh', ['-c', `(${gate}) 2>&1`], cwd, { env, onSpawn: release.adopt });
   } finally {
     if (tmp) rmSync(tmp, { recursive: true, force: true });
     release();
@@ -518,7 +536,7 @@ export async function readyGate(s, cfg, cwd, deps = {}) {
   if (!cfg.gate || isTested(s.head, cwd) || localGate(s, cwd).some((r) => !r.includes('not marked tested'))) return null;
   const r = await runGate(cfg.gate, cwd, cfg, deps);
   if (r.status === 0) { markTested(s.head, cwd); return { ok: true }; }
-  return { ok: false, status: r.status, tail: String(r.stdout ?? r.error?.message ?? '').trimEnd().split('\n').slice(-60).join('\n') };
+  return { ok: false, status: r.status, tail: String(r.stdout || r.stderr).trimEnd().split('\n').slice(-60).join('\n') };
 }
 
 // Drops only `sha`, so syncing one PR keeps the markers of other PR heads in the same repository.
@@ -729,14 +747,14 @@ async function runReviewer(cfg, prompt, cwd, keep) {
     if (cfg.agent === 'codex') { // otherwise claude; localReview never gets here with --agent none
       writeFileSync(join(dir, 'schema.json'), JSON.stringify(REVIEW_SCHEMA));
       const r = await spawnAsync('codex', ['exec', '--sandbox', 'read-only', '--output-schema', join(dir, 'schema.json'), '-o', join(dir, 'out.json'),
-        ...(cfg.model ? ['-m', cfg.model] : []), ...(cfg.effort ? ['-c', `model_reasoning_effort=${cfg.effort}`] : []), prompt], cwd, cfg.lockToken);
+        ...(cfg.model ? ['-m', cfg.model] : []), ...(cfg.effort ? ['-c', `model_reasoning_effort=${cfg.effort}`] : []), prompt], cwd, { lock: cfg.lock });
       keep({ ...r, final: existsSync(join(dir, 'out.json')) ? readFileSync(join(dir, 'out.json'), 'utf8') : r.stdout });
       if (r.status !== 0) throw new Error(`codex reviewer exited with ${r.status}: ${(r.stderr ?? '').slice(-300)}`);
       return parseReview(readFileSync(join(dir, 'out.json'), 'utf8'));
     }
     const r = await spawnAsync('claude', ['-p', prompt, '--model', cfg.model ?? 'claude-opus-5-5', '--effort', cfg.effort ?? 'medium',
       '--permission-mode', 'dontAsk', '--allowedTools', 'Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git show:*)',
-      '--output-format', 'json', '--json-schema', JSON.stringify(REVIEW_SCHEMA)], cwd, cfg.lockToken);
+      '--output-format', 'json', '--json-schema', JSON.stringify(REVIEW_SCHEMA)], cwd, { lock: cfg.lock });
     keep({ ...r, final: r.stdout });
     if (r.status !== 0) throw new Error(`claude reviewer exited with ${r.status}: ${(r.stderr ?? '').slice(-300)}`);
     const out = JSON.parse(r.stdout);
@@ -929,8 +947,10 @@ export function pruneAgentLogs(now = Date.now()) {
   }
 }
 
-const spawnAsync = (cmd, args, cwd, token) => new Promise((done) => {
-  const c = spawn(cmd, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], env: token ? { ...process.env, PRLOOP_LOCK_TOKEN: token } : process.env });
+// `lock` (a worktree lock) passes its token to the child and adopts it, so the lock outlives a killed prloop.
+const spawnAsync = (cmd, args, cwd, { env = process.env, lock, onSpawn = lock?.adopt } = {}) => new Promise((done) => {
+  const c = spawn(cmd, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], env: lock?.token ? { ...env, PRLOOP_LOCK_TOKEN: lock.token } : env });
+  if (c.pid && onSpawn) onSpawn(c.pid);
   let stdout = '', stderr = '';
   c.stdout.on('data', (d) => { stdout += d; });
   c.stderr.on('data', (d) => { stderr += d; });
@@ -943,12 +963,12 @@ async function runFixAgent(cfg, prompt, cwd) {
     const dir = mkdtempSync(join(tmpdir(), 'prloop-agent-'));
     try {
       const r = await spawnAsync('codex', ['exec', '--sandbox', 'workspace-write', '-c', 'sandbox_workspace_write.network_access=true', '-o', join(dir, 'last.txt'),
-        ...(cfg.model ? ['-m', cfg.model] : []), ...(cfg.effort ? ['-c', `model_reasoning_effort=${cfg.effort}`] : []), prompt], cwd, cfg.lockToken);
+        ...(cfg.model ? ['-m', cfg.model] : []), ...(cfg.effort ? ['-c', `model_reasoning_effort=${cfg.effort}`] : []), prompt], cwd, { lock: cfg.lock });
       return { ...r, final: existsSync(join(dir, 'last.txt')) ? readFileSync(join(dir, 'last.txt'), 'utf8') : r.stdout };
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }
   const r = await spawnAsync('claude', ['-p', prompt, '--model', cfg.model ?? 'claude-opus-5-5', '--effort', cfg.effort ?? 'medium',
-    '--permission-mode', 'auto', '--output-format', 'json'], cwd, cfg.lockToken);
+    '--permission-mode', 'auto', '--output-format', 'json'], cwd, { lock: cfg.lock });
   return { ...r, final: r.stdout };
 }
 
@@ -1026,7 +1046,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     if (cfg.agent === 'none') return event(st, 'needs_agent', { verdict: v.verdict, prompt, next: 'spawn an agent with this prompt, then rerun prloop run' });
     event(st, 'agent', { verdict: v.verdict });
     const testedBefore = isTested(s.head, cwd);
-    const r = await runFixAgent({ ...cfg, lockToken: lock.token }, prompt, cwd);
+    const r = await runFixAgent({ ...cfg, lock }, prompt, cwd);
     lock.release(); // the spawn ended; the progress check below only reads
     const agentLog = st.agentLog = saveAgentLog(repo, st.pr, r);
     const fail = (reason) => event(st, 'blocked', { reason, next: `a human decision is needed; the agent output is in ${agentLog}`, agentLog });
@@ -1091,7 +1111,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
       st.lockedBy = undefined;
       event(st, 'local_review');
       let r;
-      try { r = await localReview(repo, s, { ...cfg, lockToken: lock.token }, cwd, (p) => { st.agentLog = p; }); } finally { lock.release(); }
+      try { r = await localReview(repo, s, { ...cfg, lock }, cwd, (p) => { st.agentLog = p; }); } finally { lock.release(); }
       if (!r) return event(st, 'polling', { verdict: 'local_review_posted', agentLog: st.agentLog });
       if (r.verdict === 'blocked') return r.agentLog ? event(st, 'blocked', { reason: r.reason, next: `a human decision is needed; the reviewer output is in ${r.agentLog}`, agentLog: r.agentLog }) : block(st, r.reason);
       return fix(st, s, cwd, { verdict: 'not_requested', trigger: 'local_review', missing: r.missing, localReview: true });
