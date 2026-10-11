@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import {
-  classify, config, globToRegex, localCleanBody, localGate, markTested, localReviewPayload, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, syncBranch, unionLines, waitFor,
+  classify, config, globToRegex, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, syncBranch, unionLines, waitFor,
 } from '../prloop.mjs';
 
 const fixture = () => JSON.parse(readFileSync(new URL('./pr-fixture.json', import.meta.url), 'utf8'));
@@ -121,6 +121,12 @@ test('run exit code: blocked wins, then the first verdict needing action', () =>
   assert.equal(runExitCode([{ verdict: 'clean' }, { verdict: 'merged' }]), 0);
   assert.equal(runExitCode([{ verdict: 'clean' }, { verdict: 'findings' }, { verdict: 'timeout' }]), 10);
   assert.equal(runExitCode([{ verdict: 'not_requested' }, { verdict: 'blocked' }]), 50);
+});
+
+test('the default reviewer login is anchored', () => {
+  const pr = fixture();
+  request(pr).reactions.nodes.push({ content: 'THUMBS_UP', createdAt: at('10:20'), user: { login: 'not-chatgpt-codex-connector-fan' } });
+  assert.equal(classify(pr, cfg, NOW).verdict, 'pending');
 });
 
 test('custom reviewer and trigger', () => {
@@ -242,6 +248,7 @@ test('local reviews: mode, one per head and a per-PR cap', () => {
   assert.deepEqual(reviewPlan({ ...s, verdict: 'findings' }, local), {});
   assert.match(reviewPlan({ ...s, local: { total: 1, onHead: true } }, local).blocked, /only one per head/);
   assert.match(reviewPlan({ ...s, local: { total: 3, onHead: false } }, local).blocked, /limit \(3\)/);
+  assert.match(reviewPlan({ ...s, local: { truncated: true, total: 0, onHead: false } }, local).blocked, /too many comments/);
 });
 
 test('posted local results classify like cloud results on that head', () => {
@@ -250,14 +257,14 @@ test('posted local results classify like cloud results on that head', () => {
   pr.comments.nodes.push({ id: 'IC_l', databaseId: 950, body: localCleanBody(pr.headRefOid), createdAt: at('10:30'), author: me, reactions: { nodes: [] } });
   let s = classify(pr, cfg, NOW);
   assert.equal(s.verdict, 'clean');
-  assert.deepEqual(s.local, { total: 1, onHead: true });
+  assert.deepEqual(s.local, { truncated: false, total: 1, onHead: true });
   pr.comments.nodes.at(-1).body = localCleanBody('2222222222222222222222222222222222222222');
   assert.notEqual(classify(pr, cfg, NOW).verdict, 'clean');
   pr.comments.nodes.at(-1).body = localCleanBody(pr.headRefOid);
   pr.comments.nodes.at(-1).author = { login: 'someone-else' }; // anyone can type the prefix
   s = classify(pr, cfg, NOW);
   assert.notEqual(s.verdict, 'clean');
-  assert.deepEqual(s.local, { total: 0, onHead: false });
+  assert.deepEqual(s.local, { truncated: false, total: 0, onHead: false });
 
   const withThread = fixture();
   withThread.reviewThreads.nodes.push(thread('T9', at('10:30'), '[local review] [P1] Null check missing', me));
@@ -379,4 +386,25 @@ test('the local gate requires the PR checkout, a clean tree and a tested pushed 
   r.run(r.work, 'checkout', '--', 'app.txt');
   r.run(r.work, 'switch', '-q', 'main');
   assert.match(localGate(s, r.work).join(), /not in a checkout of feat/); // the marker is shared across worktrees
+});
+
+test('dirty checks ignore config that hides untracked files', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  markTested(head, r.work);
+  r.run(r.work, 'config', 'status.showUntrackedFiles', 'no');
+  writeFileSync(join(r.work, 'new.txt'), 'untracked\n');
+  assert.match(localGate({ branch: 'feat', head }, r.work).join(), /not clean/);
+});
+
+test('a local review fails closed when the base cannot be fetched', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  markTested(head, r.work);
+  const s = { pr: 7, head, branch: 'feat', base: 'no-such-base', unresolvedThreads: [] };
+  const v = localReview('example-org/example-repo', s, cfg, r.work); // never reaches the reviewer agent
+  assert.equal(v.verdict, 'blocked');
+  assert.match(v.reason, /could not fetch base/);
 });

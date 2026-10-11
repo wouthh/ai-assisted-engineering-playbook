@@ -22,7 +22,7 @@ Usage:
              [--deadline 4h] [--model <m>] [--effort <e>] [--union <glob>]...
 
 Reviewer options (flag or env):
-  --reviewer-login <regex>  PRLOOP_REVIEWER_LOGIN  default: codex
+  --reviewer-login <regex>  PRLOOP_REVIEWER_LOGIN  default: ^chatgpt-codex-connector(\[bot\])?$
   --trigger <text>          PRLOOP_TRIGGER         default: @codex review
   --clean-regex <regex>     PRLOOP_CLEAN_REGEX     default: didn.t find any major issues
   --timeout <dur>           PRLOOP_TIMEOUT         default: 40m after the request
@@ -73,13 +73,16 @@ const sh = (cmd, args, opts = {}) =>
   execFileSync(cmd, args, { encoding: 'utf8', maxBuffer: 64 << 20, stdio: ['ignore', 'pipe', 'pipe'], ...opts }).trim();
 const git = (args, cwd) => sh('git', args, { cwd });
 const tryGit = (args, cwd) => { try { return git(args, cwd); } catch { return null; } };
+// Explicit flags so user or repository config cannot hide untracked files or dirty submodules.
+const dirty = (cwd) => git(['status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none'], cwd) !== '';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const short = (sha) => (sha ?? '').slice(0, 7);
 
 export function config(opts, env = process.env) {
   return {
     mode: String(opts.reviewer ?? env.PRLOOP_REVIEWER ?? 'auto'),
-    reviewer: new RegExp(opts.reviewerLogin ?? env.PRLOOP_REVIEWER_LOGIN ?? 'codex', 'i'),
+    // Anchored: any account whose login merely contains the bot's name could otherwise approve.
+    reviewer: new RegExp(opts.reviewerLogin ?? env.PRLOOP_REVIEWER_LOGIN ?? '^chatgpt-codex-connector(\\[bot\\])?$', 'i'),
     // Phrasings seen from the Codex connector when it cannot review.
     unavailable: new RegExp(opts.unavailableRegex ?? env.PRLOOP_UNAVAILABLE_REGEX
       ?? 'reached your .*usage limits|couldn.t complete this request|unable to review|quota', 'i'),
@@ -103,8 +106,8 @@ const PR_QUERY = `query($owner:String!,$name:String!,$pr:Int!){viewer{login} rep
     timelineItems(last:1,itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT]){nodes{... on HeadRefForcePushedEvent{createdAt}}}
     commits(last:1){nodes{commit{oid committedDate}}}
     reviewThreads(first:100){pageInfo{hasNextPage} nodes{id isResolved isOutdated path line comments(first:1){nodes{body createdAt author{login}}}}}
-    comments(last:100){nodes{id databaseId body createdAt author{login} reactions(last:50){nodes{content createdAt user{login}}}}}
-    reviews(last:50){nodes{id body state submittedAt author{login} commit{oid} comments{totalCount}}}}}}`;
+    comments(last:100){pageInfo{hasPreviousPage} nodes{id databaseId body createdAt author{login} reactions(last:50){nodes{content createdAt user{login}}}}}
+    reviews(last:50){pageInfo{hasPreviousPage} nodes{id body state submittedAt author{login} commit{oid} comments{totalCount}}}}}}`;
 
 export function resolveRepo(opts) {
   if (opts.repo) return opts.repo;
@@ -186,7 +189,8 @@ export function classify(pr, cfg, nowMs = Date.now()) {
   // A local review whose findings could not be anchored inline carries them in its body.
   const localFindingReview = botReviews.some((r) => trusted(r) && !r.comments?.totalCount);
   const localArtifacts = [...pr.reviews.nodes, ...pr.comments.nodes].filter(trusted);
-  const local = { total: localArtifacts.length, onHead: localArtifacts.some((n) => n.commit?.oid === head || n.body.includes(head)) };
+  const local = { truncated: !!(pr.comments.pageInfo?.hasPreviousPage || pr.reviews.pageInfo?.hasPreviousPage),
+    total: localArtifacts.length, onHead: localArtifacts.some((n) => n.commit?.oid === head || n.body.includes(head)) };
   const requestsOnHead = pr.comments.nodes.filter((c) => !isBot(c) && c.createdAt >= headTime
     && c.body.toLowerCase().includes(cfg.trigger.toLowerCase())).length;
   const oldUnresolved = current ? threads.filter((t) => t.createdAt < triggerNode.createdAt) : [];
@@ -256,7 +260,7 @@ export function localGate(s, cwd) {
   const branch = tryGit(['branch', '--show-current'], cwd);
   if (branch !== s.branch) reasons.push(`not in a checkout of ${s.branch} (current: ${branch || 'none'}): run this inside the PR checkout`);
   else {
-    if (git(['status', '--porcelain'], cwd)) reasons.push('working tree is not clean: commit or remove local changes');
+    if (dirty(cwd)) reasons.push('working tree is not clean: commit or remove local changes');
     const local = git(['rev-parse', 'HEAD'], cwd);
     if (local !== s.head) reasons.push(`local HEAD ${short(local)} differs from remote PR head ${short(s.head)}: push or pull first`);
   }
@@ -297,7 +301,7 @@ export function resolveUnion(cwd, globs, baseStage) {
 
 export function syncBranch({ cwd, branch, base, head, settings, union = [], remote = 'origin' }) {
   if (tryGit(['branch', '--show-current'], cwd) !== branch) return { verdict: 'error', error: `run sync inside a checkout of ${branch}` };
-  if (git(['status', '--porcelain'], cwd)) return { verdict: 'error', error: 'working tree is not clean' };
+  if (dirty(cwd)) return { verdict: 'error', error: 'working tree is not clean' };
   git(['fetch', '--quiet', remote, base, branch], cwd);
   if (git(['rev-parse', 'HEAD'], cwd) !== head) return { verdict: 'error', error: `local HEAD differs from remote PR head ${short(head)}: push or pull first` };
   if (tryGit(['merge-base', '--is-ancestor', `${remote}/${base}`, 'HEAD'], cwd) !== null) return { verdict: 'up_to_date', head };
@@ -354,6 +358,7 @@ export function reviewPlan(s, cfg) {
   const done = ['clean', 'findings', 'requested_while_unresolved'].includes(s.verdict);
   const wants = cfg.mode === 'local' ? !done : cfg.mode === 'auto' && s.verdict === 'unavailable';
   if (!wants) return {};
+  if (s.local.truncated) return { blocked: 'too many comments or reviews to verify the local review limits; review manually' };
   if (s.local.onHead) return { blocked: `a local review already ran on head ${short(s.head)}; only one per head` };
   if (s.local.total >= cfg.maxLocal) return { blocked: `local review limit (${cfg.maxLocal}) reached for this PR` };
   return { local: true };
@@ -433,7 +438,10 @@ export function localReview(repo, s, cfg, cwd) {
   const missing = s.unresolvedThreads.length ? [`${s.unresolvedThreads.length} unresolved threads`] : [];
   missing.push(...localGate(s, cwd));
   if (missing.length) return { verdict: 'not_requested', pr: s.pr, head: s.head, missing, next: `a local review needs: ${missing.join('; ')}` };
-  tryGit(['fetch', '--quiet', 'origin', s.base], cwd);
+  // Fail closed: a missing or stale base would make an empty diff look like a clean review.
+  if (tryGit(['fetch', '--quiet', 'origin', s.base], cwd) === null || tryGit(['merge-base', `origin/${s.base}`, 'HEAD'], cwd) === null) {
+    return { verdict: 'blocked', pr: s.pr, head: s.head, reason: `could not fetch base origin/${s.base} for the local review` };
+  }
   const prompt = `Review pull request #${s.pr}: the changes in \`git diff origin/${s.base}...HEAD\` at head ${s.head}.
 Do not modify any file. Report only real defects (bugs, security, data loss, broken contracts), not style.
 Return JSON {"findings":[{"path","line","severity":"P0".."P3","body"}]} with "line" in the new file (0 if none) and an empty array when there are no issues.`;
@@ -441,7 +449,7 @@ Return JSON {"findings":[{"path","line","severity":"P0".."P3","body"}]} with "li
   try { findings = runReviewer(cfg, prompt, cwd); } catch (e) {
     return { verdict: 'blocked', pr: s.pr, head: s.head, reason: `local reviewer failed: ${String(e.message).slice(0, 400)}` };
   }
-  if (git(['status', '--porcelain'], cwd) || git(['rev-parse', 'HEAD'], cwd) !== s.head) {
+  if (dirty(cwd) || git(['rev-parse', 'HEAD'], cwd) !== s.head) {
     return { verdict: 'blocked', pr: s.pr, head: s.head, reason: 'the local reviewer changed the checkout; review discarded' };
   }
   const post = (path, body) => sh('gh', ['api', '-X', 'POST', path, '--input', '-'], { input: JSON.stringify(body), stdio: ['pipe', 'pipe', 'pipe'] });
