@@ -221,7 +221,7 @@ export function classify(pr, cfg, nowMs = Date.now()) {
     reviewerState: { state: reviewer, count: newFindings.length }, local,
     unavailableReason: reviewer === 'unavailable' ? 'the reviewer reported it cannot review' : verdict === 'unavailable' ? 'two requests on this head timed out' : undefined,
     summaries: summaries.map((s) => s.body.slice(0, 600)),
-    rerequestBody: triggerNode?.body ?? cfg.trigger,
+    triggerText: cfg.trigger, rerequestBody: triggerNode?.body ?? cfg.trigger,
     verdict, readyToRequest: reasons.length === 0, reasons,
   };
 }
@@ -367,7 +367,7 @@ function finish(s) {
   if (s.verdict === 'findings') return { ...base, findings: s.unresolvedThreads, summaries: s.summaries,
     next: 'fix, run your gate, push, `prloop mark-tested`, reply to and resolve each thread, `prloop ready`, then request a review' };
   if (s.verdict === 'not_requested') return { ...base, unresolvedThreads: s.unresolvedThreads.map((t) => t.id),
-    next: `no "${s.trigger?.body ?? 'trigger'}" comment after head ${short(s.head)}: run \`prloop ready\`, then request a review` };
+    next: `no "${s.triggerText}" comment after head ${short(s.head)}: run \`prloop ready\`, then request a review` };
   return { ...base, unresolvedThreads: s.unresolvedThreads,
     next: 'a review was requested while threads were unresolved: resolve them, then request a review again' };
 }
