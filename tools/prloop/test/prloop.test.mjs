@@ -363,6 +363,18 @@ test('wait drops the local reviewer log when the head moved after that review po
   assert.equal(v.agentLog, undefined);
 });
 
+test('wait reports the local reviewer log when the review fails after saving it', async () => {
+  const pr = fixture();
+  request(pr).reactions.nodes.push({ content: 'EYES', createdAt: at('10:05'), user: BOT });
+  pr.comments.nodes.push(botComment('IC_q', QUOTA, '10:06'));
+  const v = await waitFor('example-org/example-repo', 7, cfg, {
+    interval: 1, now: () => NOW, pause: async () => {}, fetch: () => pr, metrics: idle().metrics,
+    runLocal: (repo, s, c, cwd, onLog) => { onLog('/state/agents/review.log'); return { verdict: 'blocked', pr: 7, head: s.head, reason: 'posting the review failed' }; },
+  });
+  assert.equal(v.verdict, 'blocked');
+  assert.equal(v.agentLog, '/state/agents/review.log');
+});
+
 test('wait admits a local review only when load and memory allow', async () => {
   const pr = fixture();
   request(pr).reactions.nodes.push({ content: 'EYES', createdAt: at('10:05'), user: BOT });

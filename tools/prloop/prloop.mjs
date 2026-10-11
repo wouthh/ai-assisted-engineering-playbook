@@ -719,7 +719,8 @@ export async function waitFor(repo, prNum, cfg, { interval, fetch = fetchPr, now
       if (!reviewPlan(s, cfg).local) continue;
       const head = s.head;
       const r = await runLocal(repo, s, cfg, cwd, (p) => { reviewed = { head, agentLog: p }; });
-      if (r) return r; // gate missing or reviewer failed; otherwise the posted result is classified next poll
+      // Gate missing, reviewer failed or posting failed; otherwise the posted result is classified next poll.
+      if (r) return { ...r, ...(reviewed?.head === head ? { agentLog: reviewed.agentLog } : {}) };
       continue;
     }
     if (s.verdict !== 'pending') return { ...finish(s), ...(reviewed?.head === s.head ? { agentLog: reviewed.agentLog } : {}) };
