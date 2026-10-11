@@ -12,7 +12,7 @@ Identity mode (default):
 - the effective author and committer identity (`git var`), which includes `GIT_AUTHOR_*` and `GIT_COMMITTER_*` environment overrides;
 - author metadata preserved by cherry-pick and rebase, read from raw commit headers and Git's operation files without executing them.
 
-Commit message mode (`--commit-msg FILE`) runs the identity checks and then refuses any email address in the message that is not allowed. Every line is checked, including comment lines: a hook cannot tell whether Git will strip them, and `git commit -m` keeps them. As a consequence, `git commit -v` is refused when the included diff contains an address that is not allowed. Allowed addresses are:
+Commit message mode (`--commit-msg FILE`) runs the identity checks and then refuses any email address in the message that is not allowed. Every line is checked, including comment lines: a hook cannot tell whether Git will strip them, and `git commit -m` keeps them. As a consequence, `git commit -v` is refused when the included diff contains an address that is not allowed. Addresses with a single-label domain such as `localhost` count; text like `name@1.2.3` is treated as a package version, not an address. Allowed addresses are:
 
 - the configured `expected_email` and any `allowed_message_emails`;
 - GitHub's generic `noreply` and `support` addresses and `users.noreply.github.com` addresses;
@@ -20,7 +20,7 @@ Commit message mode (`--commit-msg FILE`) runs the identity checks and then refu
 
 Push mode (`--pre-push`) runs the identity checks and then reads the update list Git supplies on standard input. Every outgoing commit that no remote-tracking branch already contains must have the expected author and committer email and an allowed message. Commits that other people wrote are accepted once they are reachable from a remote-tracking branch, so fetch them into one before pushing a branch that contains them.
 
-A repository whose Git directory is under `/tmp`, `/var/tmp` or `$TMPDIR`, and which has no remote URL, is treated as disposable and skipped. Test suites that create throwaway repositories with synthetic identities therefore keep working. `$TMPDIR` is ignored when it is your home directory or one of its parents. Worktrees of real repositories keep their Git directory elsewhere and stay guarded.
+A repository whose Git directory is under `/tmp`, `/var/tmp` or `$TMPDIR`, and which has no remote URL, is treated as disposable and skipped. Test suites that create throwaway repositories with synthetic identities therefore keep working. Push mode never uses this exemption, because `git push <url>` publishes even from a repository without a configured remote. `$TMPDIR` is ignored when it is your home directory or one of its parents. Worktrees of real repositories keep their Git directory elsewhere and stay guarded.
 
 ## Configuration
 

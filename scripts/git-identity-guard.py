@@ -53,7 +53,10 @@ ENV = {name: value for name, value in os.environ.items()
        if not name.startswith("GIT_TRACE")}
 ENV.update(GIT_OPTIONAL_LOCKS="0", GIT_NO_LAZY_FETCH="1", GIT_NO_REPLACE_OBJECTS="1")
 ZERO_OID = re.compile(r"0+")
-EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
+# Single-label domains such as localhost count. The final label must start
+# with a letter, so package versions like name@1.2.3-beta are not email.
+EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@(?:[A-Za-z0-9-]+\.)*[A-Za-z][A-Za-z0-9-]*"
+                   r"(?![A-Za-z0-9.-]*[A-Za-z0-9])")
 GITHUB_USER_NOREPLY = re.compile(
     r"(?:[1-9][0-9]*\+)?[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?"
     r"@users\.noreply\.github\.com")
@@ -261,7 +264,9 @@ def main(argv: list[str]) -> int:
         # Read the push update list before any early return so Git never
         # blocks writing to a hook that did not consume its input.
         updates = sys.stdin.read() if push else ""
-        if disposable_repository():
+        # A push publishes even from a remote-less temporary repository
+        # (git push <url>), so the disposable exemption never applies to it.
+        if not push and disposable_repository():
             return 0
         config = load_config()
         check_identity(config["expected"])

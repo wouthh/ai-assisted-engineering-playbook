@@ -161,6 +161,15 @@ class MessageTests(GuardFixture):
         result = self.guard("--commit-msg", path)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_single_label_domain_is_refused(self) -> None:
+        path = self.message("Add feature\n\nCo-authored-by: Synthetic <wrong@localhost>\n")
+        self.assert_refused(self.guard("--commit-msg", path), "line 3")
+
+    def test_package_versions_are_not_email(self) -> None:
+        path = self.message("Bump zod@4.6.5, react@19.3.0 and pkg@1.2.3-beta.1\n")
+        result = self.guard("--commit-msg", path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_comment_lines_are_checked(self) -> None:
         # `git commit -m` keeps comment-prefixed lines in the stored message.
         path = self.message(f"Add feature\n\n# Co-authored-by: Synthetic <{OTHER}>\n")
@@ -236,6 +245,14 @@ class PushTests(GuardFixture):
 
 
 class DisposableRepositoryTests(GuardFixture):
+    def test_direct_push_from_temporary_repository_is_checked(self) -> None:
+        self.git("remote", "remove", "origin")
+        commit = self.commit("Add feature", env={**self.env, "GIT_AUTHOR_EMAIL": OTHER})
+        url = "https://example.invalid/target.git"
+        updates = f"refs/heads/main {commit} refs/heads/main {ZERO}\n"
+        self.assert_refused(self.guard("--pre-push", url, url, stdin=updates),
+                            "author email")
+
     def test_temporary_repository_without_remote_url_is_exempt(self) -> None:
         if not str(self.base.resolve()).startswith(("/tmp/", "/var/tmp/")):
             self.skipTest("temporary directory is not under /tmp or /var/tmp")
