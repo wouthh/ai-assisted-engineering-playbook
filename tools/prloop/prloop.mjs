@@ -1,40 +1,44 @@
 #!/usr/bin/env node
 // prloop: wait for an external PR reviewer bot and tell the agent what to do next.
 // Single file, no dependencies. Needs Node 20+, git and an authenticated `gh`.
-import { execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 export const EXIT = { clean: 0, findings: 10, not_requested: 20, requested_while_unresolved: 21, not_tested: 22, timeout: 30, unavailable: 31, error: 40, conflict: 41, blocked: 50 };
 
-const HELP = `prloop - wait for a PR review bot and report the next step as JSON.
+const HELP = `prloop - wait for a PR review bot, gate review requests, and supervise fix agents.
 
-Usage:
+Recommended: start the supervisor once in the background, check in with --status.
+  prloop run --repo owner/name --pr N[,N...] [--gate "<cmd>"] [--max-agents 2] [--max-rounds 8]
+             [--agent claude|codex|none] [--merge rebase|squash|merge] [--worktree <path>]
+             [--deadline 6h] [--model <m>] [--effort <e>] [--union <glob>]...
+  prloop run --status [--repo owner/name]
+
+Agent-in-the-loop commands:
   prloop status <pr> [--repo owner/name]
-  prloop ready <pr> [--repo owner/name]
-  prloop mark-tested [--sha <sha>]
-  prloop wait <pr> [--repo owner/name] [--timeout 40m] [--ack-timeout 3m] [--interval 75s]
-  prloop sync <pr> [--repo owner/name] [--union <glob>]...
-  prloop run --repo owner/name --pr N[,N...] [--agent claude|codex|none]
-             [--max-rounds 8] [--merge rebase|squash|merge] [--worktree <path>]
-             [--deadline 4h] [--model <m>] [--effort <e>] [--union <glob>]...
+  prloop ready <pr> [--gate "<cmd>"]     runs the gate, marks the head tested, checks the request gate
+  prloop mark-tested [--sha <sha>]       manual escape hatch when there is no gate command
+  prloop wait <pr>
+  prloop sync <pr> [--union <glob>]...
 
-Reviewer options (flag or env):
-  --reviewer-login <regex>  PRLOOP_REVIEWER_LOGIN  default: ^chatgpt-codex-connector(\[bot\])?$
+Options (flag or env):
+  --gate <cmd>              PRLOOP_GATE            the project's full validation command
+  --reviewer cloud|local|auto  PRLOOP_REVIEWER     default: auto (local review when the bot is unavailable)
+  --reviewer-login <regex>  PRLOOP_REVIEWER_LOGIN  default: exactly chatgpt-codex-connector
   --trigger <text>          PRLOOP_TRIGGER         default: @codex review
   --clean-regex <regex>     PRLOOP_CLEAN_REGEX     default: didn.t find any major issues
+  --unavailable-regex <re>  PRLOOP_UNAVAILABLE_REGEX  bot replies that mean it cannot review
   --timeout <dur>           PRLOOP_TIMEOUT         default: 40m after the request
   --ack-timeout <dur>       PRLOOP_ACK_TIMEOUT     default: 3m without any reaction
   --interval <dur>          PRLOOP_INTERVAL        default: 75s between polls
-  --reviewer cloud|local|auto  PRLOOP_REVIEWER     default: auto (local review when the bot is unavailable)
-  --unavailable-regex <re>  PRLOOP_UNAVAILABLE_REGEX  bot replies that mean it cannot review
   --max-local-reviews <n>   PRLOOP_MAX_LOCAL_REVIEWS  default: 3 per PR
-  --agent claude|codex      PRLOOP_AGENT           local reviewer (and run's fixer); --model, --effort
+  --agent claude|codex|none PRLOOP_AGENT           fix agent and local reviewer; --model, --effort
 
 Exit codes: 0 clean/ok/merged, 10 findings, 20 not_requested, 21 requested_while_unresolved, 22 not_tested,
-            30 timeout, 31 unavailable, 40 error, 41 conflict, 50 blocked (run) / not ready (ready).`;
+            30 timeout, 31 unavailable, 40 error, 41 conflict, 50 blocked / not ready / needs a human.`;
 
 // ---------- small helpers ----------
 
@@ -90,6 +94,7 @@ export function config(opts, env = process.env) {
     agent: String(opts.agent ?? env.PRLOOP_AGENT ?? 'claude'),
     model: opts.model ?? env.PRLOOP_MODEL,
     effort: opts.effort ?? env.PRLOOP_EFFORT,
+    gate: opts.gate ?? env.PRLOOP_GATE,
     trigger: String(opts.trigger ?? env.PRLOOP_TRIGGER ?? '@codex review'),
     clean: new RegExp(opts.cleanRegex ?? env.PRLOOP_CLEAN_REGEX ?? 'didn.t find any major issues', 'i'),
     timeout: parseDuration(opts.timeout ?? env.PRLOOP_TIMEOUT ?? '40m'),
@@ -102,7 +107,7 @@ export function config(opts, env = process.env) {
 
 const PR_QUERY = `query($owner:String!,$name:String!,$pr:Int!){viewer{login} repository(owner:$owner,name:$name){
   mergeCommitAllowed squashMergeAllowed rebaseMergeAllowed
-  pullRequest(number:$pr){number url state headRefName reactions(last:50){nodes{content createdAt user{login}}} baseRefName headRefOid mergeable mergeStateStatus mergeCommit{oid}
+  pullRequest(number:$pr){number url state headRefName reactions(last:50){nodes{content createdAt user{login}}} baseRefName baseRefOid headRefOid mergeable mergeStateStatus mergeCommit{oid}
     timelineItems(last:1,itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT]){nodes{... on HeadRefForcePushedEvent{createdAt}}}
     commits(last:1){nodes{commit{oid committedDate}}}
     reviewThreads(first:100){pageInfo{hasNextPage} nodes{id isResolved isOutdated path line comments(first:1){nodes{body createdAt author{login}}}}}
@@ -172,6 +177,9 @@ export function classify(pr, cfg, nowMs = Date.now()) {
   const triggerNode = [...pr.comments.nodes].reverse()
     .find((c) => !isBot(c) && c.body.toLowerCase().includes(cfg.trigger.toLowerCase()));
   const current = !!triggerNode && triggerNode.createdAt >= headTime;
+  if (!current && pr.comments.pageInfo?.hasPreviousPage && pr.comments.nodes[0]?.createdAt > headTime) {
+    throw new Error('more than 100 comments since the head commit: prloop cannot see a possible request, so it fails closed');
+  }
   const since = current ? triggerNode.createdAt : headTime;
 
   const signals = [...(current ? triggerNode.reactions.nodes : []), ...(pr.reactions?.nodes ?? [])]
@@ -220,7 +228,7 @@ export function classify(pr, cfg, nowMs = Date.now()) {
   if (reviewer === 'clean') reasons.push(`head ${short(head)} is already reviewed clean`);
 
   return {
-    pr: pr.number, url: pr.url, state: pr.state, mergeCommit: pr.mergeCommit?.oid ?? null, head, branch: pr.headRefName, base: pr.baseRefName,
+    pr: pr.number, url: pr.url, state: pr.state, mergeCommit: pr.mergeCommit?.oid ?? null, head, branch: pr.headRefName, base: pr.baseRefName, baseOid: pr.baseRefOid,
     mergeable: pr.mergeable, mergeState: pr.mergeStateStatus,
     unresolvedThreads: threads,
     trigger: triggerNode && { id: triggerNode.id, databaseId: triggerNode.databaseId, createdAt: triggerNode.createdAt, afterHead: current, body: triggerNode.body },
@@ -251,6 +259,15 @@ export function markTested(sha, cwd) {
   const prev = existsSync(f) ? readFileSync(f, 'utf8').split('\n').filter(Boolean).slice(-50) : [];
   writeFileSync(f, [...prev, full].join('\n') + '\n');
   return full;
+}
+
+// Runs the project gate for `ready` when one is configured and the clean, pushed PR head is not yet
+// tested; a pass marks the head tested. Returns null when nothing ran.
+export function readyGate(s, gate, cwd) {
+  if (!gate || isTested(s.head, cwd) || localGate(s, cwd).some((r) => !r.includes('not marked tested'))) return null;
+  const r = spawnSync('sh', ['-c', `(${gate}) 2>&1`], { cwd, encoding: 'utf8', maxBuffer: 256 << 20 });
+  if (r.status === 0) { markTested(s.head, cwd); return { ok: true }; }
+  return { ok: false, status: r.status, tail: String(r.stdout ?? r.error?.message ?? '').trimEnd().split('\n').slice(-60).join('\n') };
 }
 
 const clearTested = (cwd) => { const f = markerFile(cwd); if (f) rmSync(f, { force: true }); };
@@ -299,10 +316,23 @@ export function resolveUnion(cwd, globs, baseStage) {
   return [];
 }
 
-export function syncBranch({ cwd, branch, base, head, settings, union = [], remote = 'origin' }) {
+// Fetches the base and checks that origin/<base> contains the base commit GitHub reports for the PR,
+// so a fork's stale same-named branch is never used. Returns an error string or null.
+export function fetchBase(cwd, base, baseOid, remote = 'origin') {
+  if (tryGit(['fetch', '--quiet', remote, base], cwd) === null) return `could not fetch ${remote}/${base}`;
+  if (tryGit(['merge-base', `${remote}/${base}`, 'HEAD'], cwd) === null) return `${remote}/${base} shares no history with HEAD`;
+  if (baseOid && tryGit(['merge-base', '--is-ancestor', baseOid, `${remote}/${base}`], cwd) === null) {
+    return `${remote}/${base} does not contain the PR base commit ${short(baseOid)}; point ${remote} at the base repository`;
+  }
+  return null;
+}
+
+export function syncBranch({ cwd, branch, base, baseOid, head, settings, union = [], remote = 'origin' }) {
   if (tryGit(['branch', '--show-current'], cwd) !== branch) return { verdict: 'error', error: `run sync inside a checkout of ${branch}` };
   if (dirty(cwd)) return { verdict: 'error', error: 'working tree is not clean' };
-  git(['fetch', '--quiet', remote, base, branch], cwd);
+  const baseError = fetchBase(cwd, base, baseOid, remote);
+  if (baseError) return { verdict: 'error', error: baseError };
+  tryGit(['fetch', '--quiet', remote, branch], cwd);
   if (git(['rev-parse', 'HEAD'], cwd) !== head) return { verdict: 'error', error: `local HEAD differs from remote PR head ${short(head)}: push or pull first` };
   if (tryGit(['merge-base', '--is-ancestor', `${remote}/${base}`, 'HEAD'], cwd) !== null) return { verdict: 'up_to_date', head };
   // ponytail: merge whenever merge or squash merges are allowed; rebase only for rebase-only repos.
@@ -345,7 +375,7 @@ export async function waitFor(repo, prNum, cfg, { interval, fetch = fetchPr, now
     const plan = reviewPlan(s, cfg);
     if (plan.blocked) return { verdict: 'blocked', pr: s.pr, head: s.head, reason: plan.blocked };
     if (plan.local) {
-      const r = runLocal(repo, s, cfg, cwd);
+      const r = await runLocal(repo, s, cfg, cwd);
       if (r) return r; // gate missing or reviewer failed; otherwise the posted result is classified next poll
       continue;
     }
@@ -411,21 +441,19 @@ export function localReviewPayload(head, findings, inline = true) {
   };
 }
 
-function runReviewer(cfg, prompt, cwd) {
+async function runReviewer(cfg, prompt, cwd) {
   const dir = mkdtempSync(join(tmpdir(), 'prloop-review-'));
   try {
     if (cfg.agent === 'codex') { // any other agent setting, including none, reviews with claude
       writeFileSync(join(dir, 'schema.json'), JSON.stringify(REVIEW_SCHEMA));
-      const r = spawnSync('codex', ['exec', '--sandbox', 'read-only', '--output-schema', join(dir, 'schema.json'), '-o', join(dir, 'out.json'),
-        ...(cfg.model ? ['-m', cfg.model] : []), ...(cfg.effort ? ['-c', `model_reasoning_effort=${cfg.effort}`] : []), prompt],
-      { cwd, encoding: 'utf8', maxBuffer: 64 << 20, stdio: ['ignore', 'pipe', 'pipe'] });
+      const r = await spawnAsync('codex', ['exec', '--sandbox', 'read-only', '--output-schema', join(dir, 'schema.json'), '-o', join(dir, 'out.json'),
+        ...(cfg.model ? ['-m', cfg.model] : []), ...(cfg.effort ? ['-c', `model_reasoning_effort=${cfg.effort}`] : []), prompt], cwd);
       if (r.status !== 0) throw new Error(`codex reviewer exited with ${r.status}: ${(r.stderr ?? '').slice(-300)}`);
       return parseReview(readFileSync(join(dir, 'out.json'), 'utf8'));
     }
-    const r = spawnSync('claude', ['-p', prompt, '--model', cfg.model ?? 'claude-opus-5-5', '--effort', cfg.effort ?? 'medium',
+    const r = await spawnAsync('claude', ['-p', prompt, '--model', cfg.model ?? 'claude-opus-5-5', '--effort', cfg.effort ?? 'medium',
       '--permission-mode', 'dontAsk', '--allowedTools', 'Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git show:*)',
-      '--output-format', 'json', '--json-schema', JSON.stringify(REVIEW_SCHEMA)],
-    { cwd, encoding: 'utf8', maxBuffer: 64 << 20, stdio: ['ignore', 'pipe', 'pipe'] });
+      '--output-format', 'json', '--json-schema', JSON.stringify(REVIEW_SCHEMA)], cwd);
     if (r.status !== 0) throw new Error(`claude reviewer exited with ${r.status}: ${(r.stderr ?? '').slice(-300)}`);
     const out = JSON.parse(r.stdout);
     return parseReview(out.structured_output ?? out.result);
@@ -434,19 +462,18 @@ function runReviewer(cfg, prompt, cwd) {
 
 // Runs one read-only review of the current head in `cwd` and posts it. Returns a verdict to stop on,
 // or null when the result was posted and the next poll should classify it.
-export function localReview(repo, s, cfg, cwd) {
+export async function localReview(repo, s, cfg, cwd) {
   const missing = s.unresolvedThreads.length ? [`${s.unresolvedThreads.length} unresolved threads`] : [];
   missing.push(...localGate(s, cwd));
   if (missing.length) return { verdict: 'not_requested', pr: s.pr, head: s.head, missing, next: `a local review needs: ${missing.join('; ')}` };
   // Fail closed: a missing or stale base would make an empty diff look like a clean review.
-  if (tryGit(['fetch', '--quiet', 'origin', s.base], cwd) === null || tryGit(['merge-base', `origin/${s.base}`, 'HEAD'], cwd) === null) {
-    return { verdict: 'blocked', pr: s.pr, head: s.head, reason: `could not fetch base origin/${s.base} for the local review` };
-  }
+  const baseError = fetchBase(cwd, s.base, s.baseOid);
+  if (baseError) return { verdict: 'blocked', pr: s.pr, head: s.head, reason: `local review: ${baseError}` };
   const prompt = `Review pull request #${s.pr}: the changes in \`git diff origin/${s.base}...HEAD\` at head ${s.head}.
 Do not modify any file. Report only real defects (bugs, security, data loss, broken contracts), not style.
 Return JSON {"findings":[{"path","line","severity":"P0".."P3","body"}]} with "line" in the new file (0 if none) and an empty array when there are no issues.`;
   let findings;
-  try { findings = runReviewer(cfg, prompt, cwd); } catch (e) {
+  try { findings = await runReviewer(cfg, prompt, cwd); } catch (e) {
     return { verdict: 'blocked', pr: s.pr, head: s.head, reason: `local reviewer failed: ${String(e.message).slice(0, 400)}` };
   }
   if (dirty(cwd) || git(['rev-parse', 'HEAD'], cwd) !== s.head) {
@@ -472,7 +499,7 @@ const statePath = (repo, pr) => join(stateDir(), `${repo.replace('/', '__')}__${
 const loadState = (repo, pr) => {
   try { return JSON.parse(readFileSync(statePath(repo, pr), 'utf8')); } catch { return { rounds: 0, seen: {} }; }
 };
-const saveState = (repo, pr, st) => { mkdirSync(stateDir(), { recursive: true }); writeFileSync(statePath(repo, pr), JSON.stringify(st, null, 2)); };
+const saveState = (st) => { mkdirSync(stateDir(), { recursive: true }); writeFileSync(statePath(st.repo, st.pr), JSON.stringify(st, null, 2)); };
 
 // Records findings; returns the fingerprints that came back after a fix twice (seen on 3+ distinct threads).
 export function recordFindings(seen, findings) {
@@ -488,35 +515,69 @@ export function recordFindings(seen, findings) {
 
 export const DENIED = /permission (was |has been )?denied|denied permission|not (been )?permitted|requires? (your )?approval/i;
 
-export function buildPrompt(repo, v) {
-  const details = v.verdict === 'conflict'
-    ? `Merge conflicts with the base branch in: ${v.conflicts.join(', ')}. Merge or rebase the base yourself and resolve them.`
-    : v.verdict === 'timeout'
-      ? `The reviewer did not answer. If \`prloop ready\` passes, repost exactly this comment:\n${v.rerequestBody}`
-      : v.verdict === 'findings'
-        ? `Findings:\n${v.findings.map((f) => `- ${f.id} ${f.path ?? ''}:${f.line ?? ''} ${title(f.body)}`).join('\n')}${v.summaries?.length ? `\nReviewer summary:\n${v.summaries.join('\n').slice(0, 1500)}` : ''}`
-        : v.next;
-  return `You are working on PR #${v.pr} in ${repo} (current verdict: ${v.verdict}).
-${details}
+// The fix agent sees only this trigger, never the round history.
+export function buildPrompt(t) {
+  const data = t.trigger === 'conflict' ? `Conflicted files: ${t.conflicts.join(', ')}`
+    : t.findings?.length ? `Findings:\n${t.findings.map((f) => `- ${f.id} ${f.path ?? ''}:${f.line ?? ''} ${f.body.replace(/\s+/g, ' ').slice(0, 600)}`).join('\n')}`
+      : `Missing: ${(t.missing ?? []).join('; ') || 'a review request on the current head'}`;
+  const request = t.localReview
+    ? 'Do not post a review request: prloop reviews this PR locally once `prloop ready` passes.'
+    : `Post the review request as a new PR comment, reusing exactly:\n${t.requestBody}`;
+  const gate = t.gate
+    ? `\`prloop ready ${t.pr} --repo ${t.repo}\` runs the gate (${t.gate}) and marks the head tested`
+    : `run the gate documented in AGENTS.md or README, then \`prloop mark-tested\` and \`prloop ready ${t.pr} --repo ${t.repo}\``;
+  return `You are fixing PR #${t.pr} in ${t.repo}, branch ${t.branch}, head ${t.head}, worktree ${t.cwd}.
+Trigger: ${t.trigger}. ${t.note ?? ''}
+${data}
 
-Rules:
-1. Fix valid findings in this checkout. If a finding is wrong, reply on the thread with evidence instead.
-2. Run the project's test gate. Commit with a normal commit and push. Never rebase, amend or force-push.
-3. Run \`prloop mark-tested\` only after the gate passes on the pushed head.
-4. Reply to each addressed thread and resolve it.
-5. Run \`prloop ready ${v.pr} --repo ${repo}\`. When it exits 0, post the review request comment once. Then stop; do not wait for the review.`;
+Do these steps in order, in this session:
+1. Read only the referenced files plus AGENTS.md.
+2. Fix each valid finding with a regression test. Reply with evidence on invalid findings and leave them unresolved. Resolve conflicts.
+3. Run focused tests while fixing. Commit and push with normal commits (run \`prloop sync ${t.pr}\` first if the base moved).
+4. Resolve the threads you fixed; reply on the disputed ones.
+5. Gate: ${gate}. If it reports a gate failure, do not rerun \`prloop ready\` straight away: rerun the failing tests or step with their focused command, fix them (including failures you did not cause when they block the gate), commit and push, and call \`prloop ready\` again only when you are confident the full gate passes. At most 5 \`prloop ready\` calls; stop as blocked only if the same failure persists after 3 consecutive fix attempts, or the failure is environmental (missing tool, no network, permission denied), and report the exact failing step. If \`prloop ready\` fails for another reason, make one repair attempt, then stop as blocked.
+6. ${request}
+7. Exit by printing ONE JSON line as your final output:
+{"status":"requested|blocked|nothing_to_do","head":"<sha>","fixed":["<thread ids>"],"disputed":["<thread ids>"],"reason":"<short>"}
+Use "blocked" with the reason when disputed findings remain unresolved.
+
+Never wait for or poll reviews, merge, touch other PRs, rewrite history except through \`prloop sync\`, or retry in a loop. A permission denial or a missing tool means stop immediately as blocked with the reason.`;
 }
 
-function runAgent(kind, prompt, cwd, opts) {
-  const model = opts.model ?? process.env.PRLOOP_MODEL;
-  const effort = opts.effort ?? process.env.PRLOOP_EFFORT;
-  const [cmd, args] = kind === 'codex'
-    ? ['codex', ['exec', '--sandbox', 'workspace-write', '-c', 'sandbox_workspace_write.network_access=true',
-      ...(model ? ['-m', model] : []), ...(effort ? ['-c', `model_reasoning_effort=${effort}`] : []), prompt]]
-    : ['claude', ['-p', prompt, '--model', model ?? 'claude-opus-5-5', '--effort', effort ?? 'medium',
-      '--permission-mode', 'auto', '--output-format', 'json']];
-  const r = spawnSync(cmd, args, { cwd, encoding: 'utf8', maxBuffer: 64 << 20, stdio: ['ignore', 'pipe', 'pipe'] });
-  return { status: r.status ?? 1, output: `${r.stdout ?? ''}\n${r.stderr ?? ''}${r.error ? `\n${r.error.message}` : ''}` };
+// Finds the agent's final JSON line, also inside a JSON wrapper such as `claude --output-format json`.
+export function parseAgentResult(text) {
+  let body = String(text ?? '');
+  try { const w = JSON.parse(body); if (typeof w?.result === 'string') body = w.result; } catch { /* plain text */ }
+  for (const line of body.trim().split('\n').reverse()) {
+    try {
+      const r = JSON.parse(line.trim().replace(/^`+|`+$/g, ''));
+      if (['requested', 'blocked', 'nothing_to_do'].includes(r?.status)) return { fixed: [], disputed: [], ...r };
+    } catch { /* keep looking */ }
+  }
+  return null;
+}
+
+const spawnAsync = (cmd, args, cwd) => new Promise((done) => {
+  const c = spawn(cmd, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+  let stdout = '', stderr = '';
+  c.stdout.on('data', (d) => { stdout += d; });
+  c.stderr.on('data', (d) => { stderr += d; });
+  c.on('error', (e) => done({ status: 1, stdout, stderr: `${stderr}${e.message}` }));
+  c.on('close', (code) => done({ status: code ?? 1, stdout, stderr }));
+});
+
+async function runFixAgent(cfg, prompt, cwd) {
+  if (cfg.agent === 'codex') {
+    const dir = mkdtempSync(join(tmpdir(), 'prloop-agent-'));
+    try {
+      const r = await spawnAsync('codex', ['exec', '--sandbox', 'workspace-write', '-c', 'sandbox_workspace_write.network_access=true', '-o', join(dir, 'last.txt'),
+        ...(cfg.model ? ['-m', cfg.model] : []), ...(cfg.effort ? ['-c', `model_reasoning_effort=${cfg.effort}`] : []), prompt], cwd);
+      return { ...r, final: existsSync(join(dir, 'last.txt')) ? readFileSync(join(dir, 'last.txt'), 'utf8') : r.stdout };
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
+  const r = await spawnAsync('claude', ['-p', prompt, '--model', cfg.model ?? 'claude-opus-5-5', '--effort', cfg.effort ?? 'medium',
+    '--permission-mode', 'auto', '--output-format', 'json'], cwd);
+  return { ...r, final: r.stdout };
 }
 
 export function findWorktree(branch, cwd) {
@@ -528,78 +589,140 @@ export function findWorktree(branch, cwd) {
   return null;
 }
 
-async function supervise(repo, prNum, cfg, opts, deadline) {
-  const st = loadState(repo, prNum);
-  const blocked = (reason, extra = {}) => { st.result = 'blocked'; saveState(repo, prNum, st); return { pr: prNum, verdict: 'blocked', reason, ...extra }; };
-  const maxRounds = Number(opts.maxRounds ?? 8);
-  for (;;) {
-    if (Date.now() > deadline) return blocked('overall deadline reached');
-    let raw = fetchPr(repo, prNum), s = classify(raw, cfg);
+const TERMINAL = new Set(['merged', 'merge_pending', 'clean', 'blocked', 'needs_human', 'needs_agent', 'deadline']);
+
+// Polls every PR round-robin in one process and spawns at most `--max-agents` agents or local reviews at a time.
+// Exits only when every PR is terminal, printing one summary line per PR.
+export async function runAll(opts, cfg) {
+  const repo = opts.repo;
+  const prs = String(opts.pr).split(',').map(Number);
+  const deadline = Date.now() + parseDuration(opts.deadline ?? '6h');
+  const maxAgents = Number(opts.maxAgents ?? 2), maxRounds = Number(opts.maxRounds ?? 8);
+  mkdirSync(stateDir(), { recursive: true });
+  const log = join(stateDir(), `run-${new Date().toISOString().replace(/[:.]/g, '-')}.jsonl`);
+  // ponytail: rounds and seen findings persist across runs on purpose; delete a PR's state file to reset them.
+  const states = prs.map((n) => ({ ...loadState(repo, n), repo, pr: n, log, phase: 'polling', reason: undefined, next: undefined }));
+  const busy = new Map();
+  const event = (st, phase, extra = {}) => {
+    Object.assign(st, { phase, updatedAt: new Date().toISOString() }, extra);
+    saveState(st);
+    appendFileSync(log, `${JSON.stringify({ at: st.updatedAt, pr: st.pr, phase, head: short(st.head), ...pick(extra, ['verdict', 'reason', 'status']) })}\n`);
+  };
+  const block = (st, reason, next = 'a human decision is needed') => event(st, 'blocked', { reason, next });
+
+  async function fix(st, s, cwd, v) {
+    if (++st.rounds > maxRounds) return block(st, `max rounds (${maxRounds}) reached`);
+    if (v.findings?.length) {
+      const repeated = recordFindings(st.seen, v.findings);
+      if (repeated.length) return block(st, 'the same finding came back after two fixes', 'decide whether the finding is valid');
+    }
+    const t = { ...v, repo, pr: st.pr, branch: s.branch, head: s.head, cwd, gate: cfg.gate, localReview: cfg.mode === 'local', requestBody: s.rerequestBody };
+    const prompt = buildPrompt(t);
+    if (cfg.agent === 'none') return event(st, 'needs_agent', { verdict: v.verdict, prompt, next: 'spawn an agent with this prompt, then rerun prloop run' });
+    event(st, 'agent', { verdict: v.verdict });
+    const r = await runFixAgent(cfg, prompt, cwd);
+    const result = parseAgentResult(r.final);
+    if (DENIED.test(`${r.final}\n${r.stderr}`)) return block(st, 'the agent reported a permission denial');
+    if (r.status !== 0) return block(st, `the agent exited with status ${r.status}: ${r.stderr.slice(-300)}`);
+    if (!result) return block(st, 'the agent output had no parseable result line');
+    if (result.disputed?.length && result.status !== 'requested') {
+      return event(st, 'needs_human', { status: result.status, reason: `disputed findings: ${result.disputed.join(', ')}`, next: 'decide the disputed threads' });
+    }
+    if (result.status === 'blocked') return block(st, `agent: ${result.reason ?? 'blocked'}`);
+    const after = classify(fetchPr(repo, st.pr), cfg);
+    const progressed = after.head !== s.head || after.unresolvedThreads.length < s.unresolvedThreads.length
+      || after.trigger?.id !== s.trigger?.id || isTested(after.head, cwd) !== isTested(s.head, cwd);
+    if (!progressed) return block(st, `agent made no progress (${result.status}): no commit, resolved thread, request or gate`);
+    event(st, 'polling', { status: result.status });
+  }
+
+  async function step(st) {
+    let raw, s;
+    try { raw = fetchPr(repo, st.pr); s = classify(raw, cfg); st.failures = 0; } catch (e) {
+      if (++st.failures >= 3) block(st, `GitHub read failed: ${String(e.stderr || e.message).slice(0, 300)}`);
+      return;
+    }
+    st.head = s.head;
+    if (s.state === 'MERGED') return event(st, 'merged', { mergeCommit: s.mergeCommit });
+    if (s.state === 'CLOSED') return block(st, 'the PR is closed');
     const cwd = opts.worktree ? resolve(opts.worktree) : findWorktree(s.branch, process.cwd());
     // A wrong --worktree would let a write-enabled agent commit to another branch.
-    if (cwd && tryGit(['branch', '--show-current'], cwd) !== s.branch) return blocked(`worktree ${cwd} does not have ${s.branch} checked out`);
-    const needsSync = () => s.mergeState === 'BEHIND' || s.mergeState === 'DIRTY' || s.mergeable === 'CONFLICTING';
-    let v = null;
-    if (needsSync()) {
-      if (!cwd) return blocked(`PR is ${s.mergeState} and no worktree for ${s.branch}; pass --worktree`);
-      v = { ...syncBranch({ cwd, branch: s.branch, base: s.base, head: s.head, settings: raw.repoSettings, union: opts.union }), pr: prNum };
-      if (v.verdict === 'error') return blocked(`sync failed: ${v.error}`);
-      if (v.verdict !== 'conflict') v = null;
+    if (cwd && tryGit(['branch', '--show-current'], cwd) !== s.branch) return block(st, `worktree ${cwd} does not have ${s.branch} checked out`);
+    const slot = () => busy.size < maxAgents;
+    if (s.mergeState === 'BEHIND' || s.mergeState === 'DIRTY' || s.mergeable === 'CONFLICTING') {
+      if (!cwd) return block(st, `PR is ${s.mergeState} and no worktree has ${s.branch}; pass --worktree`);
+      const v = syncBranch({ cwd, branch: s.branch, base: s.base, baseOid: raw.baseRefOid, head: s.head, settings: raw.repoSettings, union: opts.union });
+      if (v.verdict === 'error') return block(st, `sync failed: ${v.error}`);
+      if (v.verdict === 'synced') return event(st, 'polling', { verdict: 'synced', head: v.head });
+      if (v.verdict === 'conflict') return slot() && fix(st, s, cwd, { verdict: 'conflict', trigger: 'conflict', conflicts: v.conflicts });
     }
-    if (!v) {
-      v = await waitFor(repo, prNum, cfg, { interval: cfg.interval, cwd: cwd ?? process.cwd() });
+    const plan = reviewPlan(s, cfg);
+    if (plan.blocked) return block(st, plan.blocked);
+    if (plan.local) {
+      if (!cwd) return block(st, `no worktree has ${s.branch} for a local review; pass --worktree`);
+      if (!slot()) return;
+      event(st, 'local_review');
+      const r = await localReview(repo, s, cfg, cwd);
+      if (!r) return event(st, 'polling', { verdict: 'local_review_posted' });
+      if (r.verdict === 'blocked') return block(st, r.reason);
+      return fix(st, s, cwd, { verdict: 'not_requested', trigger: 'local_review', missing: r.missing });
     }
-    st.lastVerdict = v.verdict;
-    if (v.verdict === 'error' || v.verdict === 'blocked' || v.verdict === 'unavailable') return blocked(v.error ?? v.reason ?? 'wait failed');
-    if (v.verdict === 'clean') {
-      if (!opts.merge) { st.result = 'clean'; saveState(repo, prNum, st); return { pr: prNum, verdict: 'clean', head: v.head }; }
-      // GitHub computes mergeability lazily; give it a moment.
-      for (let i = 0; i < 6; i++) {
-        s = classify(fetchPr(repo, prNum), cfg);
-        if (s.mergeable !== 'UNKNOWN') break;
-        await sleep(5000);
-      }
-      if (s.head !== v.head) continue;
-      if (needsSync()) { // the next loop syncs, which changes the head and needs a fresh review
-        if (++st.rounds > maxRounds) return blocked(`max rounds (${maxRounds}) reached while syncing`);
-        continue;
-      }
+    if (s.verdict === 'pending') return st.phase === 'waiting' ? undefined : event(st, 'waiting', { verdict: 'pending' });
+    if (s.verdict === 'unavailable') return block(st, `cloud reviewer unavailable: ${s.unavailableReason}`, 'retry later or use --reviewer auto or local');
+    if (s.verdict === 'clean' && !opts.merge) return event(st, 'clean', { next: 'the current head is reviewed clean; merge when authorized' });
+    if (s.verdict === 'clean') {
+      if (s.unresolvedThreads.length) return; // classify reports findings in that case; defensive
       const missing = cwd ? localGate(s, cwd) : [`no worktree for ${s.branch} to confirm the head was tested; pass --worktree`];
-      if (!missing.length) {
-        if (s.mergeable !== 'MERGEABLE') return blocked(`GitHub reports mergeable=${s.mergeable}, mergeState=${s.mergeState}`);
-        sh('gh', ['pr', 'merge', String(prNum), '--repo', repo, `--${opts.merge}`, '--match-head-commit', s.head]);
-        // A merge queue or auto-merge accepts the command without merging yet: report the real state.
-        for (let i = 0; i < 6 && s.state !== 'MERGED'; i++) { await sleep(5000); s = classify(fetchPr(repo, prNum), cfg); }
-        st.result = s.state === 'MERGED' ? 'merged' : 'merge_pending'; saveState(repo, prNum, st);
-        return { pr: prNum, verdict: st.result, head: v.head, state: s.state, mergeCommit: s.mergeCommit };
-      }
-      if (!cwd) return blocked(missing[0]);
-      v = { verdict: 'not_tested', pr: prNum, head: s.head, missing,
-        next: `review is clean but the merge gate is not met: ${missing.join('; ')}. Run the gate on this head and \`prloop mark-tested\`; do not request another review unless the head changes` };
+      if (!cwd) return block(st, missing[0]);
+      if (missing.length) return slot() && fix(st, s, cwd, { verdict: 'not_tested', trigger: 'not_requested', missing,
+        note: 'The head is already reviewed clean: run the gate only and skip the review request (report status nothing_to_do).' });
+      if (s.mergeable !== 'MERGEABLE') return s.mergeable === 'UNKNOWN' ? undefined : block(st, `GitHub reports mergeable=${s.mergeable}`);
+      sh('gh', ['pr', 'merge', String(st.pr), '--repo', repo, `--${opts.merge}`, '--match-head-commit', s.head]);
+      const after = classify(fetchPr(repo, st.pr), cfg);
+      // A merge queue or auto-merge accepts the command without merging yet: report the real state.
+      return after.state === 'MERGED' ? event(st, 'merged', { mergeCommit: after.mergeCommit })
+        : event(st, 'merge_pending', { reason: `state ${after.state} after merge`, next: 'a merge queue or auto-merge holds the PR; verify later' });
     }
-    if (++st.rounds > maxRounds) return blocked(`max rounds (${maxRounds}) reached`, { last: v.verdict });
-    if (v.verdict === 'findings') {
-      const repeated = recordFindings(st.seen, v.findings);
-      if (repeated.length) return blocked('the same finding came back after two fixes', { fingerprints: repeated });
-    }
-    saveState(repo, prNum, st);
-    const prompt = buildPrompt(repo, v);
-    if (cfg.agent === 'none') return { ...v, prompt };
-    if (!cwd) return blocked(`no worktree checked out for ${s.branch}; pass --worktree`);
-    const before = classify(fetchPr(repo, prNum), cfg);
-    const r = runAgent(cfg.agent, prompt, cwd, opts);
-    if (DENIED.test(r.output)) return blocked('agent reported a permission denial', { output: r.output.slice(-800) });
-    if (r.status !== 0) return blocked(`agent exited with status ${r.status}`, { output: r.output.slice(-800) });
-    const after = classify(fetchPr(repo, prNum), cfg);
-    const progressed = after.head !== before.head || after.unresolvedThreads.length < before.unresolvedThreads.length
-      || (after.trigger?.id && after.trigger.id !== before.trigger?.id) || (v.verdict === 'not_tested' && isTested(after.head, cwd));
-    if (!progressed) return blocked('agent pushed no commit, resolved no thread and posted no request');
+    if (!cwd) return block(st, `no worktree has ${s.branch} checked out; pass --worktree`);
+    if (!slot()) return;
+    const trigger = s.verdict === 'timeout' ? 'timeout' : s.verdict === 'not_requested' ? 'not_requested'
+      : s.unresolvedThreads.some((x) => isLocal(x.body)) ? 'local_review' : 'findings';
+    return fix(st, s, cwd, { verdict: s.verdict, trigger, findings: s.unresolvedThreads, missing: s.reasons });
   }
+
+  for (;;) {
+    for (const st of states) {
+      if (TERMINAL.has(st.phase) || busy.has(st.pr)) continue;
+      if (Date.now() > deadline) { event(st, 'deadline', { reason: 'overall deadline reached', next: 'rerun prloop run or hand over' }); continue; }
+      const p = step(st).catch((e) => block(st, `prloop error: ${String(e.stderr || e.message).slice(0, 300)}`))
+        .finally(() => busy.delete(st.pr));
+      busy.set(st.pr, p);
+      if (!['agent', 'local_review'].includes(st.phase)) await p; // only agents and local reviews run in parallel
+    }
+    if (states.every((st) => TERMINAL.has(st.phase))) break;
+    await Promise.race([sleep(cfg.interval), ...busy.values()]);
+  }
+  return states.map((st) => ({ pr: st.pr, verdict: st.phase === 'needs_agent' ? st.verdict : st.phase, reason: st.reason, head: st.head,
+    rounds: st.rounds, next: st.next, ...(st.prompt && st.phase === 'needs_agent' ? { prompt: st.prompt } : {}) }));
+}
+
+const pick = (o, keys) => Object.fromEntries(keys.filter((k) => o[k] !== undefined).map((k) => [k, o[k]]));
+
+// Cheap check-in for a coordinator: state files plus the latest events, no GitHub calls.
+export function runStatus(repoFilter) {
+  const dir = stateDir();
+  const files = existsSync(dir) ? readdirSync(dir) : [];
+  const prs = files.filter((f) => f.endsWith('.json')).map((f) => JSON.parse(readFileSync(join(dir, f), 'utf8')))
+    .filter((st) => !repoFilter || st.repo === repoFilter)
+    .map((st) => ({ repo: st.repo, pr: st.pr, phase: st.phase, head: short(st.head), rounds: st.rounds, reason: st.reason, next: st.next, updatedAt: st.updatedAt }));
+  const latest = files.filter((f) => f.startsWith('run-')).sort().at(-1);
+  const events = latest ? readFileSync(join(dir, latest), 'utf8').trim().split('\n').slice(-8).map((l) => JSON.parse(l)) : [];
+  return { prs, events };
 }
 
 // blocked wins; otherwise the first verdict that still needs action; 0 when all are done.
 export function runExitCode(results) {
-  const codes = results.map((r) => EXIT[r.verdict] ?? 0);
+  const codes = results.map((r) => (['needs_human', 'deadline'].includes(r.verdict) ? EXIT.blocked : EXIT[r.verdict] ?? 0));
   return codes.includes(EXIT.blocked) ? EXIT.blocked : codes.find(Boolean) ?? 0;
 }
 
@@ -613,15 +736,13 @@ export async function main(argv) {
   const cfg = config(opts);
   try {
     if (cmd === 'mark-tested') return out({ verdict: 'ok', tested: markTested(opts.sha, process.cwd()) }, 0);
+    if (cmd === 'run' && opts.status) return out(runStatus(opts.repo), 0);
     if (cmd === 'run') {
       if (!opts.repo || !opts.pr) throw new Error('run needs --repo owner/name and --pr N[,N...]');
       if (opts.merge && !['rebase', 'squash', 'merge'].includes(opts.merge)) throw new Error('--merge must be rebase, squash or merge');
-      const deadline = Date.now() + parseDuration(opts.deadline ?? '4h');
-      const results = [];
-      // ponytail: PRs run sequentially; parallel supervisors per PR if throughput matters.
-      for (const n of String(opts.pr).split(',')) results.push(await supervise(opts.repo, Number(n), cfg, opts, deadline));
-      const code = runExitCode(results);
-      return out(results.length === 1 ? results[0] : { results }, code);
+      const results = await runAll(opts, cfg);
+      for (const r of results) console.log(JSON.stringify(r));
+      return runExitCode(results);
     }
     if (!prArg) throw new Error(`${cmd} needs a PR number`);
     const repo = resolveRepo(opts);
@@ -634,6 +755,9 @@ export async function main(argv) {
     }
     if (cmd === 'ready') {
       const s = classify(fetchPr(repo, prArg), cfg);
+      const gate = readyGate(s, cfg.gate, process.cwd());
+      if (gate && !gate.ok) return out({ ready: false, pr: s.pr, head: s.head, gate: 'failed', exitCode: gate.status, tail: gate.tail,
+        next: 'rerun the failing tests or step with its focused command, fix until it passes, then run `prloop ready` again' }, EXIT.blocked);
       const missing = [...s.reasons, ...localGate(s, process.cwd())];
       return out({ ready: !missing.length, pr: s.pr, head: s.head, missing, trigger: cfg.trigger }, missing.length ? EXIT.blocked : 0);
     }
@@ -643,7 +767,7 @@ export async function main(argv) {
     }
     if (cmd === 'sync') {
       const pr = fetchPr(repo, prArg);
-      const v = syncBranch({ cwd: process.cwd(), branch: pr.headRefName, base: pr.baseRefName, head: pr.headRefOid, settings: pr.repoSettings, union: opts.union });
+      const v = syncBranch({ cwd: process.cwd(), branch: pr.headRefName, base: pr.baseRefName, baseOid: pr.baseRefOid, head: pr.headRefOid, settings: pr.repoSettings, union: opts.union });
       return out({ pr: Number(prArg), ...v }, v.verdict === 'conflict' ? EXIT.conflict : v.verdict === 'error' ? EXIT.error : 0);
     }
     throw new Error(`unknown command: ${cmd}`);
