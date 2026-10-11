@@ -134,24 +134,25 @@ export function fetchPr(repo, pr) {
   const out = ghRetry( ['api', 'graphql', '-f', `query=${PR_QUERY}`, '-F', `owner=${owner}`, '-F', `name=${name}`, '-F', `pr=${pr}`]);
   const { viewer, repository: r } = JSON.parse(out).data;
   if (!r?.pullRequest) throw new Error(`PR ${repo}#${pr} not found`);
-  return { ...r.pullRequest, viewer, headSeenAt: headSeenAt(r.pullRequest.headRefOid),
+  return { ...r.pullRequest, viewer, headSeenAt: headSeenAt(`${repo}#${pr}`, r.pullRequest.headRefOid),
     repoSettings: { merge: r.mergeCommitAllowed, squash: r.squashMergeAllowed, rebase: r.rebaseMergeAllowed } };
 }
 
-// When prloop first saw each head. GitHub exposes no push time, and a fast-forward to an older commit
-// keeps an old committer date, so this local observation is the lower bound for current-head evidence.
-// It errs safe: a signal posted before prloop first saw the head is ignored, costing at most a re-request.
-function headSeenAt(sha) {
+// When prloop saw this PR's current head become its head. GitHub exposes no push time, and a
+// fast-forward or a return to an earlier SHA keeps an old committer date, so this local observation of
+// each head transition is the lower bound for current-head evidence. It errs safe: a signal posted
+// before prloop noticed the change is ignored, costing at most a re-request.
+export function headSeenAt(key, sha) {
   const f = join(stateDir(), 'heads.json');
   let seen = {};
   try { seen = JSON.parse(readFileSync(f, 'utf8')); } catch { /* first use */ }
-  if (!seen[sha]) {
-    seen[sha] = new Date().toISOString();
-    seen = Object.fromEntries(Object.entries(seen).sort((a, b) => a[1].localeCompare(b[1])).slice(-500)); // bounded
+  if (seen[key]?.sha !== sha) {
+    seen[key] = { sha, at: new Date().toISOString() };
+    seen = Object.fromEntries(Object.entries(seen).sort((a, b) => a[1].at.localeCompare(b[1].at)).slice(-500)); // bounded
     mkdirSync(stateDir(), { recursive: true });
     writeFileSync(f, JSON.stringify(seen));
   }
-  return seen[sha];
+  return seen[key].at;
 }
 
 // ---------- pure classification (tested with fixtures) ----------
