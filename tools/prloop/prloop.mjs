@@ -200,7 +200,11 @@ export function classify(pr, cfg, nowMs = Date.now()) {
   }
   const since = current ? triggerNode.createdAt : headTime;
 
-  const signals = [...(current ? triggerNode.reactions.nodes : []), ...(pr.reactions?.nodes ?? [])]
+  // A requested review reacts on the request. Without one, PR-body reactions count only once the bot has
+  // started (👀) after this head, so a late 👍 from a review of the previous head cannot clear this one.
+  const bodyReactions = (pr.reactions?.nodes ?? []).filter((r) => isBot(r) && r.createdAt >= headTime);
+  const reactions = current ? triggerNode.reactions.nodes : bodyReactions.some((r) => r.content === 'EYES') ? bodyReactions : [];
+  const signals = reactions
     .filter((r) => isBot(r) && r.createdAt >= since && (r.content === 'EYES' || r.content === 'THUMBS_UP'))
     .map((r) => ({ at: r.createdAt, state: r.content === 'EYES' ? 'reviewing' : 'clean' }));
   const botReviews = pr.reviews.nodes.filter((r) => isBot(r) && r.commit?.oid === head && r.submittedAt >= since);
@@ -543,7 +547,7 @@ export function recordFindings(seen, findings) {
 export const DENIED = /permission (was |has been )?denied|denied permission|not (been )?permitted|requires? (your )?approval/i;
 
 // Comment text without badges, HTML, markdown emphasis and the reviewer's boilerplate footer.
-export const plain = (body) => String(body ?? '').replace(/\n+(AGENTS\.md reference|Useful\? React)[\s\S]*$/, '').replace(/<details>[\s\S]*?<\/details>/g, '')
+export const plain = (body) => String(body ?? '').replace(/\n+(AGENTS\.md reference|Useful\? React)[\s\S]*$/, '').replace(/<details>[\s\S]*?(<\/details>|$)/g, '')
   .replace(/!\[[^\]]*\]\([^)]*\)/g, '').replace(/<[^>]+>/g, '').replace(/[*_`#>]/g, '').replace(/\s+/g, ' ').trim();
 
 // The fix agent sees only this trigger, never the round history.
@@ -612,6 +616,15 @@ async function runFixAgent(cfg, prompt, cwd) {
   return { ...r, final: r.stdout };
 }
 
+// A wrong --worktree would let a write-enabled agent commit to another branch or repository: require the
+// PR branch checked out and the PR head commit present (after fetching the branch's remote).
+export function checkWorktree(cwd, s) {
+  if (tryGit(['branch', '--show-current'], cwd) !== s.branch) return `worktree ${cwd} does not have ${s.branch} checked out`;
+  tryGit(['fetch', '--quiet', tryGit(['config', `branch.${s.branch}.remote`], cwd) || 'origin', s.branch], cwd);
+  if (tryGit(['cat-file', '-e', `${s.head}^{commit}`], cwd) === null) return `worktree ${cwd} does not contain PR head ${short(s.head)}: wrong repository?`;
+  return null;
+}
+
 export function findWorktree(branch, cwd) {
   const list = tryGit(['worktree', 'list', '--porcelain'], cwd) ?? '';
   for (const block of list.split('\n\n')) {
@@ -648,7 +661,7 @@ export async function runAll(opts, cfg) {
       const repeated = recordFindings(st.seen, v.findings);
       if (repeated.length) return block(st, 'the same finding came back after two fixes', 'decide whether the finding is valid');
     }
-    const t = { ...v, repo, pr: st.pr, branch: s.branch, head: s.head, cwd, gate: cfg.gate, localReview: cfg.mode === 'local', requestBody: s.rerequestBody };
+    const t = { ...v, repo, pr: st.pr, branch: s.branch, head: s.head, cwd, gate: cfg.gate, localReview: cfg.mode === 'local' || !!v.localReview, requestBody: s.rerequestBody };
     const prompt = buildPrompt(t);
     if (cfg.agent === 'none') return event(st, 'needs_agent', { verdict: v.verdict, prompt, next: 'spawn an agent with this prompt, then rerun prloop run' });
     event(st, 'agent', { verdict: v.verdict });
@@ -679,8 +692,8 @@ export async function runAll(opts, cfg) {
     if (s.state === 'MERGED') return event(st, 'merged', { mergeCommit: s.mergeCommit });
     if (s.state === 'CLOSED') return block(st, 'the PR is closed');
     const cwd = opts.worktree ? resolve(opts.worktree) : findWorktree(s.branch, process.cwd());
-    // A wrong --worktree would let a write-enabled agent commit to another branch.
-    if (cwd && tryGit(['branch', '--show-current'], cwd) !== s.branch) return block(st, `worktree ${cwd} does not have ${s.branch} checked out`);
+    const wrong = cwd && checkWorktree(cwd, s);
+    if (wrong) return block(st, wrong);
     const slot = () => busy.size < maxAgents;
     if (s.mergeState === 'BEHIND' || s.mergeState === 'DIRTY' || s.mergeable === 'CONFLICTING') {
       if (!cwd) return block(st, `PR is ${s.mergeState} and no worktree has ${s.branch}; pass --worktree`);
@@ -698,7 +711,7 @@ export async function runAll(opts, cfg) {
       const r = await localReview(repo, s, cfg, cwd);
       if (!r) return event(st, 'polling', { verdict: 'local_review_posted' });
       if (r.verdict === 'blocked') return block(st, r.reason);
-      return fix(st, s, cwd, { verdict: 'not_requested', trigger: 'local_review', missing: r.missing });
+      return fix(st, s, cwd, { verdict: 'not_requested', trigger: 'local_review', missing: r.missing, localReview: true });
     }
     if (s.verdict === 'pending') return st.phase === 'waiting' ? undefined : event(st, 'waiting', { verdict: 'pending' });
     if (s.verdict === 'unavailable') return block(st, `cloud reviewer unavailable: ${s.unavailableReason}`, 'retry later or use --reviewer auto or local');
