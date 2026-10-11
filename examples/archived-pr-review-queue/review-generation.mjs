@@ -1671,6 +1671,7 @@ export function validateGenerationCompletionAttestation(
     expectedPrNumber = null,
     expectedHeadSha = null,
     expectedGitTreeHash = null,
+    expectedMembershipFingerprints,
   } = {},
 ) {
   const record = asRecord(attestation, "generation completion attestation");
@@ -1719,6 +1720,23 @@ export function validateGenerationCompletionAttestation(
       { mismatches, expected, actual },
     );
   }
+  // The attested clusters must be exactly the generation's assigned clusters,
+  // so a worker cannot drop a cluster and still pass.
+  const expectedMembership = [
+    ...new Set(
+      stringList(expectedMembershipFingerprints, "expectedMembershipFingerprints"),
+    ),
+  ].sort();
+  const attestedMembership = normalized.clusters
+    .map((cluster) => cluster.membership_fingerprint)
+    .sort();
+  if (JSON.stringify(expectedMembership) !== JSON.stringify(attestedMembership)) {
+    fail(
+      "generation_attestation_mismatch",
+      "generation completion attestation does not cover the assigned clusters",
+      { expected: expectedMembership, actual: attestedMembership },
+    );
+  }
   return {
     status: "valid",
     ...normalized,
@@ -1735,6 +1753,7 @@ export function evaluateGenerationCompletionAttestationReuse({
   prNumber,
   currentHeadSha,
   currentGitTreeHash,
+  expectedMembershipFingerprints,
   reason,
 } = {}) {
   if (reason !== "review_timeout") {
@@ -1748,6 +1767,7 @@ export function evaluateGenerationCompletionAttestationReuse({
     expectedPrNumber: prNumber,
     expectedHeadSha: currentHeadSha,
     expectedGitTreeHash: currentGitTreeHash,
+    expectedMembershipFingerprints,
   });
   return {
     status: "reusable_after_review_timeout",

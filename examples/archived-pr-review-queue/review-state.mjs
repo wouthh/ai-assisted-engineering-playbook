@@ -370,11 +370,7 @@ export function isNoFindingsReviewerMessage(body) {
     return true;
   }
 
-  return (
-    /status\/summary update/i.test(stripped) &&
-    /not a new reviewer finding or requested fix/i.test(stripped) &&
-    /no concrete follow-up code changes to apply right now/i.test(stripped)
-  );
+  return false;
 }
 
 export function extractActionableReviewSummaryBody(body) {
