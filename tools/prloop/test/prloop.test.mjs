@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import {
-  buildPrompt, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, syncBranch, unionLines, waitFor,
+  buildPrompt, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, syncBranch, unionLines, waitFor,
 } from '../prloop.mjs';
 
 const fixture = () => JSON.parse(readFileSync(new URL('./pr-fixture.json', import.meta.url), 'utf8'));
@@ -118,6 +118,13 @@ test('a head first seen after a request does not inherit that request (fast-forw
   const s = classify(pr, cfg, Date.parse(at('10:31')));
   assert.equal(s.trigger.afterHead, false);
   assert.equal(s.verdict, 'not_requested');
+});
+
+test('a lone PR-body thumbs-up after a head change does not clear the new head', () => {
+  const pr = fixture();
+  pr.comments.nodes.pop(); // no request for this head
+  pr.reactions.nodes.push({ content: 'THUMBS_UP', createdAt: at('10:20'), user: BOT }); // late result of the previous head's review
+  assert.equal(classify(pr, cfg, NOW).verdict, 'not_requested');
 });
 
 test('more than one page of review threads fails closed', () => {
@@ -486,6 +493,7 @@ test('run --status reads state files and the latest events without GitHub', (t) 
 
 test('plain strips badges, markup and the reviewer footer', () => {
   assert.equal(plain('**<sub>![P2 Badge](https://example.invalid/b.svg)</sub>  Fix `x`**\n\nDetails here.\n\nAGENTS.md reference: [x](y)\n\nUseful? React'), 'Fix x Details here.');
+  assert.equal(plain('Review.\n\n<details> <summary>About</summary>\ntruncated befo'), 'Review.');
   assert.equal(plain('### Review\n\nSuggestions below.\n\n<details> <summary>About</summary>\nboilerplate\n</details>\n'), 'Review Suggestions below.');
 });
 
@@ -537,4 +545,13 @@ test('sync merges the reported base commit, not extra commits on the remote bran
 test('the local review diffs from the reported base commit', () => {
   assert.match(localReviewPrompt({ pr: 7, base: 'main', baseOid: 'b0b0', head: 'abc' }), /git diff b0b0\.\.\.HEAD/);
   assert.match(localReviewPrompt({ pr: 7, base: 'main', head: 'abc' }), /git diff origin\/main\.\.\.HEAD/);
+});
+
+test('worktree check: branch and PR head commit must match', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  assert.equal(checkWorktree(r.work, { branch: 'feat', head }), null);
+  assert.match(checkWorktree(r.work, { branch: 'other', head }), /does not have other checked out/);
+  assert.match(checkWorktree(r.work, { branch: 'feat', head: 'f'.repeat(40) }), /does not contain PR head/);
 });
