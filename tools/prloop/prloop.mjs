@@ -132,7 +132,7 @@ const PR_QUERY = `query($owner:String!,$name:String!,$pr:Int!){viewer{login} rep
   pullRequest(number:$pr){number url state headRefName reactions(last:50){nodes{content createdAt user{login}}} baseRefName baseRefOid headRefOid mergeable mergeStateStatus mergeCommit{oid}
     timelineItems(last:1,itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT]){nodes{... on HeadRefForcePushedEvent{createdAt}}}
     commits(last:1){nodes{commit{oid committedDate}}}
-    reviewThreads(first:100){pageInfo{hasNextPage} nodes{id isResolved isOutdated path line comments(first:1){nodes{body createdAt author{login}}}}}
+    reviewThreads(first:100){pageInfo{hasNextPage} nodes{id isResolved isOutdated path line comments(first:1){nodes{body createdAt author{login} pullRequestReview{state}}}}}
     comments(last:100){pageInfo{hasPreviousPage} nodes{id databaseId body createdAt author{login} reactions(last:50){nodes{content createdAt user{login}}}}}
     reviews(last:50){pageInfo{hasPreviousPage} nodes{id body state submittedAt author{login} commit{oid} comments{totalCount}}}}}}`;
 
@@ -210,7 +210,8 @@ export function classify(pr, cfg, nowMs = Date.now()) {
   // Local review output counts only from the authenticated user who posts it; anyone can type the prefix.
   const trusted = (n) => isLocal(n.body) && !!pr.viewer?.login && login(n) === pr.viewer.login;
   const isBot = (n) => cfg.reviewer.test(login(n)) || trusted(n);
-  const threads = pr.reviewThreads.nodes.filter((t) => !t.isResolved).map((t) => {
+  // Inline comments of a dismissed review stay as unresolved threads; the review was withdrawn, so they are dropped too.
+  const threads = pr.reviewThreads.nodes.filter((t) => !t.isResolved && t.comments.nodes[0]?.pullRequestReview?.state !== 'DISMISSED').map((t) => {
     const c = t.comments.nodes[0] ?? {};
     return { id: t.id, path: t.path, line: t.line, outdated: !!t.isOutdated, author: login(c), fromReviewer: isBot(c), createdAt: c.createdAt, body: (c.body ?? '').slice(0, 2000) };
   });
