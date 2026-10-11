@@ -104,6 +104,15 @@ test('a PR-body thumbs-up after a new request counts only after this cycle\'s ey
   assert.equal(classify(pr, cfg, AFTER).verdict, 'clean'); // this cycle acknowledged before the 👍
 });
 
+test('a PR-body thumbs-up without eyes does not count when older PR-body reactions were truncated', () => {
+  const pr = cleanWithoutAck('2603924');
+  pr.comments.nodes.pop();
+  pr.comments.nodes.shift(); // no earlier request visible
+  pr.reactions.nodes.push({ content: 'THUMBS_UP', createdAt: '2026-01-01T22:06:11Z', user: BOT });
+  pr.reactions.pageInfo = { hasPreviousPage: true }; // an older cycle's reaction may be cut off
+  assert.equal(classify(pr, cfg, AFTER).reviewerState.state, 'none');
+});
+
 test('an unacknowledged clean comment naming an older commit does not clear the head', () => {
   const pr = cleanWithoutAck('1111111');
   assert.equal(classify(pr, cfg, AFTER).reviewerState.state, 'none'); // no clean signal: after the ack timeout it times out
@@ -1583,6 +1592,27 @@ test('run keeps polling when an agent without a result line still made progress'
   assert.ok(events.includes('agent_no_result'), events.join(','));
   const log = readFileSync(join(process.env.XDG_STATE_HOME, 'prloop', readdirSync(join(process.env.XDG_STATE_HOME, 'prloop')).find((f) => f.startsWith('run-'))), 'utf8');
   assert.match(log, /agent made progress without a result line \(the agent session ended at its max-turns limit\)/);
+});
+
+test('run counts a configured gate pass as progress when the head already had another gate\'s marker', async (t) => {
+  const state = tempState(t);
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  writeFileSync(join(state, 'heads.json'), JSON.stringify({ 'example-org/example-repo#7': { sha: head, at: at('09:00') } }));
+  markTested(head, r.work); // a generic marker left by another gate
+  const pr = fixture();
+  Object.assign(pr, { headRefName: 'feat', headRefOid: head, mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE' });
+  request(pr).reactions.nodes.push({ content: 'THUMBS_UP', createdAt: at('10:30'), user: BOT });
+  fakeGh(t, r.dir, pr);
+  const mod = fileURLToPath(new URL('../prloop.mjs', import.meta.url));
+  writeFileSync(join(r.dir, 'bin', 'claude'), `#!/bin/sh
+node -e 'import(process.argv[1]).then((m) => m.recordGatePass("true", process.cwd()))' "${mod}"
+echo '{"status":"nothing_to_do","head":"${head}"}'
+`, { mode: 0o755 });
+  const [res] = await runAll({ repo: 'example-org/example-repo', pr: '7', worktree: r.work, merge: 'rebase', deadline: '1h' }, { ...cfg, gate: 'true', interval: 1 }, { metrics: idle().metrics });
+  assert.equal(res.verdict, 'merged', JSON.stringify(res));
 });
 
 test('run skips a locked worktree before judging its checkout: the holder\'s uncommitted edit does not block', async (t) => {
