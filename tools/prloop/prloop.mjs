@@ -701,7 +701,8 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
   const rebase = !settings.merge && !settings.squash;
   // A rebase-only repository refuses a branch with merge commits even when it contains the base: linearize it.
   const merges = rebase && !!git(['rev-list', '--merges', `${target}..HEAD`], cwd);
-  if (!merges && tryGit(['merge-base', '--is-ancestor', target, 'HEAD'], cwd) !== null) return { verdict: 'up_to_date', head };
+  const upToDate = tryGit(['merge-base', '--is-ancestor', target, 'HEAD'], cwd) !== null;
+  if (!merges && upToDate) return { verdict: 'up_to_date', head };
   const env = { ...process.env, GIT_EDITOR: 'true' };
   const step = (args) => spawnSync('git', args, { cwd, env, encoding: 'utf8' }).status === 0;
   const unioned = new Set();
@@ -721,6 +722,14 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
   if (!ok) {
     step([rebase ? 'rebase' : 'merge', '--abort']);
     return { verdict: 'error', error: `${rebase ? 'rebase' : 'merge'} failed` };
+  }
+  // A rebase drops merge commits, including edits made only in them: push only when the result equals merging the base.
+  if (merges) {
+    const expected = upToDate ? git(['rev-parse', `${head}^{tree}`], cwd) : tryGit(['merge-tree', '--write-tree', target, head], cwd)?.split('\n')[0];
+    if (git(['rev-parse', 'HEAD^{tree}'], cwd) !== expected) {
+      git(['reset', '--quiet', '--hard', head], cwd);
+      return { verdict: 'error', error: 'linearizing would drop changes made in merge commits: linearize the branch by hand' };
+    }
   }
   const push = rebase ? ['push', `--force-with-lease=${branch}:${head}`, headRemote, `HEAD:${branch}`] : ['push', headRemote, `HEAD:${branch}`];
   if (!step(push)) return { verdict: 'error', error: 'push failed; the branch is updated locally only' };
@@ -860,7 +869,7 @@ export async function localReview(repo, s, cfg, cwd, onLog = () => {}) {
   if (cfg.agent === 'none') return { verdict: 'blocked', pr: s.pr, head: s.head,
     reason: '--agent none runs no local reviewer: review the head yourself or rerun with --agent claude or codex' };
   const missing = s.unresolvedThreads.length ? [`${s.unresolvedThreads.length} unresolved threads`] : [];
-  missing.push(...localGate(s, cwd));
+  missing.push(...localGate(s, cwd, cfg.gate));
   if (missing.length) return { verdict: 'not_requested', pr: s.pr, head: s.head, missing, next: `a local review needs: ${missing.join('; ')}` };
   // Fail closed: a missing or stale base would make an empty diff look like a clean review.
   const baseError = fetchBase(cwd, s.base, s.baseOid);
@@ -1377,7 +1386,7 @@ export async function main(argv) {
     const repo = resolveRepo(opts);
     if (cmd === 'status') {
       const s = classify(fetchPr(repo, prArg), cfg);
-      const local = tryGit(['rev-parse', '--git-dir']) ? localGate(s, process.cwd()) : [];
+      const local = tryGit(['rev-parse', '--git-dir']) ? localGate(s, process.cwd(), cfg.gate) : [];
       const unresolvedThreads = s.unresolvedThreads.map((t) => ({ ...t, body: t.body.slice(0, 300) }));
       return out({ ...s, unresolvedThreads, reasons: [...s.reasons, ...local], readyToRequest: s.readyToRequest && !local.length,
         tested: isTested(s.head, process.cwd()) }, 0);
