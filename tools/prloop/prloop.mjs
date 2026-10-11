@@ -2,10 +2,10 @@
 // prloop: wait for an external PR reviewer bot and tell the agent what to do next.
 // Single file, no dependencies. Needs Node 20+, git and an authenticated `gh`.
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { appendFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
+import { appendFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { availableParallelism, freemem, homedir, loadavg, tmpdir, totalmem } from 'node:os';
 import { join, resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 export const EXIT = { clean: 0, findings: 10, not_requested: 20, requested_while_unresolved: 21, not_tested: 22, timeout: 30, unavailable: 31, error: 40, conflict: 41, blocked: 50 };
 
@@ -15,7 +15,7 @@ Recommended: start the supervisor once in the background, check in with --status
   prloop run --repo owner/name --pr N[,N...] [--gate "<cmd>"] [--max-agents 2] [--max-rounds 6]
              [--agent claude|codex|none] [--merge rebase|squash|merge] [--worktree <path>]
              [--deadline 6h] [--model <m>] [--effort <e>] [--union <glob>]...
-  prloop run --status [--repo owner/name]
+  prloop run --status [--repo owner/name]   PR states plus one machine line (load, free memory, gate slots)
   prloop reset-rounds <pr> [--repo owner/name]   one explicit, logged reset of the round counter
 
 Agent-in-the-loop commands:
@@ -38,12 +38,22 @@ Options (flag or env):
   --max-local-reviews <n>   PRLOOP_MAX_LOCAL_REVIEWS  default: 3 per PR
   --agent claude|codex|none PRLOOP_AGENT           fix agent and local reviewer; --model, --effort
 
+Self-check: \`run\` and \`ready\` warn when prloop's own checkout is dirty, off its default branch or behind it.
+  --require-current         PRLOOP_REQUIRE_CURRENT=1  fail with a usage error instead of warning
+
+Machine resources (on by default; shared by every prloop process of the user):
+  --gate-slots <n>          PRLOOP_GATE_SLOTS      default: 2 gates at once, machine-wide
+  --max-load <x>            PRLOOP_MAX_LOAD        default: 0.75 x CPU cores (1-minute load average)
+  --min-free-mem <size>     PRLOOP_MIN_FREE_MEM    default: the larger of 4G and 10% of RAM
+  --resource-wait <dur>     PRLOOP_RESOURCE_WAIT   default: 30m, then proceed with one slot only
+  --gate-tmpdir <dir>       PRLOOP_GATE_TMPDIR     run each gate with a private TMPDIR under <dir>
+
 Exit codes: 0 clean/ok/merged, 10 findings, 20 not_requested, 21 requested_while_unresolved, 22 not_tested,
             30 timeout, 31 unavailable, 40 error, 41 conflict, 50 blocked / not ready / needs a human / merge pending.`;
 
 // ---------- small helpers ----------
 
-const FLAGS = new Set(['help', 'status']);
+const FLAGS = new Set(['help', 'status', 'requireCurrent']);
 
 // Every option except FLAGS takes a value; a missing one fails instead of becoming `true`.
 export function parseArgs(argv) {
@@ -73,6 +83,22 @@ const positiveInt = (name, v) => {
   if (!/^\d+$/.test(String(v)) || !(Number(v) > 0) || !Number.isSafeInteger(Number(v))) throw new Error(`--${name} must be a positive integer, not ${v}`);
   return Number(v);
 };
+
+// Undefined keeps the per-machine default, computed when the metrics are read.
+const positiveNumber = (name, v) => {
+  if (v === undefined) return undefined;
+  if (!/^\d+(\.\d+)?$/.test(String(v)) || !(Number(v) > 0)) throw new Error(`--${name} must be a positive number, not ${v}`);
+  return Number(v);
+};
+
+// Binary units: 512M, 4G, 4GiB or plain bytes.
+export function parseSize(v, name = 'min-free-mem') {
+  if (v === undefined) return undefined;
+  const m = /^(\d+(?:\.\d+)?)\s*([KMGT]?)(i?B)?$/i.exec(String(v));
+  const bytes = m ? Math.round(Number(m[1]) * 1024 ** ' KMGT'.indexOf(m[2].toUpperCase() || ' ')) : NaN;
+  if (!(bytes > 0) || !Number.isSafeInteger(bytes)) throw new Error(`--${name} must be a positive size such as 512M or 4G, not ${v}`);
+  return bytes;
+}
 
 export function globToRegex(glob) {
   let re = '';
@@ -122,6 +148,11 @@ export function config(opts, env = process.env) {
     deadline: parseDuration(opts.deadline ?? '6h', 'deadline'),
     maxRounds: positiveInt('max-rounds', opts.maxRounds ?? 6),
     maxAgents: positiveInt('max-agents', opts.maxAgents ?? 2),
+    gateSlots: positiveInt('gate-slots', opts.gateSlots ?? env.PRLOOP_GATE_SLOTS ?? 2),
+    maxLoad: positiveNumber('max-load', opts.maxLoad ?? env.PRLOOP_MAX_LOAD),
+    minFreeMem: parseSize(opts.minFreeMem ?? env.PRLOOP_MIN_FREE_MEM),
+    resourceWait: parseDuration(opts.resourceWait ?? env.PRLOOP_RESOURCE_WAIT ?? '30m', 'resource-wait'),
+    gateTmpdir: (opts.gateTmpdir ?? env.PRLOOP_GATE_TMPDIR) && resolve(opts.gateTmpdir ?? env.PRLOOP_GATE_TMPDIR),
   };
 }
 
@@ -301,6 +332,106 @@ export function classify(pr, cfg, nowMs = Date.now()) {
   };
 }
 
+// ---------- machine resources ----------
+// Several prloop processes and unrelated work can share one machine: agents and gates start only while the
+// load average and free memory allow it, and gates take one of N slots shared by all of the user's prloop
+// processes. None of this can deadlock: a resource wait ends after --resource-wait with one slot only.
+
+const GiB = 2 ** 30;
+const SLOT_POLL = 5e3;
+const gib = (b) => (b / GiB).toFixed(1);
+const logStderr = (e) => console.error(JSON.stringify({ at: new Date().toISOString(), ...e }));
+export const slotDir = () => join(process.env.XDG_RUNTIME_DIR || '/tmp', 'prloop-slots');
+
+// MemAvailable counts reclaimable page cache; os.freemem() does not, so it is only the fallback.
+export function machineMetrics() {
+  let freeMem = freemem();
+  try { const m = /^MemAvailable:\s+(\d+) kB/m.exec(readFileSync('/proc/meminfo', 'utf8')); if (m) freeMem = Number(m[1]) * 1024; } catch { /* not Linux */ }
+  return { load: loadavg()[0], cores: availableParallelism(), freeMem, totalMem: totalmem() };
+}
+
+export const limits = (cfg, m) => ({ maxLoad: cfg.maxLoad ?? 0.75 * m.cores, minFreeMem: cfg.minFreeMem ?? Math.max(4 * GiB, Math.round(0.1 * m.totalMem)) });
+
+// One admission check. `w` tracks one wait period: `waiting_for_resources` is logged once when it starts and
+// `resource_wait_expired` once after --resource-wait. Returns ok, wait, or expired (proceed with one slot only).
+export function admitStep(w, cfg, m, now, log) {
+  const { maxLoad, minFreeMem } = limits(cfg, m);
+  if (m.load <= maxLoad && m.freeMem >= minFreeMem) { delete w.since; delete w.expired; return 'ok'; }
+  const numbers = { load: Number(m.load.toFixed(2)), maxLoad: Number(maxLoad.toFixed(2)), freeGiB: Number(gib(m.freeMem)), minFreeGiB: Number(gib(minFreeMem)) };
+  if (w.since === undefined) { w.since = now; log({ event: 'waiting_for_resources', ...numbers }); }
+  if (now - w.since < cfg.resourceWait) return 'wait';
+  if (!w.expired) { w.expired = true; log({ event: 'resource_wait_expired', proceeding: 'with one slot only', ...numbers }); }
+  return 'expired';
+}
+
+// Blocks until admitted; checks every --interval.
+export async function admit(cfg, { metrics = machineMetrics, now = Date.now, pause = sleep, log = logStderr } = {}) {
+  const w = {};
+  for (;;) {
+    const r = admitStep(w, cfg, metrics(), now(), log);
+    if (r !== 'wait') return r;
+    await pause(cfg.interval);
+  }
+}
+
+const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
+
+// A slot file holds its owner's PID. It is stale when that process is gone (killed or crashed), or when it is
+// still empty a minute after creation; a file that vanished meanwhile counts as free.
+function staleSlot(f) {
+  try {
+    const pid = Number(readFileSync(f, 'utf8'));
+    return Number.isSafeInteger(pid) && pid > 0 ? !alive(pid) : Date.now() - statSync(f).mtimeMs > 60e3;
+  } catch (e) { return e.code === 'ENOENT'; }
+}
+
+// Takes the first free of `slots` slot files with an exclusive create; returns a release function or null.
+export function acquireSlot(dir, slots, pid = process.pid) {
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  for (let i = 0; i < slots; i++) {
+    const f = join(dir, `slot-${i}`);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        writeFileSync(f, `${pid}\n`, { flag: 'wx' });
+        return () => { try { if (readFileSync(f, 'utf8') === `${pid}\n`) rmSync(f); } catch { /* already gone */ } };
+      } catch (e) { if (e.code !== 'EEXIST') throw e; }
+      if (!staleSlot(f)) break;
+      // ponytail: two processes freeing the same stale file at once can briefly exceed N; files only go stale when a process dies.
+      rmSync(f, { force: true });
+    }
+  }
+  return null;
+}
+
+export const slotsInUse = (dir) => { try { return readdirSync(dir).filter((f) => /^slot-\d+$/.test(f) && !staleSlot(join(dir, f))).length; } catch { return 0; } };
+
+// Runs `gate` after admission, holding a machine-wide slot, optionally with a private TMPDIR that is removed
+// afterwards (a full test suite can fill a small tmpfs /tmp). Returns spawnSync's result.
+export async function runGate(gate, cwd, cfg, deps = {}) {
+  const { dir = slotDir(), pause = sleep, log = logStderr } = deps;
+  const slots = (await admit(cfg, deps)) === 'expired' ? 1 : cfg.gateSlots;
+  let release, logged = false;
+  while (!(release = acquireSlot(dir, slots))) {
+    if (!logged) { logged = true; log({ event: 'waiting_for_gate_slot', slots, inUse: slotsInUse(dir) }); }
+    await pause(SLOT_POLL);
+  }
+  let tmp;
+  try {
+    const env = { ...process.env };
+    if (cfg.gateTmpdir) { mkdirSync(cfg.gateTmpdir, { recursive: true }); env.TMPDIR = tmp = mkdtempSync(join(cfg.gateTmpdir, 'prloop-gate-')); }
+    return spawnSync('sh', ['-c', `(${gate}) 2>&1`], { cwd, env, encoding: 'utf8', maxBuffer: 256 << 20 });
+  } finally {
+    if (tmp) rmSync(tmp, { recursive: true, force: true });
+    release();
+  }
+}
+
+export function machineLine(cfg, { metrics = machineMetrics, dir = slotDir() } = {}) {
+  const m = metrics();
+  const { maxLoad, minFreeMem } = limits(cfg, m);
+  return `load ${m.load.toFixed(2)} (max ${maxLoad.toFixed(2)}, ${m.cores} cores), free memory ${gib(m.freeMem)} GiB (min ${gib(minFreeMem)} GiB), gate slots ${slotsInUse(dir)}/${cfg.gateSlots} in use`;
+}
+
 // ---------- local checkout gate ----------
 
 function markerFile(cwd) {
@@ -323,10 +454,11 @@ export function markTested(sha, cwd) {
 }
 
 // Runs the project gate for `ready` when one is configured and the clean, pushed PR head is not yet
-// tested; a pass marks the head tested. Returns null when nothing ran.
-export function readyGate(s, gate, cwd) {
-  if (!gate || isTested(s.head, cwd) || localGate(s, cwd).some((r) => !r.includes('not marked tested'))) return null;
-  const r = spawnSync('sh', ['-c', `(${gate}) 2>&1`], { cwd, encoding: 'utf8', maxBuffer: 256 << 20 });
+// tested; a pass marks the head tested. Returns null when nothing ran. `deps` injects the machine metrics,
+// slot directory, clock and logger (see runGate).
+export async function readyGate(s, cfg, cwd, deps = {}) {
+  if (!cfg.gate || isTested(s.head, cwd) || localGate(s, cwd).some((r) => !r.includes('not marked tested'))) return null;
+  const r = await runGate(cfg.gate, cwd, cfg, deps);
   if (r.status === 0) { markTested(s.head, cwd); return { ok: true }; }
   return { ok: false, status: r.status, tail: String(r.stdout ?? r.error?.message ?? '').trimEnd().split('\n').slice(-60).join('\n') };
 }
@@ -738,7 +870,7 @@ const TERMINAL = new Set(['merged', 'merge_pending', 'clean', 'blocked', 'needs_
 
 // Polls every PR round-robin in one process and spawns at most `--max-agents` agents or local reviews at a time.
 // Exits only when every PR is terminal, printing one summary line per PR.
-export async function runAll(opts, cfg) {
+export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.now } = {}) {
   const repo = opts.repo;
   const prs = String(opts.pr).split(',').map(Number);
   const deadline = Date.now() + cfg.deadline;
@@ -754,6 +886,14 @@ export async function runAll(opts, cfg) {
     logEvent(st, { phase, ...pick(extra, ['verdict', 'reason', 'status']) });
   };
   const block = (st, reason, next = 'a human decision is needed') => event(st, 'blocked', { reason, next });
+  // One resource wait for the whole run: the machine is the same for every PR.
+  const wait = {};
+  // After an expired wait only one agent or local review runs at a time. Within step() the current PR is not
+  // in `busy` yet, so busy.size counts only the others.
+  const resourcesAllow = (st) => {
+    const r = admitStep(wait, cfg, metrics(), now(), ({ event: phase, ...e }) => logEvent(st, { phase, ...e }));
+    return r === 'ok' || (r === 'expired' && busy.size === 0);
+  };
 
   async function fix(st, s, cwd, v) {
     if (++st.rounds > maxRounds) return block(st, `max rounds (${maxRounds}) reached`,
@@ -795,7 +935,7 @@ export async function runAll(opts, cfg) {
     const cwd = opts.worktree ? resolve(opts.worktree) : findWorktree(s.branch, process.cwd());
     const wrong = cwd && checkWorktree(cwd, s);
     if (wrong) return block(st, wrong);
-    const slot = () => busy.size < maxAgents;
+    const slot = () => busy.size < maxAgents && resourcesAllow(st);
     // A behind head is always synced, even when mergeable, so the gate runs on the combined base-plus-branch
     // state before a merge; an unchanged patch carries the clean review, so this costs no new review.
     if (s.mergeState === 'BEHIND' || s.mergeState === 'DIRTY' || s.mergeable === 'CONFLICTING') {
@@ -886,6 +1026,29 @@ export function runExitCode(results) {
   return codes.includes(EXIT.blocked) ? EXIT.blocked : codes.find(Boolean) ?? 0;
 }
 
+// ---------- self-check ----------
+
+const SCRIPT_DIR = fileURLToPath(new URL('.', import.meta.url));
+
+// The installed prloop should be a checkout of the published default branch; changes go through PRs.
+// Returns null when there is nothing to report (also outside a Git repository), otherwise { warning?, note? }.
+export function selfCheck(dir) {
+  if (tryGit(['rev-parse', '--is-inside-work-tree'], dir) !== 'true') return null;
+  const branch = (tryGit(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], dir) ?? 'origin/main').replace(/^origin\//, '');
+  const problems = [];
+  if (dirty(dir)) problems.push('has uncommitted changes');
+  const current = tryGit(['branch', '--show-current'], dir);
+  if (current !== branch) problems.push(`is on ${current || 'a detached HEAD'}, not ${branch}`);
+  let note;
+  try {
+    sh('git', ['fetch', '--quiet', 'origin', branch], { cwd: dir, timeout: 10e3, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } });
+    const behind = Number(git(['rev-list', '--count', 'HEAD..FETCH_HEAD'], dir));
+    if (behind) problems.push(`is ${behind} commit(s) behind origin/${branch}`);
+  } catch { note = `could not fetch origin ${branch} within 10s; skipped the behind check`; }
+  if (!problems.length) return note ? { note } : null;
+  return { note, warning: `prloop checkout ${dir} ${problems.join(', ')}: update it with \`git -C ${dir} pull --ff-only\` on ${branch}, and move local changes to a PR` };
+}
+
 // ---------- CLI ----------
 
 export async function main(argv) {
@@ -896,8 +1059,13 @@ export async function main(argv) {
   const out = (obj, code) => { console.log(JSON.stringify(obj)); return code; };
   try {
     if (cmd === 'mark-tested') return out({ verdict: 'ok', tested: markTested(opts.sha, process.cwd()) }, 0);
-    if (cmd === 'run' && opts.status) return out(runStatus(opts.repo), 0);
     const cfg = config(opts);
+    if (cmd === 'run' && opts.status) return out({ machine: machineLine(cfg), ...runStatus(opts.repo) }, 0);
+    if (cmd === 'run' || cmd === 'ready') {
+      const c = selfCheck(SCRIPT_DIR);
+      if (c?.warning && (opts.requireCurrent || process.env.PRLOOP_REQUIRE_CURRENT === '1')) return out({ verdict: 'error', error: c.warning }, EXIT.error);
+      if (c) logStderr({ event: 'self_check', ...c });
+    }
     if (cmd === 'run') {
       if (!opts.repo || !opts.pr) throw new Error('run needs --repo owner/name and --pr N[,N...]');
       if (opts.merge && !['rebase', 'squash', 'merge'].includes(opts.merge)) throw new Error('--merge must be rebase, squash or merge');
@@ -916,7 +1084,7 @@ export async function main(argv) {
     }
     if (cmd === 'ready') {
       const s = classify(fetchPr(repo, prArg), cfg);
-      const gate = readyGate(s, cfg.gate, process.cwd());
+      const gate = await readyGate(s, cfg, process.cwd());
       if (gate && !gate.ok) return out({ ready: false, pr: s.pr, head: s.head, gate: 'failed', exitCode: gate.status, tail: gate.tail,
         next: 'rerun the failing tests or step with its focused command, fix until it passes, then run `prloop ready` again' }, EXIT.blocked);
       const missing = [...s.reasons, ...localGate(s, process.cwd())];

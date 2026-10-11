@@ -15,6 +15,22 @@ prloop --help
 
 `bin/prloop` is a symlink to `tools/prloop/prloop.mjs`. Run the tests with `node --test` from the repository root; they use fixture JSON and temporary Git repositories and never contact the network.
 
+The installed copy should be a checkout that tracks the published `main`; changes go through PRs, not local edits. On startup `run` and `ready` check prloop's own checkout (the directory of the resolved script, when it is a Git repository): it must be clean, on the default branch (`origin/HEAD`, else `main`) and not behind `origin` after a quick `git fetch` of that branch (10s timeout; a failed fetch skips this part with a note). Otherwise they print one `self_check` warning on stderr naming the fix, `git -C <dir> pull --ff-only`. With `--require-current` (or `PRLOOP_REQUIRE_CURRENT=1`) the warning becomes a usage error (exit 40). A copy outside Git is not checked.
+
+## Sharing one machine
+
+Several `prloop` processes, their agents and gates, and unrelated work often share one machine. Resource awareness is on by default:
+
+| Option | Environment | Default | |
+|---|---|---|---|
+| `--gate-slots <n>` | `PRLOOP_GATE_SLOTS` | 2 | Gates running at once, across every `prloop` process of the user. Each gate takes a slot file in `${XDG_RUNTIME_DIR:-/tmp}/prloop-slots/`, created exclusively and holding the owner's PID; a slot whose process died is reclaimed. A waiting gate polls quietly and logs one `waiting_for_gate_slot` event. |
+| `--max-load <x>` | `PRLOOP_MAX_LOAD` | 0.75 x CPU cores | No agent, local review or gate starts while the 1-minute load average is higher. |
+| `--min-free-mem <size>` | `PRLOOP_MIN_FREE_MEM` | larger of 4G and 10% of RAM | ...or while available memory (`MemAvailable` on Linux, free memory elsewhere) is lower. Sizes take K, M, G or T (binary). |
+| `--resource-wait <dur>` | `PRLOOP_RESOURCE_WAIT` | 30m | The wait never deadlocks: after this long it proceeds with one slot only (one agent at a time in `run`, only the first gate slot in `ready`) and logs `resource_wait_expired`. |
+| `--gate-tmpdir <dir>` | `PRLOOP_GATE_TMPDIR` | off | Runs each gate with `TMPDIR` set to a private directory that prloop creates under `<dir>` and deletes afterwards, so a test suite does not fill a small RAM-backed `/tmp` and leaves no scratch behind. |
+
+Resource checks repeat every `--interval`; one `waiting_for_resources` event with the load, its limit, free memory and its limit is logged per wait (in the run log for `run`, on stderr for `ready`). `prloop run --status` adds one `machine` line: load, free memory and gate slots in use. To turn a limit off in practice, raise it (for example `--gate-slots 64`).
+
 ## Recommended workflow: one background supervisor
 
 A coordinator (a person or an orchestrating agent) starts one supervisor for a set of PRs and checks in rarely:
@@ -24,7 +40,7 @@ prloop run --repo owner/name --pr 42,43,44 --gate "npm test" --merge squash &   
 prloop run --status --repo owner/name                                          # cheap check-in, no GitHub calls
 ```
 
-`run` polls every PR round-robin every `--interval`, in one process. It syncs a branch that GitHub reports behind or conflicting (see [Saving cloud reviews](#saving-cloud-reviews)), waits for the reviewer, runs local reviews when needed, and spawns a fix agent only for findings, a manual conflict, a missing request, a timed-out request or a local-review gate gap. At most `--max-agents` (2) agents or local reviews run at once. It never needs the coordinator between steps and exits only when every PR is `merged`, `merge_pending`, `clean` (without `--merge`), `blocked`, `needs_human`, `needs_agent` (with `--agent none`) or past the `--deadline` (6h). It then prints one JSON line per PR: `verdict`, `reason`, last `head`, `rounds`, and `next`, what a human or the coordinator must do.
+`run` polls every PR round-robin every `--interval`, in one process, and shares the machine with other work by default (see [Sharing one machine](#sharing-one-machine)). It syncs a branch that GitHub reports behind or conflicting (see [Saving cloud reviews](#saving-cloud-reviews)), waits for the reviewer, runs local reviews when needed, and spawns a fix agent only for findings, a manual conflict, a missing request, a timed-out request or a local-review gate gap. At most `--max-agents` (2) agents or local reviews run at once. It never needs the coordinator between steps and exits only when every PR is `merged`, `merge_pending`, `clean` (without `--merge`), `blocked`, `needs_human`, `needs_agent` (with `--agent none`) or past the `--deadline` (6h). It then prints one JSON line per PR: `verdict`, `reason`, last `head`, `rounds`, and `next`, what a human or the coordinator must do.
 
 Each PR's state lives in `${XDG_STATE_HOME:-~/.local/state}/prloop/<owner>__<name>__<pr>.json`, and every state change is appended to that run's `run-<time>.jsonl` event log in the same directory. `prloop run --status` prints all PR states as one JSON object, each with its last five events from the run log that state names. Rounds and seen findings persist across runs on purpose; `prloop reset-rounds <pr>` resets the rounds once (see [At the round cap](#at-the-round-cap)), and deleting a PR's state file resets everything.
 
