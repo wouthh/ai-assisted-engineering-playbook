@@ -277,7 +277,8 @@ export function classify(pr, cfg, nowMs = Date.now()) {
     .filter((r) => isBot(r) && r.content === 'EYES').map((r) => r.createdAt).sort()[0];
   const earlierCycle = !current || pr.comments.pageInfo?.hasPreviousPage || pr.reactions?.pageInfo?.hasPreviousPage
     || pr.comments.nodes.some((c) => !isBot(c) && c.createdAt < triggerNode.createdAt && c.body.toLowerCase().includes(cfg.trigger.toLowerCase()))
-    || (pr.reactions?.nodes ?? []).some((r) => isBot(r) && r.createdAt < headTime);
+    // Any bot PR-body reaction before this request (even after the head) may belong to an automatic review still running.
+    || (pr.reactions?.nodes ?? []).some((r) => isBot(r) && r.createdAt < since);
   const bodyOk = (r) => r.content === 'EYES' || !earlierCycle || (!!ackAt && r.createdAt >= ackAt);
   const reactions = current ? [...triggerNode.reactions.nodes, ...bodyReactions.filter(bodyOk)]
     : bodyReactions.some((r) => r.content === 'EYES') ? bodyReactions : [];
@@ -739,8 +740,14 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
   }
   // A rebase drops merge commits, including edits made only in them: push only when the result equals merging the base.
   if (merges) {
-    const expected = upToDate ? git(['rev-parse', `${head}^{tree}`], cwd) : tryGit(['merge-tree', '--write-tree', target, head], cwd)?.split('\n')[0];
-    if (git(['rev-parse', 'HEAD^{tree}'], cwd) !== expected) {
+    // merge-tree exits 1 on conflicts but still writes a tree; conflicts only in union-resolved files are excluded
+    // from the comparison, since the rebase resolved them line by line.
+    // ponytail: merge-only edits inside a union file are not detected; compare per-line sets if that matters.
+    const mt = upToDate ? null : spawnSync('git', ['merge-tree', '--write-tree', '--name-only', target, head], { cwd, encoding: 'utf8' });
+    const [tree, ...conflicts] = upToDate ? [git(['rev-parse', `${head}^{tree}`], cwd)] : mt.status <= 1 ? mt.stdout.split('\n\n')[0].split('\n').filter(Boolean) : [];
+    const same = !!tree && conflicts.every((f) => unioned.has(f))
+      && tryGit(['diff', '--quiet', tree, 'HEAD', '--', '.', ...conflicts.map((f) => `:(exclude,literal)${f}`)], cwd) !== null;
+    if (!same) {
       git(['reset', '--quiet', '--hard', head], cwd);
       return { verdict: 'error', error: 'linearizing would drop changes made in merge commits: linearize the branch by hand' };
     }
