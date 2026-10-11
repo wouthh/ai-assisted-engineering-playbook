@@ -53,15 +53,13 @@ ENV = {name: value for name, value in os.environ.items()
        if not name.startswith("GIT_TRACE")}
 ENV.update(GIT_OPTIONAL_LOCKS="0", GIT_NO_LAZY_FETCH="1", GIT_NO_REPLACE_OBJECTS="1")
 ZERO_OID = re.compile(r"0+")
-# Single-label domains such as localhost count. The final label must start
-# with a letter, so package versions like name@1.2.3-beta are not email.
-# The local part is deliberately broad: a quoted string with escapes, or any
-# run of characters that cannot delimit an address. Over-matching only makes
-# the guard stricter, never more permissive.
-EMAIL = re.compile(r"(?:\"(?:[^\"\\\r\n]|\\.)*\"|[^\s<>()\[\],;:@\"]+)"
-                   r"@(?:\[[^\[\]\s\\]*\]"  # domain literal such as [192.0.2.1]
-                   r"|(?:[A-Za-z0-9-]+\.)*[A-Za-z][A-Za-z0-9-]*"
-                   r"(?![A-Za-z0-9.-]*[A-Za-z0-9]))")
+# Message checks fail closed: every whitespace-separated word containing "@"
+# is treated as an address unless it starts with "@" (a mention or scoped
+# package) or ends in a version such as name@1.2.3. Unusual but valid address
+# syntax is therefore refused unless it is allowlisted.
+WORD_EDGE = "<>()[]{},;:!?'\"`."
+VERSION_SUFFIX = re.compile(r"@v?[0-9][0-9A-Za-z.+-]*")
+CONFIG_EMAIL = re.compile(r"[^@\s]+@[^@\s]+")
 GITHUB_USER_NOREPLY = re.compile(
     r"(?:[1-9][0-9]*\+)?[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?"
     r"@users\.noreply\.github\.com")
@@ -104,10 +102,10 @@ def load_config() -> dict:
         raise Refusal(f"guard configuration {str(path)!r} is missing or invalid") from exc
     expected = data.get("expected_email") if isinstance(data, dict) else None
     extras = data.get("allowed_message_emails", []) if isinstance(data, dict) else None
-    if not isinstance(expected, str) or not EMAIL.fullmatch(expected):
+    if not isinstance(expected, str) or not CONFIG_EMAIL.fullmatch(expected):
         raise Refusal("guard configuration needs a valid expected_email")
     if not isinstance(extras, list) or not all(
-            isinstance(item, str) and EMAIL.fullmatch(item) for item in extras):
+            isinstance(item, str) and CONFIG_EMAIL.fullmatch(item) for item in extras):
         raise Refusal("allowed_message_emails must be a list of email addresses")
     return {"expected": expected,
             "message_allowed": {expected.lower(), *(e.lower() for e in extras)}}
@@ -211,11 +209,25 @@ def message_email_allowed(email: str, allowed: set[str]) -> bool:
             or GITHUB_USER_NOREPLY.fullmatch(lower) is not None)
 
 
+def message_addresses(line: str) -> list[str]:
+    """Words that must be treated as addresses (see the comment on WORD_EDGE)."""
+    found = []
+    for word in line.split():
+        word = word.strip(WORD_EDGE)
+        if "@" not in word or word.startswith("@") or word.endswith("@"):
+            continue
+        tail = word[word.rindex("@"):]
+        if VERSION_SUFFIX.fullmatch(tail):
+            continue
+        found.append(word)
+    return found
+
+
 def check_message_text(text: str, allowed: set[str], label: str) -> None:
     # Every line is checked: the hook cannot tell whether Git will strip
     # comment lines (it keeps them for `git commit -m`, for example).
     for number, line in enumerate(text.splitlines(), start=1):
-        for email in EMAIL.findall(line):
+        for email in message_addresses(line):
             if not message_email_allowed(email, allowed):
                 raise Refusal(f"{label} line {number} contains email "
                               f"{email!r}, which is not on the allowlist")

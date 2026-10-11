@@ -167,13 +167,15 @@ class MessageTests(GuardFixture):
 
     def test_punctuated_and_quoted_local_parts_are_refused(self) -> None:
         for address in ("wrong!@synthetic-mail.net", '"quoted name"@synthetic-mail.net',
-                        '"wrong\\!name"@synthetic-mail.net', "wrong@[192.0.2.1]"):
+                        '"wrong\\!name"@synthetic-mail.net', "wrong@[192.0.2.1]",
+                        "wrong@[foo\\]bar]", "https://user@host.synthetic-mail.net/path"):
             with self.subTest(address=address):
                 path = self.message(f"Add feature\n\nCo-authored-by: Synthetic <{address}>\n")
                 self.assert_refused(self.guard("--commit-msg", path), "line 3")
 
     def test_package_versions_are_not_email(self) -> None:
-        path = self.message("Bump zod@4.6.5, react@19.3.0 and pkg@1.2.3-beta.1\n")
+        path = self.message("Bump zod@4.6.5, react@19.3.0 and pkg@1.2.3-beta.1\n\n"
+                            "Scoped @types/react@19.3.0, thanks @alice.\n")
         result = self.guard("--commit-msg", path)
         self.assertEqual(result.returncode, 0, result.stderr)
 
