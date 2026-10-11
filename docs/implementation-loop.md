@@ -55,7 +55,7 @@ Classify and deduplicate each finding. Record each completed review using the fi
 
 Every substantive new head needs a fresh completed review. Repeat as many useful correction cycles as needed, not a fixed two rounds. Convergence means completed clean review of the exact latest head, no unresolved relevant conversation or change request, passing applicable checks, and no merge conflict. Silence and an older thumbs-up do not establish convergence. Do not request redundant reviews merely to accumulate approvals.
 
-Poll at reasonable intervals, normally 30–60 seconds for up to about 15 minutes per requested cycle. If a reviewer, check, or integration remains unavailable, leave the PR open with the exact head and blocker. Do not wait indefinitely or spam review requests.
+Poll at reasonable intervals, normally 30–90 seconds for a bounded time per requested cycle; [`prloop wait`](review-wait-loop.md) does this without spending agent tokens. If a reviewer, check, or integration remains unavailable, leave the PR open with the exact head and blocker. Do not wait indefinitely or spam review requests.
 
 ## 7. Human review or authorized merge
 
