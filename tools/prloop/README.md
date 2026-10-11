@@ -26,18 +26,18 @@ Every command prints one JSON object on stdout. `--repo owner/name` defaults to 
 | `prloop mark-tested [--sha <sha>]` | Records that your gate passed for `HEAD` (or `--sha`). Stored as `prloop-tested` in the Git common directory; never pushed. | 0, 40 |
 | `prloop wait <pr>` | Polls every `--interval` (75s) until a verdict. A 👀 reaction means the bot is still reviewing. Never posts anything. | see below |
 | `prloop sync <pr> [--union <glob>]...` | Brings the PR branch up to date with its base, inside the PR checkout. See [Syncing with the base](#syncing-with-the-base). | 0, 40, 41 |
-| `prloop run --repo o/n --pr N[,N...]` | Optional supervisor that waits, spawns one fresh agent per round and stops on failsafes. See [Supervisor](#supervisor). | 0, 50, or the verdict code with `--agent none` |
+| `prloop run --repo o/n --pr N[,N...]` | Optional supervisor that waits, spawns one fresh agent per round and stops on failsafes. See [Supervisor](#supervisor). | 50 if any PR is blocked, else the first verdict code that needs action, else 0 |
 
 `wait` verdicts:
 
 | Verdict | Exit | Meaning |
 |---|---|---|
 | `clean` | 0 | 👍 by the bot on the current request or on the PR body, or a bot comment or review on the head matching the clean regex. When the bot reacts more than once, the latest reaction wins. |
-| `findings` | 10 | New reviewer threads (path, line, body) plus any reviewer summary on this head. |
+| `findings` | 10 | Unresolved threads (path, line, up to 2000 characters of body) plus any reviewer summary on this head. |
 | `not_requested` | 20 | No trigger comment after the current head commit. Run `prloop ready`, then request a review. |
 | `requested_while_unresolved` | 21 | A request was posted while older threads were still open. |
 | `timeout` | 30 | No reaction within `--ack-timeout` (3m) of the request, or no result within `--timeout` (40m). Both are measured from the request time, so running `wait` again does not restart the clock. Includes `rerequestBody`, a copy of your last trigger comment, to repost unchanged. A timed-out request no longer blocks `prloop ready`. |
-| `error` | 40 | GitHub could not be read three times in a row, or bad input. |
+| `error` | 40 | GitHub could not be read three times in a row, bad input, or more than 100 review threads (prloop fails closed rather than miss one). |
 
 ## Agent workflow
 
@@ -80,7 +80,7 @@ For each PR, sequentially: sync if GitHub reports the branch behind or conflicti
 | `--agent codex` | | `codex exec` with a workspace-write sandbox that allows network access. |
 | `--agent none` | | Prints the verdict with the generated `prompt` and exits with the verdict code, so a coordinator can spawn its own agent. |
 | `--model`, `--effort` | | Override the agent model and effort (`PRLOOP_MODEL`, `PRLOOP_EFFORT`). |
-| `--merge rebase\|squash\|merge` | off | Merges only when the current head is clean and GitHub reports it mergeable, with `gh pr merge --match-head-commit <sha>`. |
+| `--merge rebase\|squash\|merge` | off | Merges only when the current head is clean, marked tested in the PR worktree with a clean pushed tree, and GitHub reports it mergeable, with `gh pr merge --match-head-commit <sha>`. A clean but untested head returns `not_tested` (22) and goes to the agent for the gate. The result is `merged` with the merge commit, or `merge_pending` when a merge queue or auto-merge accepted it without merging yet. |
 | `--deadline 4h` | 4h | Overall deadline for the whole run. |
 | `--union` | | Passed to sync. Reviewer and timing options apply as for `wait`. |
 
@@ -107,7 +107,7 @@ export PRLOOP_REVIEWER_LOGIN='^example-review-bot' PRLOOP_TRIGGER='/review' PRLO
 
 ## Limits
 
-- "After the head" compares the trigger time with the head commit's committer date, not the push time.
+- "After the head" uses the later of the head commit's committer date and the last force-push event; GitHub exposes no push time. A fast-forward to a commit dated before an existing request is not detected, which `ready` avoids by requiring a pushed head before each request.
 - Reads the latest 100 review threads and comments and 50 reviews; very long PRs may need a fresh PR.
 - Transient GitHub errors are retried; three failed polls in a row end `wait` with `error`.
 - Outdated threads are flagged `outdated: true` but still count as unresolved: a moved anchor does not prove the finding is fixed.

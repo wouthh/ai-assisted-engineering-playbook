@@ -22,3 +22,12 @@ When GitHub reports the branch behind or conflicting with its base, `prloop sync
 - **No infinite loops.** The optional `prloop run` supervisor stops with a `blocked` reason on a round limit, an overall deadline, an agent that makes no progress or reports a permission denial, or the same finding returning after two fixes.
 
 Merging remains a separate, explicitly authorized step. `prloop run --merge` only merges a clean current head that GitHub reports mergeable, pinned with `--match-head-commit`.
+
+## Origin
+
+`prloop` replaces a much larger review queue that a private project ran and later retired. That queue clustered findings, ran its own repair workers, and tracked review budgets across rebases. The lessons that survived are small:
+
+- A review is clean only on an explicit current-head signal with no new unresolved threads. Silence, eyes, timeouts, stale approvals and an earlier head's clean result are not clean.
+- Resolve a thread only when the current code and validation show the finding is fixed or concretely invalid. An outdated anchor is not evidence.
+- Retry transient GitHub errors, but fail closed on ambiguous state instead of starting over.
+- Keep the agent responsible for the work and keep every loop bounded.
