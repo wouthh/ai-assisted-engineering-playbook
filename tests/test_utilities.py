@@ -1793,5 +1793,19 @@ class RedactionTests(unittest.TestCase):
             self.assertNotIn("\nredaction-check", result.stderr)
 
 
+class GuidanceConsistencyTests(unittest.TestCase):
+    def test_instruction_correction_after_false_finding_requires_authority(self) -> None:
+        required = {
+            "templates/AGENTS.template.md": "review-guidelines entry in a normal PR when instruction maintenance and publication are already authorized; otherwise report the gap",
+            "docs/implementation-loop.md": "review-guidelines entry through a normal PR when instruction maintenance is authorized, or report the gap otherwise",
+            "examples/fictional-order-service/README.md": "When instruction maintenance is authorized, also clarify that wording in a normal PR",
+        }
+        for path, phrase in required.items():
+            with self.subTest(path=path):
+                text = (ROOT / path).read_text(encoding="utf-8")
+                self.assertIn(phrase, text)
+                self.assertNotIn("without waiting to be asked", text)
+
+
 if __name__ == "__main__":
     unittest.main()
