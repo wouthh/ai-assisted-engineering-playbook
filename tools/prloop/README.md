@@ -99,7 +99,7 @@ esac
 - merges the base when the repository allows merge or squash merges, then pushes normally;
 - rebases onto the base when the repository allows only rebase merges, then pushes with `--force-with-lease=<branch>:<expected-sha>`, so it never overwrites commits it has not seen.
 
-Conflicts in files matching `--union` globs (append-only changelogs, CSV ledgers) are resolved as a union of both sides, base lines first, with identical lines kept once. Any other conflict aborts the merge or rebase, leaves the checkout as it was, and exits 41 with `verdict: "conflict"` and the conflicted files, for the agent to resolve by hand. Union resolution suits files where every line is an independent record; do not use it for files whose lines depend on order or on each other.
+Conflicts in files matching `--union` globs (append-only changelogs, CSV ledgers) are resolved as a union of both sides, base lines first, with identical lines kept once. A matching file that is a symlink on either side is never resolved this way. Any other conflict aborts the merge or rebase, leaves the checkout as it was, and exits 41 with `verdict: "conflict"` and the conflicted files, for the agent to resolve by hand. Union resolution suits files where every line is an independent record; do not use it for files whose lines depend on order or on each other.
 
 A successful sync changes the head, so it clears the tested marker of the old head (markers of other PR heads stay): run `prloop ready` (which reruns the gate), then request a review.
 
@@ -111,11 +111,11 @@ A successful sync changes the head, so it clears the tested marker of the old he
 |---|---|
 | `cloud` | Only the bot. An unavailable bot ends `wait` with `unavailable` (31). |
 | `local` | Never asks the bot. `wait` runs a local review of the current head itself. |
-| `auto` (default) | Uses the bot, and runs a local review when the bot replies that it cannot review (default regex matches "reached your ... usage limits", "couldn't complete this request", "unable to review", "quota"; set `--unavailable-regex`) or when two requests on the same head time out. |
+| `auto` (default) | Uses the bot, and runs a local review when the bot replies, after acknowledging this cycle with 👀, that it cannot review (default regex matches "reached your ... usage limits", "couldn't complete this request", "unable to review", "quota"; set `--unavailable-regex`) or when two requests on the same head time out. |
 
 The local review is a separate, read-only agent run (`--agent claude` by default with `--permission-mode dontAsk` and only read and `git diff/log/show` tools; `--agent codex` uses `codex exec --sandbox read-only`), never the run that wrote the fix. It needs the same gate as a request: no unresolved threads, a tested head, and `wait` running inside a clean, pushed checkout of the PR branch. It reviews `git diff <base commit>...HEAD` from the base commit GitHub reports, and returns structured findings (path, line, severity P0-P3, body), which prloop posts with `gh` under your account (only results posted by the authenticated `gh` user count, so a copied prefix from someone else is ignored) as a normal PR review with inline comments, each prefixed `[local review]`; findings outside the diff go in the review body. A clean result posts `[local review] No issues found on <sha>.` The next poll classifies these exactly like bot results.
 
-Failsafes: one local review per head, a fetched and verified base branch, at most `--max-local-reviews` (3) per PR, and any reviewer failure, malformed output, change to the checkout or posting error ends in `blocked` with the reason instead of a retry.
+Failsafes: one local review per head, a fetched and verified base branch, at most `--max-local-reviews` (3, a nonnegative integer) per PR, and any reviewer failure, malformed output, change to the checkout or posting error ends in `blocked` with the reason instead of a retry.
 
 ## Another reviewer bot
 

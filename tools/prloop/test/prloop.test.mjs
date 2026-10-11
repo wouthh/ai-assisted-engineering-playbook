@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -267,12 +267,21 @@ const QUOTA = 'You have reached your Codex usage limits for code reviews. You ca
 test('quota and failure replies mark the cloud reviewer unavailable', () => {
   for (const body of [QUOTA, "Codex couldn't complete this request. Try again later."]) {
     const pr = fixture();
+    request(pr).reactions.nodes.push({ content: 'EYES', createdAt: at('10:05'), user: BOT });
     pr.comments.nodes.push(botComment('IC_q', body, '10:06'));
     const s = classify(pr, cfg, NOW);
     assert.equal(s.verdict, 'unavailable', body);
     assert.deepEqual(reviewPlan(s, cfg), { local: true });
     assert.deepEqual(reviewPlan(s, { ...cfg, mode: 'cloud' }), {});
   }
+});
+
+test('a failure reply before this cycle is acknowledged does not mark it unavailable', () => {
+  const pr = fixture();
+  pr.comments.nodes.push(botComment('IC_q', "Codex couldn't complete this request. Try again later.", '10:06'));
+  const s = classify(pr, cfg, NOW);
+  assert.equal(s.verdict, 'pending');
+  assert.deepEqual(reviewPlan(s, cfg), {});
 });
 
 test('auto falls back only after two timed-out requests on the same head', () => {
@@ -321,6 +330,7 @@ test('posted local results classify like cloud results on that head', () => {
 
 test('wait runs one local review on fallback, then classifies the posted result', async () => {
   const pr = fixture();
+  request(pr).reactions.nodes.push({ content: 'EYES', createdAt: at('10:05'), user: BOT });
   pr.comments.nodes.push(botComment('IC_q', QUOTA, '10:06'));
   let calls = 0;
   const v = await waitFor('example-org/example-repo', 7, cfg, {
@@ -416,6 +426,35 @@ for (const settings of [{ merge: true, squash: true }, { merge: false, squash: f
     assert.equal(r.run(r.work, 'branch', '--show-current'), 'feat');
   });
 }
+
+test('sync refuses to resolve a union file that is a symlink', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  const link = (target, msg) => {
+    rmSync(join(r.work, 'log.csv'), { force: true });
+    symlinkSync(join(r.dir, target), join(r.work, 'log.csv'));
+    r.run(r.work, 'add', '-A');
+    r.run(r.work, 'commit', '-qm', msg);
+  };
+  for (const f of ['a.txt', 'b.txt', 'c.txt']) writeFileSync(join(r.dir, f), 'keep\n');
+  r.run(r.work, 'switch', '-q', 'main');
+  link('a.txt', 'link');
+  r.run(r.work, 'push', '-q', 'origin', 'main');
+  r.run(r.work, 'switch', '-q', 'feat');
+  r.run(r.work, 'reset', '-q', '--hard', 'main');
+  link('b.txt', 'feature');
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  r.run(r.work, 'switch', '-q', 'main');
+  link('c.txt', 'retarget');
+  r.run(r.work, 'push', '-q', 'origin', 'main');
+  r.run(r.work, 'switch', '-q', 'feat');
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true }, union: ['*.csv'] });
+  assert.equal(v.verdict, 'conflict', JSON.stringify(v));
+  assert.deepEqual(v.conflicts, ['log.csv']);
+  for (const f of ['a.txt', 'b.txt', 'c.txt']) assert.equal(readFileSync(join(r.dir, f), 'utf8'), 'keep\n');
+  assert.equal(r.run(r.work, 'rev-parse', 'HEAD'), head);
+});
 
 test('the local gate requires the PR checkout, a clean tree and a tested pushed head', (t) => {
   const r = gitRepo();
@@ -517,6 +556,9 @@ test('run --status reads state files and the latest events without GitHub', (t) 
 test('configuration errors are JSON errors, and an unknown --agent is rejected', async (t) => {
   assert.throws(() => config({ agent: 'nonee' }, {}), /--agent must be claude, codex or none/);
   assert.throws(() => config({}, { PRLOOP_AGENT: 'Claude' }), /--agent must be/);
+  assert.throws(() => config({ maxLocalReviews: 'three' }, {}), /--max-local-reviews must be/);
+  assert.throws(() => config({}, { PRLOOP_MAX_LOCAL_REVIEWS: '-1' }), /--max-local-reviews must be/);
+  assert.equal(config({ maxLocalReviews: '0' }, {}).maxLocal, 0);
   const logs = [];
   t.mock.method(console, 'log', (l) => logs.push(JSON.parse(l)));
   assert.equal(await main(['status', '7', '--repo', 'example-org/example-repo', '--timeout', 'bad']), EXIT.error);
