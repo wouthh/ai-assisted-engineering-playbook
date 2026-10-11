@@ -104,6 +104,14 @@ test('a PR-body thumbs-up after a new request counts only after this cycle\'s ey
   assert.equal(classify(pr, cfg, AFTER).verdict, 'clean'); // this cycle acknowledged before the 👍
 });
 
+test('a PR-body eyes from before the current request does not let a late thumbs-up clear the new head', () => {
+  const pr = fixture(); // IC_old at 09:00, head at 10:00, IC_req at 10:05
+  pr.reactions = { nodes: [{ content: 'EYES', createdAt: at('10:02'), user: BOT }, { content: 'THUMBS_UP', createdAt: at('10:06'), user: BOT }] };
+  assert.equal(classify(pr, cfg, NOW).reviewerState.state, 'none'); // both belong to IC_old's review
+  pr.reactions.nodes.push({ content: 'EYES', createdAt: at('10:05'), user: BOT }, { content: 'THUMBS_UP', createdAt: at('10:07'), user: BOT });
+  assert.equal(classify(pr, cfg, Date.parse(at('10:08'))).verdict, 'clean'); // this cycle's eyes, then thumbs-up
+});
+
 test('a PR-body thumbs-up without eyes does not count when older PR-body reactions were truncated', () => {
   const pr = cleanWithoutAck('2603924');
   pr.comments.nodes.pop();
@@ -1057,6 +1065,18 @@ test('concurrent ready runs for the same head and gate run the gate once', async
   assert.equal(readFileSync(runs, 'utf8'), 'run\n');
   assert.deepEqual(results, [{ ok: true }, { ok: true, cached: s.head }, { ok: true, cached: s.head }]);
   assert.deepEqual(readdirSync(join(state, 'gate-locks')), []); // the per-key lock is removed when free
+});
+
+test('the per-key gate lock records the gate shell, so it outlives a killed ready', async (t) => {
+  const state = tempState(t);
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  const out = join(r.dir, 'claim');
+  const s = { branch: 'feat', head: r.run(r.work, 'rev-parse', 'HEAD') };
+  const c = { ...cfg, gate: `sleep 0.3; cat "${state}"/gate-locks/*/* > "${out}"; { echo; echo $$; } >> "${out}"` };
+  assert.deepEqual(await readyGate(s, c, r.work, { ...idle(), dir: join(r.dir, 'slots') }), { ok: true });
+  const lines = readFileSync(out, 'utf8').trim().split('\n');
+  assert.equal(lines.at(-2).split(' ')[0], lines.at(-1)); // the claim lists the gate shell's pid
 });
 
 test('sync linearizes a branch with merge commits on a rebase-only repository and reports the tree', (t) => {
