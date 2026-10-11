@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import {
-  EXIT, main, slotDir, agentFailure, saveAgentLog, pruneAgentLogs, takeLock, lockHolder, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, syncBranch, unionLines, waitFor,
+  EXIT, OUTPUT_TAIL, main, slotDir, agentFailure, saveAgentLog, pruneAgentLogs, takeLock, lockHolder, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, syncBranch, unionLines, waitFor,
 } from '../prloop.mjs';
 
 const pick = (o, keys) => Object.fromEntries(keys.map((k) => [k, o[k]]));
@@ -750,6 +750,15 @@ test('--gate-tmpdir gives each gate a private TMPDIR and removes it afterwards',
   const failed = await runGate('touch "$TMPDIR/scratch"; exit 2', dir, c, deps);
   assert.equal(failed.status, 2);
   assert.deepEqual(readdirSync(join(dir, 'tmp')), []);
+});
+
+test('runGate keeps only a bounded tail of verbose gate output', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'prloop-gateout-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const r = await runGate(`head -c ${3 * OUTPUT_TAIL} /dev/zero | tr '\\0' x; echo; echo END; exit 3`, dir, cfg, { ...idle(), dir });
+  assert.equal(r.status, 3);
+  assert.equal(r.stdout.length, OUTPUT_TAIL);
+  assert.match(r.stdout, /x\nEND\n$/);
 });
 
 test('machine options: defaults, validation, and the status line', (t) => {

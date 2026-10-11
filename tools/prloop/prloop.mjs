@@ -948,14 +948,19 @@ export function pruneAgentLogs(now = Date.now()) {
 }
 
 // `lock` (a worktree lock) passes its token to the child and adopts it, so the lock outlives a killed prloop.
+// Each stream keeps only its last OUTPUT_TAIL bytes (trimmed in amortized steps), so a verbose or looping
+// child cannot exhaust the heap; callers use only the tail (failure reports, the agent's final JSON line).
+export const OUTPUT_TAIL = 4 << 20;
+const keepTail = (s) => (s.length > 2 * OUTPUT_TAIL ? s.slice(-OUTPUT_TAIL) : s);
 const spawnAsync = (cmd, args, cwd, { env = process.env, lock, onSpawn = lock?.adopt } = {}) => new Promise((done) => {
   const c = spawn(cmd, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], env: lock?.token ? { ...env, PRLOOP_LOCK_TOKEN: lock.token } : env });
   if (c.pid && onSpawn) onSpawn(c.pid);
   let stdout = '', stderr = '';
-  c.stdout.on('data', (d) => { stdout += d; });
-  c.stderr.on('data', (d) => { stderr += d; });
-  c.on('error', (e) => done({ status: 1, stdout, stderr: `${stderr}${e.message}` }));
-  c.on('close', (code) => done({ status: code ?? 1, stdout, stderr }));
+  c.stdout.on('data', (d) => { stdout = keepTail(stdout + d); });
+  c.stderr.on('data', (d) => { stderr = keepTail(stderr + d); });
+  const tail = (s) => s.slice(-OUTPUT_TAIL);
+  c.on('error', (e) => done({ status: 1, stdout: tail(stdout), stderr: `${tail(stderr)}${e.message}` }));
+  c.on('close', (code) => done({ status: code ?? 1, stdout: tail(stdout), stderr: tail(stderr) }));
 });
 
 async function runFixAgent(cfg, prompt, cwd) {
