@@ -68,7 +68,7 @@ Install [`prloop`](https://github.com/wouthh/ai-assisted-engineering-playbook/tr
 ### Fix agent (one session, one step)
 
 1. Read only the referenced files plus this file.
-2. Fix each valid finding with a regression test; reply with evidence on invalid ones and leave them unresolved; resolve conflicts.
+2. Fix each valid finding with a regression test; reply with evidence on invalid ones and leave them unresolved, except a finding proven to misread this file, which you resolve after the evidence reply (see Instruction maintenance); resolve conflicts.
 3. Run focused tests, then commit and push normally (`prloop sync <pr>` first if the base moved).
 4. Resolve the fixed threads; reply on disputed ones.
 5. `prloop ready <pr>` runs the gate and marks the head tested. After a gate failure, rerun the failing tests or step with their focused command and fix them, including failures you did not cause, before calling `prloop ready` again. At most 5 calls; stop as blocked only when the same failure survives 3 consecutive fixes or the cause is environmental (missing tool, no network, permission denied).

@@ -1813,5 +1813,11 @@ class GuidanceConsistencyTests(unittest.TestCase):
         self.assertIn(f"root `AGENTS.md` states \"{rule}\"", walkthrough)
         self.assertIn(rule, (ROOT / "AGENTS.md").read_text(encoding="utf-8"))
 
+    def test_fix_agent_steps_allow_resolving_proven_instruction_misreads(self) -> None:
+        for path in ("templates/AGENTS.template.md", "tools/prloop/README.md", "tools/prloop/prloop.mjs"):
+            with self.subTest(path=path):
+                text = (ROOT / path).read_text(encoding="utf-8")
+                self.assertRegex(text, r"leave them unresolved,? \(?except a finding proven to misread (AGENTS\.md|this file), which (you|it) resolves? after the evidence reply")
+
 if __name__ == "__main__":
     unittest.main()
