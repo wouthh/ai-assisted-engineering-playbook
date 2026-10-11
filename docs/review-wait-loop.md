@@ -16,6 +16,8 @@ The recommended way to run the loop is one background supervisor: `prloop run --
 
 Several supervisors and unrelated work can share one machine safely, because resource awareness is on by default. Gates take one of `--gate-slots` (2) slots shared by all of the user's `prloop` processes, and no agent or gate starts while the 1-minute load average exceeds `--max-load` (0.75 x CPU cores) or available memory is below `--min-free-mem` (the larger of 4 GiB and 10% of RAM). A wait never deadlocks: after `--resource-wait` (30m) it proceeds with one slot only. `--gate-tmpdir <dir>` gives each gate a private, deleted-afterwards `TMPDIR` so a large suite cannot fill a small `/tmp`. `prloop run --status` shows load, free memory and slots in use. See [Sharing one machine](../tools/prloop/README.md#sharing-one-machine).
 
+One writer works in a worktree at a time. While `prloop run` has a fix agent or local reviewer working in a worktree it holds a lock in that worktree's Git directory, and `prloop ready`, `sync` and `mark-tested` from any other process exit 40 naming the holder. Coordinators respect the lock too: check `prloop lock-status <dir>` before handing a worktree to an agent. When parallel work would share a checkout, create a separate worktree per agent or PR (`git worktree add <dir> -b <branch> origin/<base>`, or `git worktree add <dir> <existing branch>`) and remove it after the merge.
+
 ## Why
 
 - **Fewer tokens.** Polling, gating and syncing cost no model tokens. Agents start only when there is work, see only the current trigger, and exit after one step; a coordinator reads one compact status object.
