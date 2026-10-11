@@ -87,6 +87,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const short = (sha) => (sha ?? '').slice(0, 7);
 
 export function config(opts, env = process.env) {
+  const agent = String(opts.agent ?? env.PRLOOP_AGENT ?? 'claude');
+  // Any other value would fall through to the write-enabled Claude agent.
+  if (!['claude', 'codex', 'none'].includes(agent)) throw new Error(`--agent must be claude, codex or none, not ${agent}`);
   return {
     mode: String(opts.reviewer ?? env.PRLOOP_REVIEWER ?? 'auto'),
     // Anchored: any account whose login merely contains the bot's name could otherwise approve.
@@ -95,7 +98,7 @@ export function config(opts, env = process.env) {
     unavailable: new RegExp(opts.unavailableRegex ?? env.PRLOOP_UNAVAILABLE_REGEX
       ?? 'reached your .*usage limits|couldn.t complete this request|unable to review|quota', 'i'),
     maxLocal: Number(opts.maxLocalReviews ?? env.PRLOOP_MAX_LOCAL_REVIEWS ?? 3),
-    agent: String(opts.agent ?? env.PRLOOP_AGENT ?? 'claude'),
+    agent,
     model: opts.model ?? env.PRLOOP_MODEL,
     effort: opts.effort ?? env.PRLOOP_EFFORT,
     gate: opts.gate ?? env.PRLOOP_GATE,
@@ -670,7 +673,7 @@ export async function runAll(opts, cfg) {
   const event = (st, phase, extra = {}) => {
     Object.assign(st, { phase, updatedAt: new Date().toISOString() }, extra);
     saveState(st);
-    appendFileSync(log, `${JSON.stringify({ at: st.updatedAt, pr: st.pr, phase, head: short(st.head), ...pick(extra, ['verdict', 'reason', 'status']) })}\n`);
+    appendFileSync(log, `${JSON.stringify({ at: st.updatedAt, repo, pr: st.pr, phase, head: short(st.head), ...pick(extra, ['verdict', 'reason', 'status']) })}\n`);
   };
   const block = (st, reason, next = 'a human decision is needed') => event(st, 'blocked', { reason, next });
 
@@ -780,8 +783,13 @@ export function runStatus(repoFilter) {
   const prs = files.filter((f) => /__\d+\.json$/.test(f)).map((f) => JSON.parse(readFileSync(join(dir, f), 'utf8')))
     .filter((st) => !repoFilter || st.repo === repoFilter)
     .map((st) => ({ repo: st.repo, pr: st.pr, phase: st.phase, head: short(st.head), rounds: st.rounds, reason: st.reason, next: st.next, updatedAt: st.updatedAt }));
-  const latest = files.filter((f) => f.startsWith('run-')).sort().at(-1);
-  const events = latest ? readFileSync(join(dir, latest), 'utf8').trim().split('\n').slice(-8).map((l) => JSON.parse(l)) : [];
+  // Logs from other repositories' runs share the directory: take the newest log with events for the filter.
+  let events = [];
+  for (const f of files.filter((x) => x.startsWith('run-')).sort().reverse()) {
+    events = readFileSync(join(dir, f), 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l))
+      .filter((e) => !repoFilter || e.repo === repoFilter).slice(-8);
+    if (events.length) break;
+  }
   return { prs, events };
 }
 
@@ -799,10 +807,10 @@ export async function main(argv) {
   const [cmd, prArg] = opts._;
   if (!cmd || opts.help || cmd === 'help') { console.log(HELP); return 0; }
   const out = (obj, code) => { console.log(JSON.stringify(obj)); return code; };
-  const cfg = config(opts);
   try {
     if (cmd === 'mark-tested') return out({ verdict: 'ok', tested: markTested(opts.sha, process.cwd()) }, 0);
     if (cmd === 'run' && opts.status) return out(runStatus(opts.repo), 0);
+    const cfg = config(opts);
     if (cmd === 'run') {
       if (!opts.repo || !opts.pr) throw new Error('run needs --repo owner/name and --pr N[,N...]');
       if (opts.merge && !['rebase', 'squash', 'merge'].includes(opts.merge)) throw new Error('--merge must be rebase, squash or merge');
