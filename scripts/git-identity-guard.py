@@ -235,16 +235,23 @@ def message_addresses(text: str) -> list[tuple[int, str]]:
     The whole message is tokenized at once so that an address folded around
     a standalone at-sign, even across lines, is rejoined before checking.
     """
-    words = [(text.count("\n", 0, match.start()) + 1,
-              match.group().lstrip(LEADING_EDGE).rstrip(TRAILING_EDGE))
-             for match in re.finditer(r"[^\s,;]+", text)]
+    raw = [(text.count("\n", 0, match.start()) + 1, match.group())
+           for match in re.finditer(r"[^\s,;]+", text)]
+    words = [(number, token.lstrip(LEADING_EDGE).rstrip(TRAILING_EDGE))
+             for number, token in raw]
     found = []
     for index, (number, word) in enumerate(words):
         if word == "@":
             # "name @ domain" is one folded address; check it as a whole.
-            before = words[index - 1][1] if index > 0 else ""
-            after = words[index + 1][1] if index + 1 < len(words) else ""
-            found.append((number, f"{before}@{after}"))
+            before = raw[index - 1][1] if index > 0 else ""
+            after = raw[index + 1][1] if index + 1 < len(raw) else ""
+            if any(mark in before + after for mark in "()"):
+                # A comment beside the at-sign hides the real local part or
+                # domain; keep the raw text so it can never match the allowlist.
+                found.append((number, f"{before}@{after}"))
+            else:
+                found.append((number, f"{before.lstrip(LEADING_EDGE)}@"
+                                      f"{after.rstrip(TRAILING_EDGE)}"))
             continue
         if "@" not in word:
             continue

@@ -187,7 +187,8 @@ class MessageTests(GuardFixture):
                         "https://wrong@synthetic-mail.net/path.invalid",
                         "wrong@127.0.0.1", "ssh://wrong@127.0.0.1", "https://wrong@1.2.3",
                         "wrong @synthetic-mail.net", "wrong@ synthetic-mail.net",
-                        "@synthetic-mail.net", "wrong @ synthetic-mail.net"):
+                        "@synthetic-mail.net", "wrong @ synthetic-mail.net",
+                        "wrong (docs) @ (example.com) synthetic-mail.net"):
             with self.subTest(address=address):
                 path = self.message(f"Add feature\n\nCo-authored-by: Synthetic <{address}>\n")
                 self.assert_refused(self.guard("--commit-msg", path), "line 3")
@@ -259,6 +260,25 @@ class MessageTests(GuardFixture):
         self.assertNotEqual(applied.returncode, 0)
         self.assertIn("not on the allowlist", applied.stderr)
         self.git("am", "--abort")
+
+
+    def test_configured_hooks_refuse_reused_foreign_author(self) -> None:
+        self.require_configured_hooks()
+        self.commit("Upstream", env={**self.env, "GIT_AUTHOR_EMAIL": OTHER})
+        command = f"{shlex.quote(sys.executable)} {shlex.quote(str(GUARD))}"
+        self.git("config", "hook.identity-guard.command", command)
+        for event in ("pre-commit", "prepare-commit-msg"):
+            self.git("config", "--add", "hook.identity-guard.event", event)
+        before = self.git("rev-parse", "HEAD").stdout
+        for arguments in (["--amend", "-m", "Amended"], ["-C", "HEAD"],
+                          ["--amend", "--no-verify", "-m", "Amended"]):
+            with self.subTest(arguments=arguments):
+                result = subprocess.run(
+                    ["git", "commit", "--allow-empty", *arguments], cwd=self.repository,
+                    env=self.env, text=True, capture_output=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("author email", result.stderr)
+                self.assertEqual(self.git("rev-parse", "HEAD").stdout, before)
 
 
 class PushTests(GuardFixture):
