@@ -27,7 +27,7 @@ Several `prloop` processes, their agents and gates, and unrelated work often sha
 | `--max-load <x>` | `PRLOOP_MAX_LOAD` | 0.75 x CPU cores | No agent, local review (also one started by `wait`) or gate starts while the 1-minute load average is higher. |
 | `--min-free-mem <size>` | `PRLOOP_MIN_FREE_MEM` | larger of 4G and 10% of RAM | ...or while available memory (`MemAvailable` on Linux, free memory elsewhere) is lower. Sizes take K, M, G or T (binary). |
 | `--resource-wait <dur>` | `PRLOOP_RESOURCE_WAIT` | 30m | The wait never deadlocks: after this long it proceeds with one slot only (one agent at a time in `run`, only the first gate slot in `ready`) and logs `resource_wait_expired`. |
-| `--gate-tmpdir <dir>` | `PRLOOP_GATE_TMPDIR` | off | Runs each gate with `TMPDIR` set to a private directory that prloop creates under `<dir>` and deletes afterwards, so a test suite does not fill a small RAM-backed `/tmp` and leaves no scratch behind. |
+| `--gate-tmpdir <dir>` | `PRLOOP_GATE_TMPDIR` | off | Runs each gate, fix agent and local review with `TMPDIR` set to a private directory that prloop creates under `<dir>` for that run and deletes afterwards, so a test suite does not fill a small RAM-backed `/tmp` and leaves no scratch behind. |
 
 Resource checks repeat every `--interval`; one `waiting_for_resources` event with the load, its limit, free memory and its limit is logged per wait (in the run log for `run`, on stderr for `ready`). `prloop run --status` adds one `machine` line: load, free memory and gate slots in use. To turn a limit off in practice, raise it (for example `--gate-slots 64`).
 

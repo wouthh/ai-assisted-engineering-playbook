@@ -52,7 +52,7 @@ Machine resources (on by default; shared by every prloop process of the user):
   --max-load <x>            PRLOOP_MAX_LOAD        default: 0.75 x CPU cores (1-minute load average)
   --min-free-mem <size>     PRLOOP_MIN_FREE_MEM    default: the larger of 4G and 10% of RAM
   --resource-wait <dur>     PRLOOP_RESOURCE_WAIT   default: 30m, then proceed with one slot only
-  --gate-tmpdir <dir>       PRLOOP_GATE_TMPDIR     run each gate with a private TMPDIR under <dir>
+  --gate-tmpdir <dir>       PRLOOP_GATE_TMPDIR     run each gate and agent with a private TMPDIR under <dir>
 
 Exit codes: 0 clean/ok/merged, 10 findings, 20 not_requested, 21 requested_while_unresolved, 22 not_tested,
             30 timeout, 31 unavailable, 40 error, 41 conflict, 50 blocked / not ready / needs a human / merge pending.`;
@@ -845,16 +845,16 @@ async function runReviewer(cfg, prompt, cwd, keep) {
   try {
     if (cfg.agent === 'codex') { // otherwise claude; localReview never gets here with --agent none
       writeFileSync(join(dir, 'schema.json'), JSON.stringify(REVIEW_SCHEMA));
-      const r = await spawnAsync('codex', ['exec', '--sandbox', 'read-only', '--output-schema', join(dir, 'schema.json'), '-o', join(dir, 'out.json'),
-        ...(cfg.model ? ['-m', cfg.model] : []), ...(cfg.effort ? ['-c', `model_reasoning_effort=${cfg.effort}`] : []), prompt], cwd, agentSpawn(cfg));
+      const r = await spawnAgent('codex', ['exec', '--sandbox', 'read-only', '--output-schema', join(dir, 'schema.json'), '-o', join(dir, 'out.json'),
+        ...(cfg.model ? ['-m', cfg.model] : []), ...(cfg.effort ? ['-c', `model_reasoning_effort=${cfg.effort}`] : []), prompt], cwd, cfg);
       keep({ ...r, final: existsSync(join(dir, 'out.json')) ? readFileSync(join(dir, 'out.json'), 'utf8') : r.stdout });
       if (r.timedOut) throw new Error('agent timed out');
       if (r.status !== 0) throw new Error(`codex reviewer exited with ${r.status}: ${(r.stderr ?? '').slice(-300)}`);
       return parseReview(readFileSync(join(dir, 'out.json'), 'utf8'));
     }
-    const r = await spawnAsync('claude', ['-p', prompt, '--model', cfg.model ?? 'claude-opus-5-5', '--effort', cfg.effort ?? 'medium',
+    const r = await spawnAgent('claude', ['-p', prompt, '--model', cfg.model ?? 'claude-opus-5-5', '--effort', cfg.effort ?? 'medium',
       '--permission-mode', 'dontAsk', '--allowedTools', 'Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git show:*)',
-      '--output-format', 'json', '--json-schema', JSON.stringify(REVIEW_SCHEMA)], cwd, agentSpawn(cfg));
+      '--output-format', 'json', '--json-schema', JSON.stringify(REVIEW_SCHEMA)], cwd, cfg);
     keep({ ...r, final: r.stdout });
     if (r.timedOut) throw new Error('agent timed out');
     if (r.status !== 0) throw new Error(`claude reviewer exited with ${r.status}: ${(r.stderr ?? '').slice(-300)}`);
@@ -1095,19 +1095,26 @@ const spawnAsync = (cmd, args, cwd, { env = process.env, lock, onSpawn = lock?.a
 // before the command (the gate) finishes: raise both limits to the agent's own budget.
 export const agentEnv = (cfg, env = process.env) => cfg.agent === 'claude'
   ? { ...env, BASH_DEFAULT_TIMEOUT_MS: String(cfg.agentTimeout), BASH_MAX_TIMEOUT_MS: String(cfg.agentTimeout) } : env;
-const agentSpawn = (cfg) => ({ lock: cfg.lock, timeout: cfg.agentTimeout, env: agentEnv(cfg) });
+// With --gate-tmpdir, each agent run gets its own TMPDIR there too (agents may run tests), removed when it ends.
+async function spawnAgent(cmd, args, cwd, cfg) {
+  const env = { ...agentEnv(cfg) };
+  let tmp;
+  if (cfg.gateTmpdir) { mkdirSync(cfg.gateTmpdir, { recursive: true }); env.TMPDIR = tmp = mkdtempSync(join(cfg.gateTmpdir, 'prloop-agent-')); }
+  try { return await spawnAsync(cmd, args, cwd, { lock: cfg.lock, timeout: cfg.agentTimeout, env }); }
+  finally { if (tmp) rmSync(tmp, { recursive: true, force: true }); }
+}
 
 async function runFixAgent(cfg, prompt, cwd) {
   if (cfg.agent === 'codex') {
     const dir = mkdtempSync(join(tmpdir(), 'prloop-agent-'));
     try {
-      const r = await spawnAsync('codex', ['exec', '--sandbox', 'workspace-write', '-c', 'sandbox_workspace_write.network_access=true', '-o', join(dir, 'last.txt'),
-        ...(cfg.model ? ['-m', cfg.model] : []), ...(cfg.effort ? ['-c', `model_reasoning_effort=${cfg.effort}`] : []), prompt], cwd, agentSpawn(cfg));
+      const r = await spawnAgent('codex', ['exec', '--sandbox', 'workspace-write', '-c', 'sandbox_workspace_write.network_access=true', '-o', join(dir, 'last.txt'),
+        ...(cfg.model ? ['-m', cfg.model] : []), ...(cfg.effort ? ['-c', `model_reasoning_effort=${cfg.effort}`] : []), prompt], cwd, cfg);
       return { ...r, final: existsSync(join(dir, 'last.txt')) ? readFileSync(join(dir, 'last.txt'), 'utf8') : r.stdout };
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }
-  const r = await spawnAsync('claude', ['-p', prompt, '--model', cfg.model ?? 'claude-opus-5-5', '--effort', cfg.effort ?? 'medium',
-    '--permission-mode', 'auto', '--output-format', 'json'], cwd, agentSpawn(cfg));
+  const r = await spawnAgent('claude', ['-p', prompt, '--model', cfg.model ?? 'claude-opus-5-5', '--effort', cfg.effort ?? 'medium',
+    '--permission-mode', 'auto', '--output-format', 'json'], cwd, cfg);
   return { ...r, final: r.stdout };
 }
 
