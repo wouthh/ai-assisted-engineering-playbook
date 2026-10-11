@@ -56,7 +56,7 @@ Every cloud review costs quota, so `run` avoids requesting one when the PR's own
 Each fix agent runs in the PR's worktree (found with `git worktree list` by branch name, or `--worktree <path>`; either must have the PR branch checked out with HEAD at exactly the PR head and no uncommitted, untracked or dirty-submodule changes). Its prompt carries only the current trigger, never the round history: repository, PR, branch, head, worktree, the trigger (`findings`, `conflict`, `not_requested`, `timeout`, `local_review`), its data (compact findings with thread id, path, line and body; the conflicted files; or the previous request body), and the gate command. In one session it must:
 
 1. read only the referenced files plus AGENTS.md;
-2. fix each valid finding with a regression test, reply with evidence on invalid ones and leave them unresolved, resolve conflicts;
+2. fix each valid finding with a regression test, reply with evidence on invalid ones and leave them unresolved (except a finding proven to misread AGENTS.md, which it resolves after the evidence reply), resolve conflicts;
 3. run focused tests while fixing, then commit and push normally (`prloop sync` first if the base moved);
 4. resolve the fixed threads and reply on the disputed ones;
 5. run `prloop ready`, which runs the gate; after a gate failure, rerun the failing tests or step with their focused command and fix them, including failures it did not cause, before calling `prloop ready` again (at most 5 calls; blocked only when the same failure survives 3 consecutive fixes or the cause is environmental, such as a missing tool, no network or a permission denial);
