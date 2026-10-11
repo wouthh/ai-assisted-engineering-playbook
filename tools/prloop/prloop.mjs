@@ -272,7 +272,8 @@ export function classify(pr, cfg, nowMs = Date.now()) {
   // earlier review cycle exists (no older request, no earlier bot reaction on the PR body, full comment and reaction history seen)
   // that could finish late.
   const bodyReactions = (pr.reactions?.nodes ?? []).filter((r) => isBot(r) && r.createdAt >= headTime);
-  const ackAt = [...(current ? triggerNode.reactions.nodes.filter((r) => r.createdAt >= since) : []), ...bodyReactions]
+  // A PR-body 👀 from before the current request belongs to an earlier cycle and cannot acknowledge this one.
+  const ackAt = [...(current ? triggerNode.reactions.nodes : []), ...bodyReactions].filter((r) => r.createdAt >= since)
     .filter((r) => isBot(r) && r.content === 'EYES').map((r) => r.createdAt).sort()[0];
   const earlierCycle = !current || pr.comments.pageInfo?.hasPreviousPage || pr.reactions?.pageInfo?.hasPreviousPage
     || pr.comments.nodes.some((c) => !isBot(c) && c.createdAt < triggerNode.createdAt && c.body.toLowerCase().includes(cfg.trigger.toLowerCase()))
@@ -516,7 +517,8 @@ export async function runGate(gate, cwd, cfg, deps = {}) {
   try {
     const env = { ...process.env };
     if (cfg.gateTmpdir) { mkdirSync(cfg.gateTmpdir, { recursive: true }); env.TMPDIR = tmp = mkdtempSync(join(cfg.gateTmpdir, 'prloop-gate-')); }
-    return await spawnAsync('sh', ['-c', `(${gate}) 2>&1`], cwd, { env, onSpawn: release.adopt });
+    const onSpawn = (pid) => { release.adopt(pid); deps.adopt?.(pid); };
+    return await spawnAsync('sh', ['-c', `(${gate}) 2>&1`], cwd, { env, onSpawn });
   } finally {
     if (tmp) rmSync(tmp, { recursive: true, force: true });
     release();
@@ -598,7 +600,7 @@ export async function readyGate(s, cfg, cwd, deps = {}) {
   try {
     const cached = !cfg.forceGate && gatePassed(cfg.gate, cwd);
     if (cached) { markTested(s.head, cwd); return { ok: true, cached }; }
-    const r = await runGate(cfg.gate, cwd, cfg, deps);
+    const r = await runGate(cfg.gate, cwd, cfg, { ...deps, adopt: release.adopt }); // the gate shell keeps the key lock if ready dies
     if (r.status === 0) {
       if (key && gateKey(cfg.gate, cwd) === key) recordGatePass(cfg.gate, cwd, key); // the gate left the tree as it found it
       markTested(s.head, cwd);
@@ -618,7 +620,7 @@ async function gateKeyLock(key, pause) {
   for (;;) {
     let release = null;
     try { release = acquireSlot(dir, 1); } catch (e) { if (e.code !== 'ENOENT') throw e; }
-    if (release) return () => { release(); try { rmdirSync(dir); } catch {} };
+    if (release) return Object.assign(() => { release(); try { rmdirSync(dir); } catch {} }, { adopt: release.adopt });
     await pause(SLOT_POLL);
   }
 }
