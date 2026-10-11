@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import {
-  buildPrompt, classify, headSeenAt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, syncBranch, unionLines, waitFor,
+  buildPrompt, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, syncBranch, unionLines, waitFor,
 } from '../prloop.mjs';
 
 const fixture = () => JSON.parse(readFileSync(new URL('./pr-fixture.json', import.meta.url), 'utf8'));
@@ -486,6 +486,7 @@ test('run --status reads state files and the latest events without GitHub', (t) 
 
 test('plain strips badges, markup and the reviewer footer', () => {
   assert.equal(plain('**<sub>![P2 Badge](https://example.invalid/b.svg)</sub>  Fix `x`**\n\nDetails here.\n\nAGENTS.md reference: [x](y)\n\nUseful? React'), 'Fix x Details here.');
+  assert.equal(plain('### Review\n\nSuggestions below.\n\n<details> <summary>About</summary>\nboilerplate\n</details>\n'), 'Review Suggestions below.');
 });
 
 test('sync pushes a fork branch to its own remote, not to origin', (t) => {
@@ -531,4 +532,9 @@ test('sync merges the reported base commit, not extra commits on the remote bran
   assert.equal(v.verdict, 'synced', JSON.stringify(v));
   assert.equal(r.run(r.work, 'merge-base', '--is-ancestor', baseOid, 'HEAD'), '');
   assert.throws(() => r.run(r.work, 'cat-file', '-e', 'HEAD:extra.txt'));
+});
+
+test('the local review diffs from the reported base commit', () => {
+  assert.match(localReviewPrompt({ pr: 7, base: 'main', baseOid: 'b0b0', head: 'abc' }), /git diff b0b0\.\.\.HEAD/);
+  assert.match(localReviewPrompt({ pr: 7, base: 'main', head: 'abc' }), /git diff origin\/main\.\.\.HEAD/);
 });

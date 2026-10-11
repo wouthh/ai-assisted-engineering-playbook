@@ -482,6 +482,13 @@ async function runReviewer(cfg, prompt, cwd) {
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 
+export function localReviewPrompt(s) {
+  // Diff from the reported base commit: the remote branch may carry commits that the PR still includes.
+  return `Review pull request #${s.pr}: the changes in \`git diff ${s.baseOid ?? `origin/${s.base}`}...HEAD\` at head ${s.head}.
+Do not modify any file. Report only real defects (bugs, security, data loss, broken contracts), not style.
+Return JSON {"findings":[{"path","line","severity":"P0".."P3","body"}]} with "line" in the new file (0 if none) and an empty array when there are no issues.`;
+}
+
 // Runs one read-only review of the current head in `cwd` and posts it. Returns a verdict to stop on,
 // or null when the result was posted and the next poll should classify it.
 export async function localReview(repo, s, cfg, cwd) {
@@ -491,9 +498,7 @@ export async function localReview(repo, s, cfg, cwd) {
   // Fail closed: a missing or stale base would make an empty diff look like a clean review.
   const baseError = fetchBase(cwd, s.base, s.baseOid);
   if (baseError) return { verdict: 'blocked', pr: s.pr, head: s.head, reason: `local review: ${baseError}` };
-  const prompt = `Review pull request #${s.pr}: the changes in \`git diff origin/${s.base}...HEAD\` at head ${s.head}.
-Do not modify any file. Report only real defects (bugs, security, data loss, broken contracts), not style.
-Return JSON {"findings":[{"path","line","severity":"P0".."P3","body"}]} with "line" in the new file (0 if none) and an empty array when there are no issues.`;
+  const prompt = localReviewPrompt(s);
   let findings;
   try { findings = await runReviewer(cfg, prompt, cwd); } catch (e) {
     return { verdict: 'blocked', pr: s.pr, head: s.head, reason: `local reviewer failed: ${String(e.message).slice(0, 400)}` };
@@ -538,7 +543,7 @@ export function recordFindings(seen, findings) {
 export const DENIED = /permission (was |has been )?denied|denied permission|not (been )?permitted|requires? (your )?approval/i;
 
 // Comment text without badges, HTML, markdown emphasis and the reviewer's boilerplate footer.
-export const plain = (body) => String(body ?? '').replace(/\n+(AGENTS\.md reference|Useful\? React)[\s\S]*$/, '')
+export const plain = (body) => String(body ?? '').replace(/\n+(AGENTS\.md reference|Useful\? React)[\s\S]*$/, '').replace(/<details>[\s\S]*?<\/details>/g, '')
   .replace(/!\[[^\]]*\]\([^)]*\)/g, '').replace(/<[^>]+>/g, '').replace(/[*_`#>]/g, '').replace(/\s+/g, ' ').trim();
 
 // The fix agent sees only this trigger, never the round history.
