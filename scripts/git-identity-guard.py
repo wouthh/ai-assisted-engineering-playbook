@@ -59,7 +59,10 @@ ZERO_OID = re.compile(r"0+")
 # is treated as an address unless the whole word is a mention such as @name or
 # a package version such as name@1.2.3 or @scope/name@1.2.3. Unusual but valid address
 # syntax is therefore refused unless it is allowlisted.
-WORD_EDGE = "<>()[]{},;:!?'\"`."
+# Trim only characters that can never belong to an address at that end: a
+# local part may start with ! ' ? or `, but a domain never ends in punctuation.
+LEADING_EDGE = "<([{\""
+TRAILING_EDGE = ">)]},;:!?'\"`."
 # A whole word such as name@1.2.3, name@v1.2.3-beta.1 or @scope/name@1.2.
 PACKAGE_VERSION = re.compile(
     r"(?:@[A-Za-z0-9][\w.-]*/)?[A-Za-z0-9][\w.-]*"
@@ -224,10 +227,10 @@ def message_email_allowed(email: str, allowed: set[str]) -> bool:
 
 
 def message_addresses(line: str) -> list[str]:
-    """Words that must be treated as addresses (see the comment on WORD_EDGE)."""
+    """Words that must be treated as addresses (see the comment above)."""
     found = []
     for word in re.split(r"[\s,;]+", line):
-        word = word.strip(WORD_EDGE)
+        word = word.lstrip(LEADING_EDGE).rstrip(TRAILING_EDGE)
         if word.count("@") == 0 or (word.count("@") == 1 and word.endswith("@")):
             continue  # No address, or a lone trailing at-sign such as name@.
         # Exemptions apply only when the whole word has exactly that shape.

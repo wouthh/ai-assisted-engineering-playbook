@@ -190,6 +190,18 @@ class MessageTests(GuardFixture):
                 path = self.message(f"Add feature\n\nCo-authored-by: Synthetic <{address}>\n")
                 self.assert_refused(self.guard("--commit-msg", path), "line 3")
 
+    def test_valid_leading_punctuation_is_not_trimmed_into_an_allowed_address(self) -> None:
+        self.write_config({"expected_email": EXPECTED,
+                           "allowed_message_emails": ["user@synthetic-mail.net"]})
+        for word in ("<!user@synthetic-mail.net>", "?user@synthetic-mail.net",
+                     "`user@synthetic-mail.net", "'user@synthetic-mail.net"):
+            with self.subTest(word=word):
+                path = self.message(f"Add feature\n\nCo-authored-by: Synthetic {word}\n")
+                self.assert_refused(self.guard("--commit-msg", path), "line 3")
+        path = self.message("Add feature\n\nCo-authored-by: Synthetic <user@synthetic-mail.net>.\n")
+        result = self.guard("--commit-msg", path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_package_versions_are_not_email(self) -> None:
         path = self.message("Bump zod@4.6.5, react@19.3.0 and pkg@1.2.3-beta.1\n\n"
                             "Scoped @types/react@19.3.0, thanks @alice.\n")
