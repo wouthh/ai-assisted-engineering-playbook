@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -649,6 +649,31 @@ test('a slot or lock claim whose PID now names another process is reclaimed', { 
   assert.ok(lock.token);
   assert.equal(lockHolder(r.work, null).pid, process.pid);
   lock.release();
+});
+
+test('a slot or lock claim stays live while a child outlives its killed owner', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'prloop-slots-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const kid = spawn('sleep', ['30']);
+  t.after(() => kid.kill());
+  const release = acquireSlot(dir, 1, deadPid()); // the owner was killed while its gate still runs
+  release.adopt(kid.pid);
+  assert.equal(slotsInUse(dir), 1);
+  assert.equal(acquireSlot(dir, 1), null);
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  const lock = takeLock(r.work, 'fix agent for PR #7', deadPid());
+  lock.adopt(kid.pid);
+  assert.equal(takeLock(r.work, 'another run').holder.purpose, 'fix agent for PR #7');
+  kid.kill();
+  await new Promise((done) => kid.on('exit', done));
+  assert.equal(slotsInUse(dir), 0);
+  assert.equal(lockHolder(r.work, null), null);
+  // runGate records the gate shell in its slot claim.
+  const ran = await runGate(`cat "${dir}"/slot-0.*; echo; echo $$`, dir, { ...cfg, gateSlots: 1 }, { ...idle(), dir });
+  const lines = ran.stdout.trim().split('\n');
+  assert.equal(lines[1].split(' ')[0], lines.at(-1));
+  assert.deepEqual(readdirSync(dir), []);
 });
 
 test('the slot directory is per user without XDG_RUNTIME_DIR and must not be writable by others', (t) => {
