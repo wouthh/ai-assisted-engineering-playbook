@@ -57,9 +57,9 @@ Each fix agent runs in the PR's worktree (found with `git worktree list` by bran
 
 1. read only the referenced files plus every AGENTS.md that applies to them (root and nested);
 2. fix each valid finding with a regression test, reply with evidence on invalid ones and leave them unresolved (except a finding proven to misread AGENTS.md, which it resolves after the evidence reply once every AGENTS.md that applies to its path confirms it is invalid), resolve conflicts;
-3. run focused tests while fixing, then commit and push normally (`prloop sync` first if the base moved);
+3. run focused tests while fixing, never the full project gate directly, then commit and push normally (`prloop sync` first if the base moved);
 4. resolve the fixed threads and reply on the disputed ones;
-5. run `prloop ready`, which runs the gate; after a gate failure, rerun the failing tests or step with their focused command and fix them, including failures it did not cause, before calling `prloop ready` again (at most 5 calls; blocked only when the same failure survives 3 consecutive fixes or the cause is environmental, such as a missing tool, no network or a permission denial);
+5. run `prloop ready`, which runs the gate, in the foreground with a timeout of at least `--agent-timeout`, never backgrounded; after a gate failure, rerun the failing tests or step with their focused command and fix them, including failures it did not cause, before calling `prloop ready` again (at most 5 calls; blocked only when the same failure survives 3 consecutive fixes or the cause is environmental, such as a missing tool, no network or a permission denial);
 6. post the review request, reusing the previous request body (skipped with `--reviewer local`);
 7. end its final message with one JSON line on its own line, also when blocked (a denied action is reported as `blocked` naming the denied command): `{"status":"requested|blocked|nothing_to_do","head":"…","fixed":[…],"disputed":[…],"reason":"…"}`.
 
@@ -73,10 +73,11 @@ Fix agents never wait for or poll reviews, merge, touch other PRs, rewrite histo
 
 | Option | Default | |
 |---|---|---|
-| `--gate "<cmd>"` | `PRLOOP_GATE` | The project's full validation command, run by `prloop ready`. Without it the agent runs the gate documented in AGENTS.md or README and calls `prloop mark-tested`. |
+| `--gate "<cmd>"` | `PRLOOP_GATE` | The project's full validation command, run by `prloop ready`. Without it the agent passes the gate documented in AGENTS.md or README to `prloop ready --gate`. |
 | `--agent claude` | yes | `claude -p <prompt> --model claude-opus-5-5 --effort medium --permission-mode auto --output-format json`, run in the worktree so the CLI loads that project's instructions. |
 | `--agent codex` | | `codex exec` with a workspace-write sandbox that allows network access. |
 | `--agent none` | | Stops the PR at `needs_agent` with the generated `prompt` in its summary, so the coordinator can spawn its own agent and rerun `run`. A needed local review stops the PR at `blocked` instead of running a reviewer. |
+| `--agent-timeout 90m` | 90m | `PRLOOP_AGENT_TIMEOUT`. Kills a fix agent or local reviewer (its whole process group) that runs longer and records it `blocked` with `agent timed out`. Claude agents also get `BASH_DEFAULT_TIMEOUT_MS` and `BASH_MAX_TIMEOUT_MS` set to this budget: Claude Code otherwise moves a long Bash command such as the gate to the background after its default timeout, and a `-p` session then ends before the gate completes. Codex has no such setting, so its prompt carries only the foreground rule. |
 | `--model`, `--effort` | | Override the agent model and effort (`PRLOOP_MODEL`, `PRLOOP_EFFORT`). |
 | `--max-agents 2` | 2 | Agents and local reviews running at the same time. |
 | `--max-rounds 6` | 6 | Fix-agent rounds per PR, across runs. |
@@ -86,7 +87,7 @@ Fix agents never wait for or poll reviews, merge, touch other PRs, rewrite histo
 
 Failsafes end a PR in `blocked` (or `needs_human` for disputed findings) with a reason, never in a loop: maximum rounds per PR (`--max-rounds 6`), an agent that exits non-zero, prints no parseable result line without making progress, reports `blocked` or a permission denial, or makes no progress (no new commit, resolved thread, request or tested head), the same finding (path plus normalized first line) returning after two fixes, the overall deadline, and every local-review failsafe.
 
-Every count (`--max-rounds`, `--max-agents`) must be a positive integer and every duration (`--deadline`, `--interval`, `--timeout`, `--ack-timeout`) a positive `90s`/`40m`/`6h` value; anything else, such as `NaN`, `Infinity` or `0`, is a usage error (exit 40) instead of an unbounded loop. `--max-local-reviews` is a nonnegative integer: 0 disables local reviews.
+Every count (`--max-rounds`, `--max-agents`) must be a positive integer and every duration (`--deadline`, `--interval`, `--timeout`, `--ack-timeout`, `--agent-timeout`) a positive `90s`/`40m`/`6h` value; anything else, such as `NaN`, `Infinity` or `0`, is a usage error (exit 40), as is a non-finite `--max-load`, instead of an unbounded loop. `--max-local-reviews` is a nonnegative integer: 0 disables local reviews.
 
 ### At the round cap
 
@@ -99,6 +100,10 @@ A PR that reaches `--max-rounds` stops as `blocked` with `max rounds (N) reached
 ### Agent memory in worktrees
 
 Fix agents and local reviewers run in the PR's worktree, which may live outside the main checkout. With `--agent claude` this keeps the same per-project memory: Claude Code derives its auto-memory directory from the Git repository, so all worktrees of a repository share one. Instructions load from the worktree's own checked-out `CLAUDE.md` or `AGENTS.md`. Two things do not follow the agent into a worktree outside the main checkout: an untracked, gitignored `CLAUDE.local.md` (it exists only where it was created; import a file from your home directory instead) and instruction files in directories above the main checkout. Keep project rules in tracked files.
+
+### One full gate per tree
+
+A passing gate is recorded in `${XDG_STATE_HOME:-~/.local/state}/prloop/gate-cache`, keyed by the tree of the clean checkout (`git rev-parse HEAD^{tree}`) and the SHA-256 of the gate command. `ready` skips the gate on a hit, marks the head tested and prints `gate already passed for tree <sha>` on stderr; a rebase or sync that reproduces an identical tree also hits. A dirty checkout never hits, a gate that changed the tree is not recorded, failures are never recorded, and `--force-gate` always runs it. Agents run focused tests while fixing and leave the full gate to `prloop ready`; when the gate command was already run by hand and passed on the current clean tree, `prloop mark-tested --gate "<cmd>"` records it in the same cache instead of rerunning.
 
 ## Agent-in-the-loop commands
 

@@ -71,9 +71,9 @@ Install [`prloop`](https://github.com/wouthh/ai-assisted-engineering-playbook/tr
 
 1. Read only the referenced files plus this file and every nested AGENTS.md that applies to them.
 2. Fix each valid finding with a regression test; reply with evidence on invalid ones and leave them unresolved, except a finding proven to misread this file, which you resolve after the evidence reply once every AGENTS.md that applies to its path confirms it is invalid (see Instruction maintenance); resolve conflicts.
-3. Run focused tests, then commit and push normally (`prloop sync <pr>` first if the base moved).
+3. Run focused tests, never the full gate directly, then commit and push normally (`prloop sync <pr>` first if the base moved).
 4. Resolve the fixed threads; reply on disputed ones.
-5. `prloop ready <pr>` runs the gate and marks the head tested. After a gate failure, rerun the failing tests or step with their focused command and fix them, including failures you did not cause, before calling `prloop ready` again. At most 5 calls; stop as blocked only when the same failure survives 3 consecutive fixes or the cause is environmental (missing tool, no network, permission denied).
+5. `prloop ready <pr>` runs the gate once per tree (a gate already passed on the same clean tree is skipped) and marks the head tested. Run it and any long test command in the foreground with a timeout of at least the agent budget; never background a command, and wait for one that was backgrounded anyway before ending the turn. If you already ran exactly the gate command and it passed on the current clean tree, `prloop mark-tested --gate "<cmd>"` records it instead. After a gate failure, rerun the failing tests or step with their focused command and fix them, including failures you did not cause, before calling `prloop ready` again. At most 5 calls; stop as blocked only when the same failure survives 3 consecutive fixes or the cause is environmental (missing tool, no network, permission denied).
 6. Post the review request once, reusing the previous request body.
 7. Exit with one JSON line: `{"status":"requested|blocked|nothing_to_do","head":"…","fixed":[…],"disputed":[…],"reason":"…"}`.
 
