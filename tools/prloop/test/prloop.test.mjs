@@ -1534,6 +1534,19 @@ test('agent usage: totals from a recorded claude wrapper, blank for output witho
   assert.deepEqual(runStatus('example-org/example-repo').prs[0].usage, expected);
 });
 
+test('with --gate-tmpdir an agent run gets a private TMPDIR there, removed when it ends', async (t) => {
+  const base = mkdtempSync(join(tmpdir(), 'prloop-agent-tmp-'));
+  t.after(() => rmSync(base, { recursive: true, force: true }));
+  const seen = join(base, 'seen');
+  const { res } = await runNoResultAgent(t, false, { body: `echo "$TMPDIR" > "${seen}"; touch "$TMPDIR/scratch"`, extra: { gateTmpdir: join(base, 'tmp') } });
+  assert.equal(res.verdict, 'blocked', JSON.stringify(res));
+  const dir = readFileSync(seen, 'utf8').trim();
+  assert.ok(dir.startsWith(join(base, 'tmp', 'prloop-agent-')), dir);
+  assert.equal(existsSync(dir), false); // removed after the run
+  assert.deepEqual(readdirSync(join(base, 'tmp')), []);
+  assert.notEqual(process.env.TMPDIR, dir); // prloop's own environment is untouched
+});
+
 test('run kills an agent that outlives --agent-timeout and blocks with "agent timed out"', async (t) => {
   const started = Date.now();
   const { res, r } = await runNoResultAgent(t, false, { body: 'sleep 30 & wait', extra: { agentTimeout: 300 } });
