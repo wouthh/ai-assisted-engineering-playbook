@@ -1820,5 +1820,14 @@ class GuidanceConsistencyTests(unittest.TestCase):
                 self.assertRegex(text, r"leave them unresolved,? \(?except a finding proven to misread (AGENTS\.md|this file), which (you|it) resolves? after the evidence reply once every AGENTS\.md that applies to its path confirms it is invalid")
                 self.assertRegex(text, r"(?i)read only the referenced files plus [^;\n]*?every (nested )?AGENTS\.md that applies to them")
 
+    def test_root_guidance_mirrors_template_supervisor_rules(self) -> None:
+        for path in ("AGENTS.md", "templates/AGENTS.template.md"):
+            with self.subTest(path=path):
+                text = (ROOT / path).read_text(encoding="utf-8")
+                self.assertIn("direct background job of your own shell", text)
+                self.assertIn("--deadline", text)
+                self.assertIn("Never supervise it through a detached process plus a `pgrep -f` watcher", text)
+                self.assertIn("clear that PR's state file before rerunning, instead of spending `prloop reset-rounds`", text)
+
 if __name__ == "__main__":
     unittest.main()
