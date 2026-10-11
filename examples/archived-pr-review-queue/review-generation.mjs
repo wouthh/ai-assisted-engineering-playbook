@@ -1720,9 +1720,9 @@ export function validateGenerationCompletionAttestation(
       { mismatches, expected, actual },
     );
   }
-  // The attested clusters must be exactly the generation's assigned clusters
-  // with their assigned member threads, so a worker cannot drop a cluster or
-  // empty its members and still pass.
+  // The attested clusters must be exactly the generation's assigned clusters,
+  // with their assigned member threads and final classification, so a worker
+  // cannot drop a cluster, empty its members, or downgrade an accepted cluster.
   if (!Array.isArray(expectedClusters)) {
     fail("invalid_generation_contract", "expectedClusters must be an array");
   }
@@ -1731,6 +1731,7 @@ export function validateGenerationCompletionAttestation(
     return JSON.stringify([
       requiredString(record.membership_fingerprint, `${label}.membership_fingerprint`),
       requiredString(record.cluster_id, `${label}.cluster_id`),
+      requiredString(record.classification, `${label}.classification`).toLowerCase(),
       [...stringList(record.member_thread_ids ?? [], `${label}.member_thread_ids`)].sort(),
     ]);
   };
