@@ -119,7 +119,8 @@ const sh = (cmd, args, opts = {}) =>
 const git = (args, cwd) => sh('git', args, { cwd });
 const tryGit = (args, cwd) => { try { return git(args, cwd); } catch { return null; } };
 // Explicit flags so user or repository config cannot hide untracked files or dirty submodules.
-const dirty = (cwd) => git(['status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none'], cwd) !== '';
+// --no-optional-locks: a status check must not refresh and rewrite the index (see git-status "Background refresh").
+const dirty = (cwd) => git(['--no-optional-locks', 'status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none'], cwd) !== '';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const short = (sha) => (sha ?? '').slice(0, 7);
 
@@ -676,6 +677,9 @@ export async function waitFor(repo, prNum, cfg, { interval, fetch = fetchPr, now
     if (plan.blocked) return { verdict: 'blocked', pr: s.pr, head: s.head, reason: plan.blocked };
     if (plan.local) {
       await admit(cfg, { metrics, now, pause, log }, resources);
+      // The head may have moved while waiting for resources: review the current snapshot, or poll again.
+      try { s = classify(fetch(repo, prNum), cfg, now()); } catch { continue; }
+      if (!reviewPlan(s, cfg).local) continue;
       const r = await runLocal(repo, s, cfg, cwd);
       if (r) return r; // gate missing or reviewer failed; otherwise the posted result is classified next poll
       continue;
