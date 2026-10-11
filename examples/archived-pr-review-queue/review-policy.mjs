@@ -1413,8 +1413,10 @@ export function adoptLegacyPendingReviewRequest(
   return { policy: next, adopted: true };
 }
 
+// Placeholder: pin the exact reviewer app identity (login, numeric ID, and
+// node ID) that your repository trusts before using automatic attribution.
 const AUTOMATIC_REVIEW_ACTOR = Object.freeze({
-  login: "chatgpt-codex-connector[bot]", id: 199175422, node_id: "BOT_kgDOC98s_g",
+  login: "example-reviewer[bot]", id: 123456, node_id: "BOT_example",
 });
 
 function assertAutomaticInitialEvidence(generation) {
@@ -1770,13 +1772,26 @@ function assertClearResultFollowsRequest({ result, recordedAt, requestedAt }) {
   }
 }
 
-function assertTerminalResultNotStale({ recordedAt, priorRecordedAt, cycleId }) {
-  if (
-    typeof priorRecordedAt === "string" &&
-    Date.parse(recordedAt) < Date.parse(priorRecordedAt)
-  ) {
+function assertTerminalResultNotStale({
+  recordedAt,
+  result,
+  priorRecordedAt,
+  priorResult,
+  cycleId,
+}) {
+  if (typeof priorRecordedAt !== "string") {
+    return;
+  }
+  const recordedMs = Date.parse(recordedAt);
+  const priorMs = Date.parse(priorRecordedAt);
+  if (recordedMs < priorMs) {
     throw new Error(
       `stale terminal review evidence for ${cycleId}: ${recordedAt} predates ${priorRecordedAt}`,
+    );
+  }
+  if (recordedMs === priorMs && result !== priorResult) {
+    throw new Error(
+      `ambiguous terminal review evidence for ${cycleId}: ${result} and ${priorResult} share ${recordedAt}`,
     );
   }
 }
@@ -1819,7 +1834,9 @@ export function recordReviewCycleTerminalResult(
   });
   assertTerminalResultNotStale({
     recordedAt: normalizedRecordedAt,
+    result: normalizedResult,
     priorRecordedAt: next.current_request.terminal_result_at,
+    priorResult: next.current_request.status,
     cycleId: normalizedCycleId,
   });
   const adoptedLegacyRequest =
@@ -1892,7 +1909,9 @@ export function recordExternalReviewGenerationTerminalResult(
   });
   assertTerminalResultNotStale({
     recordedAt: normalizedRecordedAt,
+    result: normalizedResult,
     priorRecordedAt: generation.terminal_result_at,
+    priorResult: generation.status,
     cycleId: normalizedCycleId,
   });
   generation.status = normalizedResult;
