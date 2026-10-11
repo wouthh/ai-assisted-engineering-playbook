@@ -708,6 +708,18 @@ test('a dismissed bot review is neither a clean nor a findings signal', () => {
   assert.equal(classify(pr, cfg, NOW).verdict, 'clean');
 });
 
+test('threads from a dismissed bot review are not findings', () => {
+  const pr = fixture();
+  const t = thread('T1', at('10:20'));
+  t.comments.nodes[0].pullRequestReview = { state: 'DISMISSED' };
+  pr.reviewThreads.nodes.push(t);
+  const s = classify(pr, cfg, NOW);
+  assert.equal(s.verdict, 'pending');
+  assert.equal(s.unresolvedThreads.length, 0);
+  t.comments.nodes[0].pullRequestReview.state = 'COMMENTED';
+  assert.equal(classify(pr, cfg, NOW).verdict, 'findings');
+});
+
 // ---------- saving cloud reviews ----------
 
 test('a carried clean verdict counts on the synced head only, and a real finding overrides it', () => {
