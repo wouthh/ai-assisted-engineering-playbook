@@ -208,7 +208,10 @@ export function classify(pr, cfg, nowMs = Date.now()) {
     .filter((r) => isBot(r) && r.createdAt >= since && (r.content === 'EYES' || r.content === 'THUMBS_UP'))
     .map((r) => ({ at: r.createdAt, state: r.content === 'EYES' ? 'reviewing' : 'clean' }));
   const botReviews = pr.reviews.nodes.filter((r) => isBot(r) && r.commit?.oid === head && r.submittedAt >= since);
-  const botComments = pr.comments.nodes.filter((c) => isBot(c) && c.createdAt >= since);
+  // Issue comments carry no commit: like PR-body reactions, they count only after a request or a 👀 on this
+  // head, so a delayed comment about the previous head cannot clear this one. Local clean bodies name the head.
+  const started = current || bodyReactions.some((r) => r.content === 'EYES');
+  const botComments = pr.comments.nodes.filter((c) => isBot(c) && c.createdAt >= since && (started || trusted(c)));
   const summaries = [...botReviews.map((r) => ({ at: r.submittedAt, body: r.body, local: trusted(r) })), ...botComments.map((c) => ({ at: c.createdAt, body: c.body, local: trusted(c) }))]
     .filter((s) => s.body);
   for (const s of summaries) {
@@ -617,11 +620,10 @@ async function runFixAgent(cfg, prompt, cwd) {
 }
 
 // A wrong --worktree would let a write-enabled agent commit to another branch or repository: require the
-// PR branch checked out and the PR head commit present (after fetching the branch's remote).
+// PR branch checked out at exactly the PR head, so local commits ahead of or diverged from it cannot be pushed.
 export function checkWorktree(cwd, s) {
   if (tryGit(['branch', '--show-current'], cwd) !== s.branch) return `worktree ${cwd} does not have ${s.branch} checked out`;
-  tryGit(['fetch', '--quiet', tryGit(['config', `branch.${s.branch}.remote`], cwd) || 'origin', s.branch], cwd);
-  if (tryGit(['cat-file', '-e', `${s.head}^{commit}`], cwd) === null) return `worktree ${cwd} does not contain PR head ${short(s.head)}: wrong repository?`;
+  if (tryGit(['rev-parse', 'HEAD'], cwd) !== s.head) return `worktree ${cwd} HEAD is not PR head ${short(s.head)}: push or pull first`;
   return null;
 }
 

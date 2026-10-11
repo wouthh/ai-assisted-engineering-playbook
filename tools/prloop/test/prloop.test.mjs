@@ -59,6 +59,16 @@ test('clean via a reviewer comment matching the clean regex', () => {
   assert.equal(classify(pr, cfg, NOW).verdict, 'clean');
 });
 
+test('a clean bot comment without a request or eyes on this head does not count', () => {
+  const pr = fixture();
+  pr.comments.nodes.pop(); // automatic review: no request after the head
+  pr.comments.nodes.push({ id: 'IC_bot', databaseId: 102, body: "Codex Review: Didn't find any major issues. Nice work.",
+    createdAt: at('10:20'), author: BOT, reactions: { nodes: [] } });
+  assert.equal(classify(pr, cfg, NOW).verdict, 'not_requested');
+  pr.reactions.nodes.push({ content: 'EYES', createdAt: at('10:01'), user: BOT });
+  assert.equal(classify(pr, cfg, NOW).verdict, 'clean');
+});
+
 test('clean via a review on the current head', () => {
   const pr = fixture();
   pr.reviews.nodes.push({ id: 'R1', body: "Didn't find any major issues.", state: 'COMMENTED',
@@ -553,5 +563,7 @@ test('worktree check: branch and PR head commit must match', (t) => {
   const head = r.run(r.work, 'rev-parse', 'HEAD');
   assert.equal(checkWorktree(r.work, { branch: 'feat', head }), null);
   assert.match(checkWorktree(r.work, { branch: 'other', head }), /does not have other checked out/);
-  assert.match(checkWorktree(r.work, { branch: 'feat', head: 'f'.repeat(40) }), /does not contain PR head/);
+  assert.match(checkWorktree(r.work, { branch: 'feat', head: 'f'.repeat(40) }), /HEAD is not PR head/);
+  r.commit('local only', { 'app.txt': 'two\n' }); // PR head still present, but HEAD is ahead of it
+  assert.match(checkWorktree(r.work, { branch: 'feat', head }), /HEAD is not PR head/);
 });
