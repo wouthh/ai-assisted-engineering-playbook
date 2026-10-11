@@ -37,6 +37,8 @@ Every command prints one JSON object on stdout. `--repo owner/name` defaults to 
 | `not_requested` | 20 | No trigger comment after the current head commit. Run `prloop ready`, then request a review. |
 | `requested_while_unresolved` | 21 | A request was posted while older threads were still open. |
 | `timeout` | 30 | No reaction within `--ack-timeout` (3m) of the request, or no result within `--timeout` (40m). Both are measured from the request time, so running `wait` again does not restart the clock. Includes `rerequestBody`, a copy of your last trigger comment, to repost unchanged. A timed-out request no longer blocks `prloop ready`. |
+| `unavailable` | 31 | Only with `--reviewer cloud`: the bot replied that it cannot review (usage limit, failure), or two requests on this head timed out. |
+| `blocked` | 50 | A local review could not run or post, or its per-head or per-PR limit is used up. |
 | `error` | 40 | GitHub could not be read three times in a row, bad input, or more than 100 review threads (prloop fails closed rather than miss one). |
 
 ## Agent workflow
@@ -87,6 +89,20 @@ For each PR, sequentially: sync if GitHub reports the branch behind or conflicti
 A single wait is bounded by `--timeout`, so the overall deadline is checked between rounds. Every failsafe ends in `verdict: "blocked"` with a reason (exit 50) instead of looping: maximum rounds per PR, the agent exiting non-zero, the agent pushing no commit, resolving no thread and posting no request, the same finding (path plus normalized first line) returning after two fixes, the overall deadline, or agent output reporting a permission denial.
 
 State (rounds, seen findings, last verdict) lives in `${XDG_STATE_HOME:-~/.local/state}/prloop/<owner>__<name>__<pr>.json`. Rounds persist across runs on purpose; delete the file to reset the budget for a PR.
+
+## Local reviewer fallback
+
+`--reviewer` (or `PRLOOP_REVIEWER`) selects who reviews:
+
+| Mode | Behavior |
+|---|---|
+| `cloud` | Only the bot. An unavailable bot ends `wait` with `unavailable` (31). |
+| `local` | Never asks the bot. `wait` runs a local review of the current head itself. |
+| `auto` (default) | Uses the bot, and runs a local review when the bot replies that it cannot review (default regex matches "reached your ... usage limits", "couldn't complete this request", "unable to review", "quota"; set `--unavailable-regex`) or when two requests on the same head time out. |
+
+The local review is a separate, read-only agent run (`--agent claude` by default with `--permission-mode dontAsk` and only read and `git diff/log/show` tools; `--agent codex` uses `codex exec --sandbox read-only`), never the run that wrote the fix. It needs the same gate as a request: no unresolved threads, a tested head, and `wait` running inside a clean, pushed checkout of the PR branch. It returns structured findings (path, line, severity P0-P3, body), which prloop posts with `gh` under your account as a normal PR review with inline comments, each prefixed `[local review]`; findings outside the diff go in the review body. A clean result posts `[local review] No issues found on <sha>.` The next poll classifies these exactly like bot results.
+
+Failsafes: one local review per head, at most `--max-local-reviews` (3) per PR, and any reviewer failure, malformed output, change to the checkout or posting error ends in `blocked` with the reason instead of a retry.
 
 ## Another reviewer bot
 
