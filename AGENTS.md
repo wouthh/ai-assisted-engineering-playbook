@@ -8,6 +8,7 @@ This repository is a reusable playbook for human-owned AI-assisted software deli
 - Utilities are read-only by default, offline-capable, and tested with synthetic fixtures. Repository inspection requires trusted tools, a quiescent checkout, and stable configuration; observed-drift checks are not sandboxing or atomic isolation.
 - Never add workstation-specific paths, credentials, personal data, private repository references, or real provider payloads.
 - Examples must be fictional or independently reusable. Do not copy source from another repository.
+- Exception: `examples/archived-*` holds owner-published, sanitized, unmaintained snapshots. Each has a README stating that it is archived. They are not utilities, are not covered by validation, and must contain no private project details.
 - Do not present the redaction helper as a complete secret scanner.
 - Keep external writes, destructive actions, deployment, merging, and credential validation behind separate approval checkpoints.
 - A passing command is evidence only for the exact repository state and head that produced it.

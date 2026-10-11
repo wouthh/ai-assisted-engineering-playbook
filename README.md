@@ -98,6 +98,8 @@ Additional stack notes show how the same workflow maps to:
 
 The examples identify representative commands, not universal project conventions. A repository's own documented gate remains authoritative.
 
+The [archived PR review queue](examples/archived-pr-review-queue/README.md) is an unmaintained, sanitized snapshot of a retired review follow-up automation, kept for reading only.
+
 ## Core principles
 
 - **Intent before implementation:** acceptance criteria shape the solution and its tests.
