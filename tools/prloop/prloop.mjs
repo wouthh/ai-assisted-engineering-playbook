@@ -1088,10 +1088,11 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     if (s.state === 'MERGED') return event(st, 'merged', { mergeCommit: s.mergeCommit });
     if (s.state === 'CLOSED') return block(st, 'the PR is closed');
     const cwd = opts.worktree ? resolve(opts.worktree) : findWorktree(s.branch, process.cwd());
-    const wrong = cwd && checkWorktree(cwd, s);
-    if (wrong) return block(st, wrong);
+    // The holder check comes first: a locked fix agent's uncommitted edit or local commit is not a bad checkout.
     const holder = cwd && lockHolder(cwd, null);
     if (holder) return lockedOut(st, cwd, holder);
+    const wrong = cwd && checkWorktree(cwd, s);
+    if (wrong) return block(st, wrong);
     const slot = () => busy.size < maxAgents && resourcesAllow(st);
     // A behind head is always synced, even when mergeable, so the gate runs on the combined base-plus-branch
     // state before a merge; an unchanged patch carries the clean review, so this costs no new review.
@@ -1254,10 +1255,12 @@ export async function main(argv) {
         tested: isTested(s.head, process.cwd()) }, 0);
     }
     if (cmd === 'ready') {
-      const s = classify(fetchPr(repo, prArg), cfg);
+      let s = classify(fetchPr(repo, prArg), cfg);
       const gate = await readyGate(s, cfg, process.cwd());
       if (gate && !gate.ok) return out({ ready: false, pr: s.pr, head: s.head, gate: 'failed', exitCode: gate.status, tail: gate.tail,
         next: 'rerun the failing tests or step with its focused command, fix until it passes, then run `prloop ready` again' }, EXIT.blocked);
+      // Waiting for admission or a slot can outlast a push from elsewhere: judge the PR as it is now, not the gated snapshot.
+      if (gate) s = classify(fetchPr(repo, prArg), cfg);
       const missing = [...s.reasons, ...localGate(s, process.cwd())];
       return out({ ready: !missing.length, pr: s.pr, head: s.head, missing, trigger: cfg.trigger }, missing.length ? EXIT.blocked : 0);
     }
@@ -1268,11 +1271,17 @@ export async function main(argv) {
     }
     if (cmd === 'reset-rounds') return out(resetRounds(repo, prArg), 0);
     if (cmd === 'sync') {
-      const pr = fetchPr(repo, prArg);
-      const clean = classify(pr, cfg).verdict === 'clean';
-      const v = syncBranch({ cwd: process.cwd(), branch: pr.headRefName, base: pr.baseRefName, baseOid: pr.baseRefOid, head: pr.headRefOid, settings: pr.repoSettings, union: opts.union });
-      const carry = v.verdict === 'synced' && v.unchanged && clean ? recordCarry(repo, prArg, pr.headRefOid, v) : undefined;
-      return out({ pr: Number(prArg), ...v, carry }, v.verdict === 'conflict' ? EXIT.conflict : v.verdict === 'error' ? EXIT.error : 0);
+      // Hold the lock for the whole sync unless the caller's inherited token owns it, so two syncs never share the checkout.
+      const cwd = process.cwd(), token = process.env.PRLOOP_LOCK_TOKEN, dir = lockDir(cwd);
+      const lock = token && dir && lockClaims(dir).some((c) => c.token === token) ? { release() {} } : takeLock(cwd, `sync of PR #${prArg}`);
+      if (lock.holder) return out({ verdict: 'error', error: lockMessage(cwd, lock.holder) }, EXIT.error);
+      try {
+        const pr = fetchPr(repo, prArg);
+        const clean = classify(pr, cfg).verdict === 'clean';
+        const v = syncBranch({ cwd, branch: pr.headRefName, base: pr.baseRefName, baseOid: pr.baseRefOid, head: pr.headRefOid, settings: pr.repoSettings, union: opts.union });
+        const carry = v.verdict === 'synced' && v.unchanged && clean ? recordCarry(repo, prArg, pr.headRefOid, v) : undefined;
+        return out({ pr: Number(prArg), ...v, carry }, v.verdict === 'conflict' ? EXIT.conflict : v.verdict === 'error' ? EXIT.error : 0);
+      } finally { lock.release(); }
     }
     throw new Error(`unknown command: ${cmd}`);
   } catch (e) {
