@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import {
-  buildPrompt, classify, config, globToRegex, isTested, parseAgentResult, readyGate, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, syncBranch, unionLines, waitFor,
+  buildPrompt, classify, plain, config, globToRegex, isTested, parseAgentResult, readyGate, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, syncBranch, unionLines, waitFor,
 } from '../prloop.mjs';
 
 const fixture = () => JSON.parse(readFileSync(new URL('./pr-fixture.json', import.meta.url), 'utf8'));
@@ -106,6 +106,15 @@ test('a force-push to an older commit invalidates an earlier clean signal', () =
   request(pr).reactions.nodes.push({ content: 'THUMBS_UP', createdAt: at('10:20'), user: BOT });
   pr.commits.nodes[0].commit.committedDate = at('08:00'); // older commit becomes the head
   pr.timelineItems = { nodes: [{ createdAt: at('10:30') }] };
+  const s = classify(pr, cfg, Date.parse(at('10:31')));
+  assert.equal(s.trigger.afterHead, false);
+  assert.equal(s.verdict, 'not_requested');
+});
+
+test('a head first seen after a request does not inherit that request (fast-forward to an older commit)', () => {
+  const pr = fixture();
+  request(pr).reactions.nodes.push({ content: 'THUMBS_UP', createdAt: at('10:20'), user: BOT });
+  pr.headSeenAt = at('10:30'); // the old-dated commit became the head after the clean signal
   const s = classify(pr, cfg, Date.parse(at('10:31')));
   assert.equal(s.trigger.afterHead, false);
   assert.equal(s.verdict, 'not_requested');
@@ -451,9 +460,9 @@ test('agent result: the last JSON line, also inside a JSON wrapper', () => {
 
 test('the fix prompt carries only the trigger data and the contract', () => {
   const p = buildPrompt({ repo: 'example-org/example-repo', pr: 7, branch: 'feat/x', head: 'abc123', cwd: '/work/x', trigger: 'findings',
-    findings: [{ id: 'T1', path: 'src/a.js', line: 3, body: 'Off by one' }], gate: 'npm test', requestBody: '@codex review' });
+    findings: [{ id: 'T1', path: 'src/a.js', line: 3, body: '**<sub>![P1 Badge](https://img.shields.io/badge/P1-orange)</sub> P1 Off by one**\n\nUseful? React with a thumb.' }], gate: 'npm test', requestBody: '@codex review' });
   for (const part of ['PR #7 in example-org/example-repo', 'branch feat/x', 'head abc123', 'worktree /work/x', 'Trigger: findings',
-    '- T1 src/a.js:3 Off by one', 'runs the gate (npm test)', 'reusing exactly:\n@codex review', '"status":"requested|blocked|nothing_to_do"',
+    '- T1 src/a.js:3 P1 Off by one', 'runs the gate (npm test)', 'reusing exactly:\n@codex review', '"status":"requested|blocked|nothing_to_do"',
     'Never wait for or poll reviews']) assert.ok(p.includes(part), part);
   assert.match(buildPrompt({ repo: 'o/n', pr: 1, trigger: 'conflict', conflicts: ['a.txt'], localReview: true }), /Conflicted files: a\.txt[\s\S]*Do not post a review request/);
 });
@@ -470,4 +479,24 @@ test('run --status reads state files and the latest events without GitHub', (t) 
   const st = runStatus();
   assert.deepEqual(st.prs.map((p) => [p.pr, p.phase, p.head, p.rounds]), [[7, 'waiting', 'abcdef1', 2]]);
   assert.equal(st.events.at(-1).phase, 'waiting');
+});
+
+test('plain strips badges, markup and the reviewer footer', () => {
+  assert.equal(plain('**<sub>![P2 Badge](https://example.invalid/b.svg)</sub>  Fix `x`**\n\nDetails here.\n\nAGENTS.md reference: [x](y)\n\nUseful? React'), 'Fix x Details here.');
+});
+
+test('sync pushes a fork branch to its own remote, not to origin', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  const fork = join(r.dir, 'fork.git');
+  r.run(r.dir, 'init', '-q', '--bare', fork);
+  r.run(r.work, 'remote', 'add', 'fork', fork);
+  r.commit('feature', { 'app.txt': 'feature\n' });
+  r.run(r.work, 'push', '-q', '-u', 'fork', 'feat');
+  divergeOnMain(r, { 'log.csv': 'id\na\nbase\n' });
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true } });
+  assert.equal(v.verdict, 'synced', JSON.stringify(v));
+  assert.equal(r.run(fork, 'rev-parse', 'feat'), v.head);
+  assert.equal(r.run(r.work, 'ls-remote', 'origin', 'feat'), '');
 });
