@@ -184,7 +184,8 @@ class MessageTests(GuardFixture):
                         "wrong@synthetic-mail.net,docs@example.com",
                         "wrong@synthetic-mail.net@example.com",
                         "wrong@synthetic-mail.net@",
-                        "https://wrong@synthetic-mail.net/path.invalid"):
+                        "https://wrong@synthetic-mail.net/path.invalid",
+                        "wrong@127.0.0.1", "ssh://wrong@127.0.0.1", "https://wrong@1.2.3"):
             with self.subTest(address=address):
                 path = self.message(f"Add feature\n\nCo-authored-by: Synthetic <{address}>\n")
                 self.assert_refused(self.guard("--commit-msg", path), "line 3")

@@ -56,11 +56,14 @@ ENV.update(GIT_OPTIONAL_LOCKS="0", GIT_NO_LAZY_FETCH="1", GIT_NO_REPLACE_OBJECTS
            GIT_TRACE2="0", GIT_TRACE2_EVENT="0", GIT_TRACE2_PERF="0")
 ZERO_OID = re.compile(r"0+")
 # Message checks fail closed: every whitespace-separated word containing "@"
-# is treated as an address unless it starts with "@" (a mention or scoped
-# package) or ends in a version such as name@1.2.3. Unusual but valid address
+# is treated as an address unless the whole word is a mention such as @name or
+# a package version such as name@1.2.3 or @scope/name@1.2.3. Unusual but valid address
 # syntax is therefore refused unless it is allowlisted.
 WORD_EDGE = "<>()[]{},;:!?'\"`."
-VERSION_SUFFIX = re.compile(r"@v?[0-9][0-9A-Za-z.+-]*")
+# A whole word such as name@1.2.3, name@v1.2.3-beta.1 or @scope/name@1.2.
+PACKAGE_VERSION = re.compile(
+    r"(?:@[A-Za-z0-9][\w.-]*/)?[A-Za-z0-9][\w.-]*"
+    r"@v?[0-9]+(?:\.[0-9]+){0,2}(?:[-+][0-9A-Za-z.-]+)?")
 CONFIG_EMAIL = re.compile(r"[^@\s]+@[^@\s]+")
 GITHUB_USER_NOREPLY = re.compile(
     r"(?:[1-9][0-9]*\+)?[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?"
@@ -231,7 +234,7 @@ def message_addresses(line: str) -> list[str]:
         body = word[1:] if word.startswith("@") else word
         if "@" not in body:
             continue  # A mention or decorator such as @name.
-        if body.count("@") == 1 and VERSION_SUFFIX.fullmatch(body[body.index("@"):]):
+        if PACKAGE_VERSION.fullmatch(word):
             continue  # A package version such as name@1.2.3 or @scope/name@1.2.3.
         found.append(word)
     return found

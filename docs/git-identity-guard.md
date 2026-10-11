@@ -12,7 +12,7 @@ Identity mode (default):
 - the effective author and committer identity (`git var`), which includes `GIT_AUTHOR_*` and `GIT_COMMITTER_*` environment overrides;
 - author metadata preserved by cherry-pick and rebase, read from raw commit headers and Git's operation files without executing them.
 
-Commit message mode (`--commit-msg FILE`) runs the identity checks and then refuses any email address in the message that is not allowed. Every line is checked, including comment lines: a hook cannot tell whether Git will strip them, and `git commit -m` keeps them. As a consequence, `git commit -v` is refused when the included diff contains an address that is not allowed. The check fails closed: every word that contains `@` (words are split at whitespace, commas and semicolons, then trimmed of surrounding brackets and punctuation) is treated as an address, unless the whole word is a mention such as `@name` or a package version such as `name@1.2.3` or `@scope/name@1.2.3`. An allowed address must be the entire word, with exactly one `@`. Unusual address syntax, quoted local parts, domain literals and URLs with user information are therefore refused unless they match the allowlist exactly. Allowed addresses are:
+Commit message mode (`--commit-msg FILE`) runs the identity checks and then refuses any email address in the message that is not allowed. Every line is checked, including comment lines: a hook cannot tell whether Git will strip them, and `git commit -m` keeps them. As a consequence, `git commit -v` is refused when the included diff contains an address that is not allowed. The check fails closed: every word that contains `@` (words are split at whitespace, commas and semicolons, then trimmed of surrounding brackets and punctuation) is treated as an address, unless the whole word is a mention such as `@name` or a package version of the form `name@MAJOR[.MINOR[.PATCH]][-prerelease]`, optionally scoped as `@scope/name@1.2.3`. Addresses with a numeric host such as `user@127.0.0.1` are therefore refused. An allowed address must be the entire word, with exactly one `@`. Unusual address syntax, quoted local parts, domain literals and URLs with user information are therefore refused unless they match the allowlist exactly. Allowed addresses are:
 
 - the configured `expected_email` and any `allowed_message_emails`;
 - GitHub's generic `noreply` and `support` addresses and `users.noreply.github.com` addresses;
@@ -41,8 +41,9 @@ Copy the script to a stable location, write the configuration, then register thr
 
 ```bash
 install -D -m 755 scripts/git-identity-guard.py ~/.local/lib/git-identity-guard/git-identity-guard.py
-# Hook commands are run by a shell, so store a shell-quoted path.
-guard=$(printf '%q' "$HOME/.local/lib/git-identity-guard/git-identity-guard.py")
+# Hook commands are run by /bin/sh, so store a POSIX single-quoted path.
+guard_path="$HOME/.local/lib/git-identity-guard/git-identity-guard.py"
+guard="'$(printf '%s' "$guard_path" | sed "s/'/'\\\\''/g")'"
 
 git config --global hook.identity-guard.command "$guard"
 for event in pre-commit pre-merge-commit pre-applypatch prepare-commit-msg; do
