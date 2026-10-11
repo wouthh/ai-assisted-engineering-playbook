@@ -348,6 +348,21 @@ test('wait runs one local review on fallback, then classifies the posted result'
   assert.equal(v.agentLog, '/state/agents/review.log');
 });
 
+test('wait drops the local reviewer log when the head moved after that review posted', async () => {
+  const pr = fixture();
+  request(pr).reactions.nodes.push({ content: 'EYES', createdAt: at('10:05'), user: BOT });
+  pr.comments.nodes.push(botComment('IC_q', QUOTA, '10:06'));
+  const moved = { ...fixture(), headRefOid: 'f'.repeat(40) };
+  moved.comments.nodes.pop(); // no request on the new head
+  let current = pr;
+  const v = await waitFor('example-org/example-repo', 7, { ...cfg, mode: 'auto' }, {
+    interval: 1, now: () => NOW, pause: async () => {}, fetch: () => current, metrics: idle().metrics,
+    runLocal: (repo, s, c, cwd, onLog) => { onLog('/state/agents/review.log'); current = moved; return null; },
+  });
+  assert.equal(v.head, 'f'.repeat(40));
+  assert.equal(v.agentLog, undefined);
+});
+
 test('wait admits a local review only when load and memory allow', async () => {
   const pr = fixture();
   request(pr).reactions.nodes.push({ content: 'EYES', createdAt: at('10:05'), user: BOT });
