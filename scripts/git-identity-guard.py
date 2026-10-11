@@ -55,7 +55,9 @@ ENV.update(GIT_OPTIONAL_LOCKS="0", GIT_NO_LAZY_FETCH="1", GIT_NO_REPLACE_OBJECTS
 ZERO_OID = re.compile(r"0+")
 # Single-label domains such as localhost count. The final label must start
 # with a letter, so package versions like name@1.2.3-beta are not email.
-EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@(?:[A-Za-z0-9-]+\.)*[A-Za-z][A-Za-z0-9-]*"
+# The local part is a dot-atom of RFC 5322 atext or a quoted string.
+EMAIL = re.compile(r"(?:\"[^\"\\\r\n]*\"|[A-Za-z0-9!#$%&'*+/=?^_`{|}~.-]+)"
+                   r"@(?:[A-Za-z0-9-]+\.)*[A-Za-z][A-Za-z0-9-]*"
                    r"(?![A-Za-z0-9.-]*[A-Za-z0-9])")
 GITHUB_USER_NOREPLY = re.compile(
     r"(?:[1-9][0-9]*\+)?[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?"
