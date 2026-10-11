@@ -2,12 +2,12 @@
 // prloop: wait for an external PR reviewer bot and tell the agent what to do next.
 // Single file, no dependencies. Needs Node 20+, git and an authenticated `gh`.
 import { execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-export const EXIT = { clean: 0, findings: 10, not_requested: 20, requested_while_unresolved: 21, not_tested: 22, timeout: 30, error: 40, conflict: 41, blocked: 50 };
+export const EXIT = { clean: 0, findings: 10, not_requested: 20, requested_while_unresolved: 21, not_tested: 22, timeout: 30, unavailable: 31, error: 40, conflict: 41, blocked: 50 };
 
 const HELP = `prloop - wait for a PR review bot and report the next step as JSON.
 
@@ -28,9 +28,13 @@ Reviewer options (flag or env):
   --timeout <dur>           PRLOOP_TIMEOUT         default: 40m after the request
   --ack-timeout <dur>       PRLOOP_ACK_TIMEOUT     default: 3m without any reaction
   --interval <dur>          PRLOOP_INTERVAL        default: 75s between polls
+  --reviewer cloud|local|auto  PRLOOP_REVIEWER     default: auto (local review when the bot is unavailable)
+  --unavailable-regex <re>  PRLOOP_UNAVAILABLE_REGEX  bot replies that mean it cannot review
+  --max-local-reviews <n>   PRLOOP_MAX_LOCAL_REVIEWS  default: 3 per PR
+  --agent claude|codex      PRLOOP_AGENT           local reviewer (and run's fixer); --model, --effort
 
 Exit codes: 0 clean/ok/merged, 10 findings, 20 not_requested, 21 requested_while_unresolved, 22 not_tested,
-            30 timeout, 40 error, 41 conflict, 50 blocked (run) / not ready (ready).`;
+            30 timeout, 31 unavailable, 40 error, 41 conflict, 50 blocked (run) / not ready (ready).`;
 
 // ---------- small helpers ----------
 
@@ -74,7 +78,15 @@ const short = (sha) => (sha ?? '').slice(0, 7);
 
 export function config(opts, env = process.env) {
   return {
+    mode: String(opts.reviewer ?? env.PRLOOP_REVIEWER ?? 'auto'),
     reviewer: new RegExp(opts.reviewerLogin ?? env.PRLOOP_REVIEWER_LOGIN ?? 'codex', 'i'),
+    // Phrasings seen from the Codex connector when it cannot review.
+    unavailable: new RegExp(opts.unavailableRegex ?? env.PRLOOP_UNAVAILABLE_REGEX
+      ?? 'reached your .*usage limits|couldn.t complete this request|unable to review|quota', 'i'),
+    maxLocal: Number(opts.maxLocalReviews ?? env.PRLOOP_MAX_LOCAL_REVIEWS ?? 3),
+    agent: String(opts.agent ?? env.PRLOOP_AGENT ?? 'claude'),
+    model: opts.model ?? env.PRLOOP_MODEL,
+    effort: opts.effort ?? env.PRLOOP_EFFORT,
     trigger: String(opts.trigger ?? env.PRLOOP_TRIGGER ?? '@codex review'),
     clean: new RegExp(opts.cleanRegex ?? env.PRLOOP_CLEAN_REGEX ?? 'didn.t find any major issues', 'i'),
     timeout: parseDuration(opts.timeout ?? env.PRLOOP_TIMEOUT ?? '40m'),
@@ -92,7 +104,7 @@ const PR_QUERY = `query($owner:String!,$name:String!,$pr:Int!){repository(owner:
     commits(last:1){nodes{commit{oid committedDate}}}
     reviewThreads(first:100){pageInfo{hasNextPage} nodes{id isResolved isOutdated path line comments(first:1){nodes{body createdAt author{login}}}}}
     comments(last:100){nodes{id databaseId body createdAt author{login} reactions(last:50){nodes{content createdAt user{login}}}}}
-    reviews(last:50){nodes{id body state submittedAt author{login} commit{oid}}}}}}`;
+    reviews(last:50){nodes{id body state submittedAt author{login} commit{oid} comments{totalCount}}}}}}`;
 
 export function resolveRepo(opts) {
   if (opts.repo) return opts.repo;
@@ -127,6 +139,11 @@ export const title = (s) => ((s ?? '').split('\n')
 
 export const fingerprint = (t) => `${t.path ?? ''}::${title(t.body).toLowerCase()}`;
 
+// Local reviews are posted under the user's account; this prefix marks them as reviewer output.
+export const LOCAL = '[local review]';
+const isLocal = (body) => typeof body === 'string' && body.startsWith(LOCAL);
+export const localCleanBody = (head) => `${LOCAL} No issues found on ${head}.`;
+
 // Classifies one PR snapshot. Rules carried over from the earlier review queue:
 // - only signals newer than the head commit (or the current request) count;
 // - reactions on the request comment and on the PR body both count, and the latest one wins
@@ -142,10 +159,10 @@ export function classify(pr, cfg, nowMs = Date.now()) {
   const headTime = [pr.commits.nodes[0]?.commit.committedDate, pr.timelineItems?.nodes[0]?.createdAt]
     .filter(Boolean).sort().at(-1) ?? '1970-01-01T00:00:00Z';
   if (pr.reviewThreads.pageInfo?.hasNextPage) throw new Error('more than 100 review threads: prloop cannot see them all, so it fails closed');
-  const isBot = (n) => cfg.reviewer.test(login(n));
+  const isBot = (n) => cfg.reviewer.test(login(n)) || isLocal(n.body);
   const threads = pr.reviewThreads.nodes.filter((t) => !t.isResolved).map((t) => {
     const c = t.comments.nodes[0] ?? {};
-    return { id: t.id, path: t.path, line: t.line, outdated: !!t.isOutdated, author: login(c), createdAt: c.createdAt, body: (c.body ?? '').slice(0, 2000) };
+    return { id: t.id, path: t.path, line: t.line, outdated: !!t.isOutdated, author: login(c), fromReviewer: isBot(c), createdAt: c.createdAt, body: (c.body ?? '').slice(0, 2000) };
   });
   const triggerNode = [...pr.comments.nodes].reverse()
     .find((c) => !isBot(c) && c.body.toLowerCase().includes(cfg.trigger.toLowerCase()));
@@ -159,12 +176,21 @@ export function classify(pr, cfg, nowMs = Date.now()) {
   const botComments = pr.comments.nodes.filter((c) => isBot(c) && c.createdAt >= since);
   const summaries = [...botReviews.map((r) => ({ at: r.submittedAt, body: r.body })), ...botComments.map((c) => ({ at: c.createdAt, body: c.body }))]
     .filter((s) => s.body);
-  for (const s of summaries) if (cfg.clean.test(s.body)) signals.push({ at: s.at, state: 'clean' });
-  const newFindings = threads.filter((t) => cfg.reviewer.test(t.author) && t.createdAt >= since);
+  for (const s of summaries) {
+    if (cfg.clean.test(s.body) || (isLocal(s.body) && s.body.includes(localCleanBody(head)))) signals.push({ at: s.at, state: 'clean' });
+    else if (!isLocal(s.body) && cfg.unavailable.test(s.body)) signals.push({ at: s.at, state: 'unavailable' });
+  }
+  const newFindings = threads.filter((t) => t.fromReviewer && t.createdAt >= since);
+  // A local review whose findings could not be anchored inline carries them in its body.
+  const localFindingReview = botReviews.some((r) => isLocal(r.body) && !r.comments?.totalCount);
+  const localArtifacts = [...pr.reviews.nodes, ...pr.comments.nodes].filter((n) => isLocal(n.body));
+  const local = { total: localArtifacts.length, onHead: localArtifacts.some((n) => n.commit?.oid === head || n.body.includes(head)) };
+  const requestsOnHead = pr.comments.nodes.filter((c) => !isBot(c) && c.createdAt >= headTime
+    && c.body.toLowerCase().includes(cfg.trigger.toLowerCase())).length;
   const oldUnresolved = current ? threads.filter((t) => t.createdAt < triggerNode.createdAt) : [];
 
   signals.sort((a, b) => a.at.localeCompare(b.at));
-  const reviewer = newFindings.length ? 'findings' : signals.at(-1)?.state ?? 'none';
+  const reviewer = newFindings.length || localFindingReview ? 'findings' : signals.at(-1)?.state ?? 'none';
   // An automatic review has no request comment; its clock starts at the first reaction.
   const startedAt = current ? triggerNode.createdAt : signals[0]?.at;
   const age = startedAt ? nowMs - Date.parse(startedAt) : 0;
@@ -175,6 +201,7 @@ export function classify(pr, cfg, nowMs = Date.now()) {
   if (reviewer === 'findings') verdict = 'findings';
   else if (oldUnresolved.length) verdict = 'requested_while_unresolved';
   else if (reviewer === 'clean') verdict = threads.length ? 'findings' : 'clean';
+  else if (reviewer === 'unavailable' || (stale && requestsOnHead >= 2)) verdict = 'unavailable';
   else if (stale) verdict = 'timeout';
   else if (current || reviewer === 'reviewing') verdict = 'pending';
   else verdict = 'not_requested';
@@ -191,7 +218,8 @@ export function classify(pr, cfg, nowMs = Date.now()) {
     mergeable: pr.mergeable, mergeState: pr.mergeStateStatus,
     unresolvedThreads: threads,
     trigger: triggerNode && { id: triggerNode.id, databaseId: triggerNode.databaseId, createdAt: triggerNode.createdAt, afterHead: current, body: triggerNode.body },
-    reviewerState: { state: reviewer, count: newFindings.length },
+    reviewerState: { state: reviewer, count: newFindings.length }, local,
+    unavailableReason: reviewer === 'unavailable' ? 'the reviewer reported it cannot review' : verdict === 'unavailable' ? 'two requests on this head timed out' : undefined,
     summaries: summaries.map((s) => s.body.slice(0, 600)),
     rerequestBody: triggerNode?.body ?? cfg.trigger,
     verdict, readyToRequest: reasons.length === 0, reasons,
@@ -299,20 +327,39 @@ export function syncBranch({ cwd, branch, base, head, settings, union = [], remo
 
 // Polls until the snapshot is no longer pending. Terminates because a request goes stale after
 // `cfg.timeout`; transient GitHub errors are retried until three fail in a row.
-export async function waitFor(repo, prNum, cfg, { interval, fetch = fetchPr, now = Date.now, pause = sleep }) {
+export async function waitFor(repo, prNum, cfg, { interval, fetch = fetchPr, now = Date.now, pause = sleep, cwd = process.cwd(), runLocal = localReview }) {
   for (let failures = 0; ; await pause(interval)) {
     let s;
     try { s = classify(fetch(repo, prNum), cfg, now()); failures = 0; } catch (e) {
       if (++failures >= 3) return { verdict: 'error', pr: Number(prNum), error: String(e.stderr || e.message).slice(0, 500) };
       continue;
     }
+    const plan = reviewPlan(s, cfg);
+    if (plan.blocked) return { verdict: 'blocked', pr: s.pr, head: s.head, reason: plan.blocked };
+    if (plan.local) {
+      const r = runLocal(repo, s, cfg, cwd);
+      if (r) return r; // gate missing or reviewer failed; otherwise the posted result is classified next poll
+      continue;
+    }
     if (s.verdict !== 'pending') return finish(s);
   }
+}
+
+// Decides whether this snapshot needs a local review. Pure, so the fallback rules are testable.
+export function reviewPlan(s, cfg) {
+  const done = ['clean', 'findings', 'requested_while_unresolved'].includes(s.verdict);
+  const wants = cfg.mode === 'local' ? !done : cfg.mode === 'auto' && s.verdict === 'unavailable';
+  if (!wants) return {};
+  if (s.local.onHead) return { blocked: `a local review already ran on head ${short(s.head)}; only one per head` };
+  if (s.local.total >= cfg.maxLocal) return { blocked: `local review limit (${cfg.maxLocal}) reached for this PR` };
+  return { local: true };
 }
 
 function finish(s) {
   const base = { verdict: s.verdict, pr: s.pr, head: s.head };
   if (s.verdict === 'clean') return { ...base, next: 'review is clean on the current head' };
+  if (s.verdict === 'unavailable') return { ...base, reason: s.unavailableReason,
+    next: 'the cloud reviewer is unavailable: retry later, or use `--reviewer local` or `auto` for a local review' };
   if (s.verdict === 'timeout') return { ...base, reviewerState: s.reviewerState, trigger: s.trigger, rerequestBody: s.rerequestBody,
     next: s.reviewerState.state === 'none'
       ? 'the reviewer never acknowledged the request: run `prloop ready`, then repost rerequestBody as a new comment'
@@ -323,6 +370,88 @@ function finish(s) {
     next: `no "${s.trigger?.body ?? 'trigger'}" comment after head ${short(s.head)}: run \`prloop ready\`, then request a review` };
   return { ...base, unresolvedThreads: s.unresolvedThreads,
     next: 'a review was requested while threads were unresolved: resolve them, then request a review again' };
+}
+
+// ---------- local review ----------
+
+const REVIEW_SCHEMA = { type: 'object', additionalProperties: false, required: ['findings'], properties: { findings: { type: 'array', items: {
+  type: 'object', additionalProperties: false, required: ['path', 'line', 'severity', 'body'], properties: {
+    path: { type: 'string' }, line: { type: 'integer' }, severity: { type: 'string', enum: ['P0', 'P1', 'P2', 'P3'] }, body: { type: 'string' } } } } } };
+
+// Validates the reviewer's JSON; throws on anything malformed.
+export function parseReview(text) {
+  const obj = typeof text === 'string' ? JSON.parse(text.slice(text.indexOf('{'), text.lastIndexOf('}') + 1)) : text;
+  if (!Array.isArray(obj?.findings)) throw new Error('reviewer output has no findings array');
+  for (const f of obj.findings) {
+    if (typeof f.path !== 'string' || !f.path || !Number.isInteger(f.line) || f.line < 0
+      || !['P0', 'P1', 'P2', 'P3'].includes(f.severity) || typeof f.body !== 'string' || !f.body.trim()) {
+      throw new Error(`malformed finding: ${JSON.stringify(f).slice(0, 200)}`);
+    }
+  }
+  return obj.findings;
+}
+
+// Review payload for POST /repos/{repo}/pulls/{n}/reviews. Findings without a usable line go in the body.
+export function localReviewPayload(head, findings, inline = true) {
+  const inl = inline ? findings.filter((f) => f.line > 0) : [];
+  const rest = findings.filter((f) => !inl.includes(f));
+  return {
+    commit_id: head, event: 'COMMENT',
+    body: [`${LOCAL} ${findings.length} finding(s) on ${head}.`, ...rest.map((f) => `- ${f.path}${f.line ? `:${f.line}` : ''} [${f.severity}] ${f.body}`)].join('\n'),
+    comments: inl.map((f) => ({ path: f.path, line: f.line, side: 'RIGHT', body: `${LOCAL} [${f.severity}] ${f.body}` })),
+  };
+}
+
+function runReviewer(cfg, prompt, cwd) {
+  const dir = mkdtempSync(join(tmpdir(), 'prloop-review-'));
+  try {
+    if (cfg.agent === 'codex') { // any other agent setting, including none, reviews with claude
+      writeFileSync(join(dir, 'schema.json'), JSON.stringify(REVIEW_SCHEMA));
+      const r = spawnSync('codex', ['exec', '--sandbox', 'read-only', '--output-schema', join(dir, 'schema.json'), '-o', join(dir, 'out.json'),
+        ...(cfg.model ? ['-m', cfg.model] : []), ...(cfg.effort ? ['-c', `model_reasoning_effort=${cfg.effort}`] : []), prompt],
+      { cwd, encoding: 'utf8', maxBuffer: 64 << 20, stdio: ['ignore', 'pipe', 'pipe'] });
+      if (r.status !== 0) throw new Error(`codex reviewer exited with ${r.status}: ${(r.stderr ?? '').slice(-300)}`);
+      return parseReview(readFileSync(join(dir, 'out.json'), 'utf8'));
+    }
+    const r = spawnSync('claude', ['-p', prompt, '--model', cfg.model ?? 'claude-opus-5-5', '--effort', cfg.effort ?? 'medium',
+      '--permission-mode', 'dontAsk', '--allowedTools', 'Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git show:*)',
+      '--output-format', 'json', '--json-schema', JSON.stringify(REVIEW_SCHEMA)],
+    { cwd, encoding: 'utf8', maxBuffer: 64 << 20, stdio: ['ignore', 'pipe', 'pipe'] });
+    if (r.status !== 0) throw new Error(`claude reviewer exited with ${r.status}: ${(r.stderr ?? '').slice(-300)}`);
+    const out = JSON.parse(r.stdout);
+    return parseReview(out.structured_output ?? out.result);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+
+// Runs one read-only review of the current head in `cwd` and posts it. Returns a verdict to stop on,
+// or null when the result was posted and the next poll should classify it.
+export function localReview(repo, s, cfg, cwd) {
+  const missing = s.unresolvedThreads.length ? [`${s.unresolvedThreads.length} unresolved threads`] : [];
+  if (tryGit(['branch', '--show-current'], cwd) !== s.branch) missing.push(`run wait inside a checkout of ${s.branch} for a local review`);
+  else missing.push(...localGate(s, cwd));
+  if (missing.length) return { verdict: 'not_requested', pr: s.pr, head: s.head, missing, next: `a local review needs: ${missing.join('; ')}` };
+  tryGit(['fetch', '--quiet', 'origin', s.base], cwd);
+  const prompt = `Review pull request #${s.pr}: the changes in \`git diff origin/${s.base}...HEAD\` at head ${s.head}.
+Do not modify any file. Report only real defects (bugs, security, data loss, broken contracts), not style.
+Return JSON {"findings":[{"path","line","severity":"P0".."P3","body"}]} with "line" in the new file (0 if none) and an empty array when there are no issues.`;
+  let findings;
+  try { findings = runReviewer(cfg, prompt, cwd); } catch (e) {
+    return { verdict: 'blocked', pr: s.pr, head: s.head, reason: `local reviewer failed: ${String(e.message).slice(0, 400)}` };
+  }
+  if (git(['status', '--porcelain'], cwd) || git(['rev-parse', 'HEAD'], cwd) !== s.head) {
+    return { verdict: 'blocked', pr: s.pr, head: s.head, reason: 'the local reviewer changed the checkout; review discarded' };
+  }
+  const post = (path, body) => sh('gh', ['api', '-X', 'POST', path, '--input', '-'], { input: JSON.stringify(body), stdio: ['pipe', 'pipe', 'pipe'] });
+  try {
+    if (!findings.length) post(`repos/${repo}/issues/${s.pr}/comments`, { body: localCleanBody(s.head) });
+    else {
+      try { post(`repos/${repo}/pulls/${s.pr}/reviews`, localReviewPayload(s.head, findings)); }
+      catch { post(`repos/${repo}/pulls/${s.pr}/reviews`, localReviewPayload(s.head, findings, false)); } // a line outside the diff
+    }
+  } catch (e) {
+    return { verdict: 'blocked', pr: s.pr, head: s.head, reason: `posting the local review failed: ${String(e.stderr || e.message).slice(0, 300)}` };
+  }
+  return null;
 }
 
 // ---------- supervisor ----------
@@ -405,10 +534,10 @@ async function supervise(repo, prNum, cfg, opts, deadline) {
       if (v.verdict !== 'conflict') v = null;
     }
     if (!v) {
-      v = await waitFor(repo, prNum, cfg, { interval: cfg.interval });
+      v = await waitFor(repo, prNum, cfg, { interval: cfg.interval, cwd: cwd ?? process.cwd() });
     }
     st.lastVerdict = v.verdict;
-    if (v.verdict === 'error') return blocked(v.error ?? 'wait failed');
+    if (v.verdict === 'error' || v.verdict === 'blocked' || v.verdict === 'unavailable') return blocked(v.error ?? v.reason ?? 'wait failed');
     if (v.verdict === 'clean') {
       if (!opts.merge) { st.result = 'clean'; saveState(repo, prNum, st); return { pr: prNum, verdict: 'clean', head: v.head }; }
       // GitHub computes mergeability lazily; give it a moment.
@@ -442,10 +571,10 @@ async function supervise(repo, prNum, cfg, opts, deadline) {
     }
     saveState(repo, prNum, st);
     const prompt = buildPrompt(repo, v);
-    if (opts.agent === 'none') return { ...v, prompt };
+    if (cfg.agent === 'none') return { ...v, prompt };
     if (!cwd) return blocked(`no worktree checked out for ${s.branch}; pass --worktree`);
     const before = classify(fetchPr(repo, prNum), cfg);
-    const r = runAgent(opts.agent ?? 'claude', prompt, cwd, opts);
+    const r = runAgent(cfg.agent, prompt, cwd, opts);
     if (DENIED.test(r.output)) return blocked('agent reported a permission denial', { output: r.output.slice(-800) });
     if (r.status !== 0) return blocked(`agent exited with status ${r.status}`, { output: r.output.slice(-800) });
     const after = classify(fetchPr(repo, prNum), cfg);
