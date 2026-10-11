@@ -258,8 +258,9 @@ export function classify(pr, cfg, nowMs = Date.now()) {
   const oldUnresolved = current ? threads.filter((t) => t.createdAt < triggerNode.createdAt) : [];
 
   // A sync that left the PR's own change identical carries the previous head's clean verdict to this head.
-  // It counts as the earliest signal, so any real review of this head overrides it.
-  const carried = pr.carry?.to === head ? pr.carry : null;
+  // It counts as the earliest signal, so any real review of this head overrides it, and a new request on
+  // this head supersedes it: that review stays pending until its own cycle completes.
+  const carried = pr.carry?.to === head && !current ? pr.carry : null;
   if (carried) signals.push({ at: headTime, state: 'clean' });
   signals.sort((a, b) => a.at.localeCompare(b.at));
   const reviewer = newFindings.length || localFindingReview ? 'findings' : signals.at(-1)?.state ?? 'none';
