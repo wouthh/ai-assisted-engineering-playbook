@@ -18,6 +18,7 @@ Recommended: start the supervisor once in the background, check in with --status
              [--deadline 6h] [--model <m>] [--effort <e>] [--union <glob>]...
   prloop run --status [--repo owner/name]   PR states plus one machine line (load, free memory, gate slots)
   prloop reset-rounds <pr> [--repo owner/name]   one explicit, logged reset of the round counter
+  prloop lock-status [<dir>]              who holds the worktree lock of <dir> (default: .); exit 50 when held
 
 Agent-in-the-loop commands:
   prloop status <pr> [--repo owner/name]
@@ -1195,6 +1196,11 @@ export async function main(argv) {
     if (['ready', 'sync', 'mark-tested'].includes(cmd)) {
       const h = lockHolder(process.cwd());
       if (h) return out({ verdict: 'error', error: lockMessage(process.cwd(), h) }, EXIT.error);
+    }
+    if (cmd === 'lock-status') {
+      const dir = resolve(prArg ?? '.');
+      const holder = lockHolder(dir, null);
+      return out({ dir, locked: !!holder, holder: holder ? pick(holder, ['pid', 'purpose', 'startedAt']) : null }, holder ? EXIT.blocked : 0);
     }
     if (cmd === 'mark-tested') return out({ verdict: 'ok', tested: markTested(opts.sha, process.cwd()) }, 0);
     const cfg = config(opts);
