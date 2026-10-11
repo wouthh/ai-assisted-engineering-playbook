@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import {
-  buildPrompt, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, syncBranch, unionLines, waitFor,
+  EXIT, main, buildPrompt, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, syncBranch, unionLines, waitFor,
 } from '../prloop.mjs';
 
 const fixture = () => JSON.parse(readFileSync(new URL('./pr-fixture.json', import.meta.url), 'utf8'));
@@ -506,10 +506,23 @@ test('run --status reads state files and the latest events without GitHub', (t) 
   mkdirSync(join(dir, 'prloop'));
   writeFileSync(join(dir, 'prloop', 'example-org__example-repo__7.json'), JSON.stringify({ repo: 'example-org/example-repo', pr: 7, phase: 'waiting', head: 'abcdef1234', rounds: 2 }));
   writeFileSync(join(dir, 'prloop', 'heads.json'), '{}'); // metadata, not a PR
-  writeFileSync(join(dir, 'prloop', 'run-2026-01-01T10-00-00-000Z.jsonl'), '{"pr":7,"phase":"agent"}\n{"pr":7,"phase":"waiting"}\n');
-  const st = runStatus();
+  writeFileSync(join(dir, 'prloop', 'run-2026-01-01T10-00-00-000Z.jsonl'), '{"repo":"example-org/example-repo","pr":7,"phase":"agent"}\n{"repo":"example-org/example-repo","pr":7,"phase":"waiting"}\n');
+  writeFileSync(join(dir, 'prloop', 'run-2026-01-02T10-00-00-000Z.jsonl'), '{"repo":"example-org/other-repo","pr":7,"phase":"blocked"}\n');
+  const st = runStatus('example-org/example-repo');
   assert.deepEqual(st.prs.map((p) => [p.pr, p.phase, p.head, p.rounds]), [[7, 'waiting', 'abcdef1', 2]]);
-  assert.equal(st.events.at(-1).phase, 'waiting');
+  assert.deepEqual(st.events.map((e) => e.phase), ['agent', 'waiting']); // not the newer other-repo log
+  assert.equal(runStatus().events.at(-1).phase, 'blocked');
+});
+
+test('configuration errors are JSON errors, and an unknown --agent is rejected', async (t) => {
+  assert.throws(() => config({ agent: 'nonee' }, {}), /--agent must be claude, codex or none/);
+  assert.throws(() => config({}, { PRLOOP_AGENT: 'Claude' }), /--agent must be/);
+  const logs = [];
+  t.mock.method(console, 'log', (l) => logs.push(JSON.parse(l)));
+  assert.equal(await main(['status', '7', '--repo', 'example-org/example-repo', '--timeout', 'bad']), EXIT.error);
+  assert.equal(await main(['run', '--repo', 'example-org/example-repo', '--pr', '7', '--agent', 'nonee']), EXIT.error);
+  assert.deepEqual(logs.map((l) => l.verdict), ['error', 'error']);
+  assert.match(logs[1].error, /--agent must be/);
 });
 
 test('plain strips badges, markup and the reviewer footer', () => {
