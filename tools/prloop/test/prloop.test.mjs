@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import {
-  classify, config, globToRegex, runExitCode, parseDuration, recordFindings, syncBranch, unionLines, waitFor,
+  classify, config, globToRegex, localCleanBody, localReviewPayload, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, syncBranch, unionLines, waitFor,
 } from '../prloop.mjs';
 
 const fixture = () => JSON.parse(readFileSync(new URL('./pr-fixture.json', import.meta.url), 'utf8'));
@@ -199,6 +199,99 @@ test('durations and globs', () => {
 
 test('union keeps base lines first and drops duplicates', () => {
   assert.equal(unionLines('id,title\na,1\nb,2\n', 'id,title\na,1\nc,3\n'), 'id,title\na,1\nb,2\nc,3\n');
+});
+
+// ---------- local reviewer fallback ----------
+
+const botComment = (id, body, hhmm) => ({ id, databaseId: 900, body, createdAt: at(hhmm), author: BOT, reactions: { nodes: [] } });
+const QUOTA = 'You have reached your Codex usage limits for code reviews. You can see your limits in the [Codex usage dashboard](https://example.invalid/usage).';
+
+test('quota and failure replies mark the cloud reviewer unavailable', () => {
+  for (const body of [QUOTA, "Codex couldn't complete this request. Try again later."]) {
+    const pr = fixture();
+    pr.comments.nodes.push(botComment('IC_q', body, '10:06'));
+    const s = classify(pr, cfg, NOW);
+    assert.equal(s.verdict, 'unavailable', body);
+    assert.deepEqual(reviewPlan(s, cfg), { local: true });
+    assert.deepEqual(reviewPlan(s, { ...cfg, mode: 'cloud' }), {});
+  }
+});
+
+test('auto falls back only after two timed-out requests on the same head', () => {
+  const pr = fixture();
+  const later = Date.parse(at('11:00'));
+  assert.equal(classify(pr, cfg, later).verdict, 'timeout');
+  pr.comments.nodes.push({ ...request(pr), id: 'IC_req2', databaseId: 102, createdAt: at('10:20') });
+  const s = classify(pr, cfg, later);
+  assert.equal(s.verdict, 'unavailable');
+  assert.equal(s.unavailableReason, 'two requests on this head timed out');
+});
+
+test('local reviews: mode, one per head and a per-PR cap', () => {
+  const local = { ...cfg, mode: 'local' };
+  const s = classify(fixture(), local, NOW);
+  assert.deepEqual(reviewPlan({ ...s, verdict: 'not_requested' }, local), { local: true });
+  assert.deepEqual(reviewPlan({ ...s, verdict: 'findings' }, local), {});
+  assert.match(reviewPlan({ ...s, local: { total: 1, onHead: true } }, local).blocked, /only one per head/);
+  assert.match(reviewPlan({ ...s, local: { total: 3, onHead: false } }, local).blocked, /limit \(3\)/);
+});
+
+test('posted local results classify like cloud results on that head', () => {
+  const pr = fixture();
+  const me = { login: 'example-dev' };
+  pr.comments.nodes.push({ id: 'IC_l', databaseId: 950, body: localCleanBody(pr.headRefOid), createdAt: at('10:30'), author: me, reactions: { nodes: [] } });
+  let s = classify(pr, cfg, NOW);
+  assert.equal(s.verdict, 'clean');
+  assert.deepEqual(s.local, { total: 1, onHead: true });
+  pr.comments.nodes.at(-1).body = localCleanBody('2222222222222222222222222222222222222222');
+  assert.notEqual(classify(pr, cfg, NOW).verdict, 'clean');
+
+  const withThread = fixture();
+  withThread.reviewThreads.nodes.push(thread('T9', at('10:30'), '[local review] [P1] Null check missing', me));
+  withThread.reviews.nodes.push({ id: 'R9', body: '[local review] 1 finding(s) on x.', state: 'COMMENTED', submittedAt: at('10:30'),
+    author: me, commit: { oid: withThread.headRefOid }, comments: { totalCount: 1 } });
+  s = classify(withThread, cfg, NOW);
+  assert.equal(s.verdict, 'findings');
+  assert.equal(s.reviewerState.count, 1);
+});
+
+test('wait runs one local review on fallback, then classifies the posted result', async () => {
+  const pr = fixture();
+  pr.comments.nodes.push(botComment('IC_q', QUOTA, '10:06'));
+  let calls = 0;
+  const v = await waitFor('example-org/example-repo', 7, cfg, {
+    interval: 1, now: () => NOW, pause: async () => {}, fetch: () => pr,
+    runLocal: (repo, s) => {
+      calls++;
+      pr.comments.nodes.push({ id: 'IC_l', databaseId: 951, body: localCleanBody(s.head), createdAt: at('10:07'), author: { login: 'example-dev' }, reactions: { nodes: [] } });
+      return null;
+    },
+  });
+  assert.equal(calls, 1);
+  assert.equal(v.verdict, 'clean');
+});
+
+test('local review payload: inline comments with a prefix, body fallback without a line', () => {
+  const findings = [
+    { path: 'src/a.js', line: 4, severity: 'P1', body: 'Off-by-one in the loop bound.' },
+    { path: 'README.md', line: 0, severity: 'P3', body: 'Example uses a removed flag.' },
+  ];
+  const p = localReviewPayload('abc123', findings);
+  assert.equal(p.commit_id, 'abc123');
+  assert.equal(p.event, 'COMMENT');
+  assert.deepEqual(p.comments, [{ path: 'src/a.js', line: 4, side: 'RIGHT', body: '[local review] [P1] Off-by-one in the loop bound.' }]);
+  assert.match(p.body, /^\[local review\] 2 finding\(s\) on abc123\.\n- README\.md \[P3\]/);
+  const flat = localReviewPayload('abc123', findings, false);
+  assert.equal(flat.comments.length, 0);
+  assert.match(flat.body, /src\/a\.js:4 \[P1\]/);
+});
+
+test('reviewer output is validated strictly', () => {
+  assert.deepEqual(parseReview('Here you go: {"findings":[]}'), []);
+  assert.equal(parseReview({ findings: [{ path: 'a', line: 1, severity: 'P2', body: 'x' }] }).length, 1);
+  assert.throws(() => parseReview('no json here'));
+  assert.throws(() => parseReview({ result: 'fine' }), /no findings array/);
+  assert.throws(() => parseReview({ findings: [{ path: 'a', line: '1', severity: 'P2', body: 'x' }] }), /malformed finding/);
 });
 
 // ---------- sync against throwaway git repositories ----------
