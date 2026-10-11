@@ -12,10 +12,11 @@ export const EXIT = { clean: 0, findings: 10, not_requested: 20, requested_while
 const HELP = `prloop - wait for a PR review bot, gate review requests, and supervise fix agents.
 
 Recommended: start the supervisor once in the background, check in with --status.
-  prloop run --repo owner/name --pr N[,N...] [--gate "<cmd>"] [--max-agents 2] [--max-rounds 8]
+  prloop run --repo owner/name --pr N[,N...] [--gate "<cmd>"] [--max-agents 2] [--max-rounds 6]
              [--agent claude|codex|none] [--merge rebase|squash|merge] [--worktree <path>]
              [--deadline 6h] [--model <m>] [--effort <e>] [--union <glob>]...
   prloop run --status [--repo owner/name]
+  prloop reset-rounds <pr> [--repo owner/name]   one explicit, logged reset of the round counter
 
 Agent-in-the-loop commands:
   prloop status <pr> [--repo owner/name]
@@ -59,11 +60,19 @@ export function parseArgs(argv) {
   return out;
 }
 
-export function parseDuration(s) {
+export function parseDuration(s, name = 'duration') {
   const m = /^(\d+)(s|m|h)?$/.exec(String(s));
-  if (!m) throw new Error(`bad duration: ${s}`);
-  return Number(m[1]) * { s: 1e3, m: 6e4, h: 36e5 }[m[2] ?? 's'];
+  const ms = m ? Number(m[1]) * { s: 1e3, m: 6e4, h: 36e5 }[m[2] ?? 's'] : NaN;
+  // Zero or NaN would make a wait spin or a deadline pass at once.
+  if (!(ms > 0) || !Number.isFinite(ms)) throw new Error(`--${name} must be a positive duration such as 90s, 40m or 6h, not ${s}`);
+  return ms;
 }
+
+// NaN or Infinity would make a cap check never trip, and zero agents would never start one.
+const positiveInt = (name, v) => {
+  if (!/^\d+$/.test(String(v)) || !(Number(v) > 0)) throw new Error(`--${name} must be a positive integer, not ${v}`);
+  return Number(v);
+};
 
 export function globToRegex(glob) {
   let re = '';
@@ -107,9 +116,12 @@ export function config(opts, env = process.env) {
     gate: opts.gate ?? env.PRLOOP_GATE,
     trigger: String(opts.trigger ?? env.PRLOOP_TRIGGER ?? '@codex review'),
     clean: new RegExp(opts.cleanRegex ?? env.PRLOOP_CLEAN_REGEX ?? 'didn.t find any major issues', 'i'),
-    timeout: parseDuration(opts.timeout ?? env.PRLOOP_TIMEOUT ?? '40m'),
-    ackTimeout: parseDuration(opts.ackTimeout ?? env.PRLOOP_ACK_TIMEOUT ?? '3m'),
-    interval: parseDuration(opts.interval ?? env.PRLOOP_INTERVAL ?? '75s'),
+    timeout: parseDuration(opts.timeout ?? env.PRLOOP_TIMEOUT ?? '40m', 'timeout'),
+    ackTimeout: parseDuration(opts.ackTimeout ?? env.PRLOOP_ACK_TIMEOUT ?? '3m', 'ack-timeout'),
+    interval: parseDuration(opts.interval ?? env.PRLOOP_INTERVAL ?? '75s', 'interval'),
+    deadline: parseDuration(opts.deadline ?? '6h', 'deadline'),
+    maxRounds: positiveInt('max-rounds', opts.maxRounds ?? 6),
+    maxAgents: positiveInt('max-agents', opts.maxAgents ?? 2),
   };
 }
 
@@ -144,7 +156,7 @@ export function fetchPr(repo, pr) {
   const out = ghRetry( ['api', 'graphql', '-f', `query=${PR_QUERY}`, '-F', `owner=${owner}`, '-F', `name=${name}`, '-F', `pr=${pr}`]);
   const { viewer, repository: r } = JSON.parse(out).data;
   if (!r?.pullRequest) throw new Error(`PR ${repo}#${pr} not found`);
-  return { ...r.pullRequest, viewer, headSeenAt: headSeenAt(`${repo}#${pr}`, r.pullRequest.headRefOid),
+  return { ...r.pullRequest, viewer, headSeenAt: headSeenAt(`${repo}#${pr}`, r.pullRequest.headRefOid), carry: loadState(repo, pr).carry,
     repoSettings: { merge: r.mergeCommitAllowed, squash: r.squashMergeAllowed, rebase: r.rebaseMergeAllowed } };
 }
 
@@ -217,7 +229,8 @@ export function classify(pr, cfg, nowMs = Date.now()) {
   const signals = reactions
     .filter((r) => isBot(r) && r.createdAt >= since && (r.content === 'EYES' || r.content === 'THUMBS_UP'))
     .map((r) => ({ at: r.createdAt, state: r.content === 'EYES' ? 'reviewing' : 'clean' }));
-  const botReviews = pr.reviews.nodes.filter((r) => isBot(r) && r.commit?.oid === head && r.submittedAt >= since);
+  // A dismissed review was withdrawn: it is neither a clean nor a findings signal.
+  const botReviews = pr.reviews.nodes.filter((r) => isBot(r) && r.state !== 'DISMISSED' && r.commit?.oid === head && r.submittedAt >= since);
   // Issue comments carry no commit: they count only after a request or a 👀 on this head, and a clean or
   // failure one only after the bot acknowledged this cycle (👀 on the current request or on the PR body after this head), so a
   // delayed comment about the previous head cannot clear this one, even after a new request. Local clean
@@ -243,6 +256,10 @@ export function classify(pr, cfg, nowMs = Date.now()) {
     && c.body.toLowerCase().includes(cfg.trigger.toLowerCase())).length;
   const oldUnresolved = current ? threads.filter((t) => t.createdAt < triggerNode.createdAt) : [];
 
+  // A sync that left the PR's own change identical carries the previous head's clean verdict to this head.
+  // It counts as the earliest signal, so any real review of this head overrides it.
+  const carried = pr.carry?.to === head ? pr.carry : null;
+  if (carried) signals.push({ at: headTime, state: 'clean' });
   signals.sort((a, b) => a.at.localeCompare(b.at));
   const reviewer = newFindings.length || localFindingReview ? 'findings' : signals.at(-1)?.state ?? 'none';
   // An automatic review has no request comment; its clock starts at the first reaction.
@@ -265,14 +282,14 @@ export function classify(pr, cfg, nowMs = Date.now()) {
   if (verdict === 'pending') reasons.push(current
     ? `review already requested on head ${short(head)} (comment ${triggerNode.databaseId}); run \`prloop wait\` instead`
     : `reviewer is already reviewing head ${short(head)}; run \`prloop wait\` instead`);
-  if (reviewer === 'clean') reasons.push(`head ${short(head)} is already reviewed clean`);
+  if (reviewer === 'clean') reasons.push(`head ${short(head)} is already reviewed clean${carried && signals.at(-1).at === headTime ? ` (carried from ${short(carried.from)}: unchanged patch-id)` : ''}`);
 
   return {
     pr: pr.number, url: pr.url, state: pr.state, mergeCommit: pr.mergeCommit?.oid ?? null, head, branch: pr.headRefName, base: pr.baseRefName, baseOid: pr.baseRefOid,
     mergeable: pr.mergeable, mergeState: pr.mergeStateStatus,
     unresolvedThreads: threads,
     trigger: triggerNode && { id: triggerNode.id, databaseId: triggerNode.databaseId, createdAt: triggerNode.createdAt, afterHead: current, body: triggerNode.body },
-    reviewerState: { state: reviewer, count: newFindings.length }, local,
+    reviewerState: { state: reviewer, count: newFindings.length }, local, carry: carried,
     unavailableReason: reviewer === 'unavailable' ? 'the reviewer reported it cannot review' : verdict === 'unavailable' ? 'two requests on this head timed out' : undefined,
     summaries: summaries.map((s) => s.body.slice(0, 600)),
     triggerText: cfg.trigger, rerequestBody: triggerNode?.body ?? cfg.trigger,
@@ -374,6 +391,16 @@ export function fetchBase(cwd, base, baseOid, remote = 'origin') {
   return null;
 }
 
+// `git patch-id --stable` of the PR's own change (`<base>...<head>`); null for an empty diff. Union-merged files are
+// compared without context lines: the union moves the PR's lines below the base's, which changes only context.
+export function patchId(cwd, base, head, unioned = []) {
+  const diff = (extra, paths) => sh('git', ['diff', '--no-color', '--no-ext-diff', ...extra, `${base}...${head}`, '--', ...paths], { cwd });
+  const lit = (f) => `:(literal)${f}`;
+  const text = [diff([], ['.', ...unioned.map((f) => `:(exclude,literal)${f}`)]), unioned.length ? diff(['-U0'], unioned.map(lit)) : '']
+    .filter(Boolean).join('\n');
+  return text ? sh('git', ['patch-id', '--stable'], { cwd, input: `${text}\n`, stdio: ['pipe', 'pipe', 'pipe'] }).split(' ')[0] || null : null;
+}
+
 export function syncBranch({ cwd, branch, base, baseOid, head, settings, union = [], remote = 'origin' }) {
   // A fork PR's branch usually tracks its own remote; push there, not to the base repository.
   const headRemote = tryGit(['config', `branch.${branch}.remote`], cwd) || remote;
@@ -390,11 +417,14 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
   const rebase = !settings.merge && !settings.squash;
   const env = { ...process.env, GIT_EDITOR: 'true' };
   const step = (args) => spawnSync('git', args, { cwd, env, encoding: 'utf8' }).status === 0;
+  const unioned = new Set();
   let ok = step(rebase ? ['rebase', target] : ['merge', '--no-edit', target]);
   for (let i = 0; !ok && i < 200; i++) {
+    const conflicted = git(['diff', '--name-only', '--diff-filter=U'], cwd).split('\n').filter(Boolean);
     // During a rebase stage 2 is the base side; during a merge stage 3 is.
     const manual = resolveUnion(cwd, union, rebase ? 2 : 3);
     if (!manual) break;
+    if (!manual.length) conflicted.forEach((f) => unioned.add(f));
     if (manual.length) {
       step([rebase ? 'rebase' : 'merge', '--abort']);
       return { verdict: 'conflict', conflicts: manual, method: rebase ? 'rebase' : 'merge', next: 'resolve these conflicts by hand, then run your gate and push' };
@@ -409,7 +439,12 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
   if (!step(push)) return { verdict: 'error', error: 'push failed; the branch is updated locally only' };
   unmarkTested(head, cwd);
   const newHead = git(['rev-parse', 'HEAD'], cwd);
-  return { verdict: 'synced', method: rebase ? 'rebase' : 'merge', head: newHead, previousHead: head, next: 'head changed: run your gate, `prloop mark-tested`, then request a review' };
+  // No manual resolution happened here (that aborts above); any difference in the PR's own change needs a new review.
+  const before = patchId(cwd, target, head, [...unioned]), after = patchId(cwd, target, newHead, [...unioned]);
+  const unchanged = !!before && before === after;
+  return { verdict: 'synced', method: rebase ? 'rebase' : 'merge', head: newHead, previousHead: head, patchId: after, unchanged, unioned: [...unioned],
+    next: unchanged ? 'head changed but the PR\'s own change did not: run your gate; a previous clean review carries over'
+      : 'head changed: run your gate, `prloop mark-tested`, then request a review' };
 }
 
 // ---------- wait ----------
@@ -557,7 +592,40 @@ const statePath = (repo, pr) => join(stateDir(), `${repo.replace('/', '__')}__${
 const loadState = (repo, pr) => {
   try { return JSON.parse(readFileSync(statePath(repo, pr), 'utf8')); } catch { return { rounds: 0, seen: {} }; }
 };
-const saveState = (st) => { mkdirSync(stateDir(), { recursive: true }); writeFileSync(statePath(st.repo, st.pr), JSON.stringify(st, null, 2)); };
+// `prloop sync` may record a carry-over while a run holds this PR's state in memory: the newer carry wins.
+const saveState = (st) => {
+  const disk = loadState(st.repo, st.pr).carry;
+  if (disk && !(st.carry?.at >= disk.at)) st.carry = disk;
+  mkdirSync(stateDir(), { recursive: true });
+  writeFileSync(statePath(st.repo, st.pr), JSON.stringify(st, null, 2));
+};
+
+// Appends one event to the PR's run log, or to a new log when no run has written this PR yet.
+function logEvent(st, e) {
+  mkdirSync(stateDir(), { recursive: true });
+  st.log ??= join(stateDir(), `run-${new Date().toISOString().replace(/[:.]/g, '-')}.jsonl`);
+  appendFileSync(st.log, `${JSON.stringify({ at: new Date().toISOString(), repo: st.repo, pr: st.pr, head: short(st.head), ...e })}\n`);
+}
+
+// Carries the clean verdict of `from` to the synced head; recorded in the state file and the event log.
+export function recordCarry(repo, prNum, from, v) {
+  const st = { rounds: 0, seen: {}, ...loadState(repo, prNum), repo, pr: Number(prNum), head: v.head };
+  st.carry = { from, to: v.head, patchId: v.patchId, at: new Date().toISOString() };
+  logEvent(st, { phase: 'carried', from: short(from), to: short(v.head), patchId: v.patchId });
+  saveState(st); // after logging, so a new log path is kept
+  return st.carry;
+}
+
+// The coordinator's one explicit reset of the round cap for a PR; a second one is refused.
+export function resetRounds(repo, prNum) {
+  const st = { rounds: 0, seen: {}, ...loadState(repo, prNum), repo, pr: Number(prNum) };
+  if ((st.roundResets ?? 0) >= 1) throw new Error(`the rounds of ${repo}#${prNum} were already reset once: hand the PR over to a human`);
+  const previous = st.rounds ?? 0;
+  Object.assign(st, { rounds: 0, roundResets: 1 });
+  logEvent(st, { phase: 'rounds_reset', reason: `rounds ${previous} -> 0` });
+  saveState(st);
+  return { verdict: 'ok', pr: st.pr, previousRounds: previous, rounds: 0, next: 'rerun prloop run for this PR' };
+}
 
 // Records findings; returns the fingerprints that came back after a fix twice (seen on 3+ distinct threads).
 export function recordFindings(seen, findings) {
@@ -669,22 +737,23 @@ const TERMINAL = new Set(['merged', 'merge_pending', 'clean', 'blocked', 'needs_
 export async function runAll(opts, cfg) {
   const repo = opts.repo;
   const prs = String(opts.pr).split(',').map(Number);
-  const deadline = Date.now() + parseDuration(opts.deadline ?? '6h');
-  const maxAgents = Number(opts.maxAgents ?? 2), maxRounds = Number(opts.maxRounds ?? 8);
+  const deadline = Date.now() + cfg.deadline;
+  const { maxAgents, maxRounds } = cfg;
   mkdirSync(stateDir(), { recursive: true });
   const log = join(stateDir(), `run-${new Date().toISOString().replace(/[:.]/g, '-')}.jsonl`);
-  // ponytail: rounds and seen findings persist across runs on purpose; delete a PR's state file to reset them.
+  // Rounds and seen findings persist across runs on purpose; `prloop reset-rounds` resets the rounds once.
   const states = prs.map((n) => ({ ...loadState(repo, n), repo, pr: n, log, phase: 'polling', reason: undefined, next: undefined }));
   const busy = new Map();
   const event = (st, phase, extra = {}) => {
     Object.assign(st, { phase, updatedAt: new Date().toISOString() }, extra);
     saveState(st);
-    appendFileSync(log, `${JSON.stringify({ at: st.updatedAt, repo, pr: st.pr, phase, head: short(st.head), ...pick(extra, ['verdict', 'reason', 'status']) })}\n`);
+    logEvent(st, { phase, ...pick(extra, ['verdict', 'reason', 'status']) });
   };
   const block = (st, reason, next = 'a human decision is needed') => event(st, 'blocked', { reason, next });
 
   async function fix(st, s, cwd, v) {
-    if (++st.rounds > maxRounds) return block(st, `max rounds (${maxRounds}) reached`);
+    if (++st.rounds > maxRounds) return block(st, `max rounds (${maxRounds}) reached`,
+      'judge the remaining findings by real impact: merge low-risk ones as deferred, or `prloop reset-rounds` once for important defects');
     if (v.findings?.length) {
       const repeated = recordFindings(st.seen, v.findings);
       if (repeated.length) return block(st, 'the same finding came back after two fixes', 'decide whether the finding is valid');
@@ -723,10 +792,17 @@ export async function runAll(opts, cfg) {
     const wrong = cwd && checkWorktree(cwd, s);
     if (wrong) return block(st, wrong);
     const slot = () => busy.size < maxAgents;
-    if (s.mergeState === 'BEHIND' || s.mergeState === 'DIRTY' || s.mergeable === 'CONFLICTING') {
+    // Behind but mergeable and reviewed clean: GitHub's own merge or rebase replays it, so syncing would only
+    // cost a new review. A failed direct merge falls back to a sync.
+    const mergeBehind = s.mergeState === 'BEHIND' && s.mergeable === 'MERGEABLE' && s.verdict === 'clean' && st.directMergeFailed !== s.head;
+    if (!mergeBehind && (s.mergeState === 'BEHIND' || s.mergeState === 'DIRTY' || s.mergeable === 'CONFLICTING')) {
       if (!cwd) return block(st, `PR is ${s.mergeState} and no worktree has ${s.branch}; pass --worktree`);
       const v = syncBranch({ cwd, branch: s.branch, base: s.base, baseOid: raw.baseRefOid, head: s.head, settings: raw.repoSettings, union: opts.union });
       if (v.verdict === 'error') return block(st, `sync failed: ${v.error}`);
+      if (v.verdict === 'synced' && v.unchanged && s.verdict === 'clean') {
+        st.carry = recordCarry(repo, st.pr, s.head, v);
+        return event(st, 'polling', { verdict: 'carried', head: v.head });
+      }
       if (v.verdict === 'synced') return event(st, 'polling', { verdict: 'synced', head: v.head });
       if (v.verdict === 'conflict') return slot() && fix(st, s, cwd, { verdict: 'conflict', trigger: 'conflict', conflicts: v.conflicts });
     }
@@ -751,7 +827,11 @@ export async function runAll(opts, cfg) {
       if (missing.length) return slot() && fix(st, s, cwd, { verdict: 'not_tested', trigger: 'not_requested', missing,
         note: 'The head is already reviewed clean and only needs the gate: run `prloop ready`, which runs the gate and marks the head tested, then reports that the head is already reviewed clean. That report is expected: skip the review request and report status nothing_to_do.' });
       if (s.mergeable !== 'MERGEABLE') return s.mergeable === 'UNKNOWN' ? undefined : block(st, `GitHub reports mergeable=${s.mergeable}`);
-      sh('gh', ['pr', 'merge', String(st.pr), '--repo', repo, `--${opts.merge}`, '--match-head-commit', s.head]);
+      try { sh('gh', ['pr', 'merge', String(st.pr), '--repo', repo, `--${opts.merge}`, '--match-head-commit', s.head]); } catch (e) {
+        if (!mergeBehind) throw e;
+        st.directMergeFailed = s.head;
+        return event(st, 'polling', { verdict: 'direct_merge_failed', reason: String(e.stderr || e.message).slice(0, 200) });
+      }
       const after = classify(fetchPr(repo, st.pr), cfg);
       // A merge queue or auto-merge accepts the command without merging yet: report the real state.
       return after.state === 'MERGED' ? event(st, 'merged', { mergeCommit: after.mergeCommit })
@@ -782,21 +862,23 @@ export async function runAll(opts, cfg) {
 
 const pick = (o, keys) => Object.fromEntries(keys.filter((k) => o[k] !== undefined).map((k) => [k, o[k]]));
 
-// Cheap check-in for a coordinator: state files plus the latest events, no GitHub calls.
-export function runStatus(repoFilter) {
+// Cheap check-in for a coordinator: state files plus each PR's last few events, no GitHub calls.
+export function runStatus(repoFilter, last = 5) {
   const dir = stateDir();
   const files = existsSync(dir) ? readdirSync(dir) : [];
+  const logs = files.filter((x) => x.startsWith('run-')).sort().reverse().map((f) => join(dir, f));
+  const read = (f) => { try { return readFileSync(f, 'utf8').split('\n').flatMap((l) => { try { return [JSON.parse(l)]; } catch { return []; } }); } catch { return []; } };
   const prs = files.filter((f) => /__\d+\.json$/.test(f)).map((f) => JSON.parse(readFileSync(join(dir, f), 'utf8')))
     .filter((st) => !repoFilter || st.repo === repoFilter)
-    .map((st) => ({ repo: st.repo, pr: st.pr, phase: st.phase, head: short(st.head), rounds: st.rounds, reason: st.reason, next: st.next, updatedAt: st.updatedAt }));
-  // Logs from other repositories' runs share the directory: take the newest log with events for the filter.
-  let events = [];
-  for (const f of files.filter((x) => x.startsWith('run-')).sort().reverse()) {
-    events = readFileSync(join(dir, f), 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l))
-      .filter((e) => !repoFilter || e.repo === repoFilter).slice(-8);
-    if (events.length) break;
-  }
-  return { prs, events };
+    .map((st) => {
+      // The state names its run log; older log lines carry no repo, so match them by PR number within that log.
+      const mine = (e) => e.pr === st.pr && (e.repo ?? st.repo) === st.repo;
+      let events = [];
+      for (const f of [st.log, ...logs].filter(Boolean)) if ((events = read(f).filter(mine)).length) break;
+      return { repo: st.repo, pr: st.pr, phase: st.phase, head: short(st.head), rounds: st.rounds, roundResets: st.roundResets, reason: st.reason, next: st.next,
+        updatedAt: st.updatedAt, carry: st.carry, events: events.slice(-last) };
+    });
+  return { prs };
 }
 
 // blocked (also a merge still pending) wins; otherwise the first verdict that still needs action; 0 when all are done.
@@ -845,10 +927,13 @@ export async function main(argv) {
       const v = await waitFor(repo, prArg, cfg, { interval: cfg.interval });
       return out(v, EXIT[v.verdict]);
     }
+    if (cmd === 'reset-rounds') return out(resetRounds(repo, prArg), 0);
     if (cmd === 'sync') {
       const pr = fetchPr(repo, prArg);
+      const clean = classify(pr, cfg).verdict === 'clean';
       const v = syncBranch({ cwd: process.cwd(), branch: pr.headRefName, base: pr.baseRefName, baseOid: pr.baseRefOid, head: pr.headRefOid, settings: pr.repoSettings, union: opts.union });
-      return out({ pr: Number(prArg), ...v }, v.verdict === 'conflict' ? EXIT.conflict : v.verdict === 'error' ? EXIT.error : 0);
+      const carry = v.verdict === 'synced' && v.unchanged && clean ? recordCarry(repo, prArg, pr.headRefOid, v) : undefined;
+      return out({ pr: Number(prArg), ...v, carry }, v.verdict === 'conflict' ? EXIT.conflict : v.verdict === 'error' ? EXIT.error : 0);
     }
     throw new Error(`unknown command: ${cmd}`);
   } catch (e) {
