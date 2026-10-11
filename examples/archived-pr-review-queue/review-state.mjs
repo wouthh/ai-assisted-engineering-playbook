@@ -353,15 +353,17 @@ export function isNoFindingsReviewerMessage(body) {
     return false;
   }
 
+  // Clean phrases must end the message so a qualified statement such as
+  // "No issues with X, but Y is broken" stays actionable.
   if (
-    /\bgenerated no new comments\b/i.test(stripped) ||
-    /\bno new comments were generated\b/i.test(stripped)
+    /\bgenerated no new comments\.?$/i.test(stripped) ||
+    /\bno new comments were generated\.?$/i.test(stripped)
   ) {
     return true;
   }
 
   if (
-    /^(?:(?:codex|copilot) review:\s*)?(?:did(?:n't| not) find any (?:major )?issues|0 comments were generated|generated no new comments|no (?:new )?comments(?: were generated)?|no new threads opened|no issues|no suggestions|no feedback)\b/i.test(
+    /^(?:(?:codex|copilot) review:\s*)?(?:did(?:n't| not) find any (?:major )?issues|0 comments were generated|generated no new comments|no (?:new )?comments(?: were generated)?|no new threads opened|no issues|no suggestions|no feedback)(?: found)?[.!]?(?:\s+[A-Z][a-z]+!)?$/iu.test(
       stripped,
     )
   ) {
