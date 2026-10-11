@@ -171,7 +171,9 @@ class MessageTests(GuardFixture):
                         "wrong@[foo\\]bar]", "https://user@host.synthetic-mail.net/path",
                         "wrong@synthetic-mail.net@1.2.3",
                         "wrong@synthetic-mail.net,docs@example.com",
-                        "wrong@synthetic-mail.net@example.com"):
+                        "wrong@synthetic-mail.net@example.com",
+                        "wrong@synthetic-mail.net@",
+                        "https://wrong@synthetic-mail.net/path.invalid"):
             with self.subTest(address=address):
                 path = self.message(f"Add feature\n\nCo-authored-by: Synthetic <{address}>\n")
                 self.assert_refused(self.guard("--commit-msg", path), "line 3")

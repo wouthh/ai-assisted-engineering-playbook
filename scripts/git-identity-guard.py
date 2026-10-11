@@ -65,8 +65,9 @@ GITHUB_USER_NOREPLY = re.compile(
     r"@users\.noreply\.github\.com")
 GENERIC_ALLOWED = {"noreply@github.com", "support@github.com"}
 # Reserved documentation and testing domains (RFC 2606 and RFC 6761).
-RESERVED_SUFFIXES = (".example", ".invalid", ".test", "@example.com",
-                     "@example.net", "@example.org")
+RESERVED_DOMAINS = ("example.com", "example.net", "example.org")
+RESERVED_TLDS = (".example", ".invalid", ".test")
+HOSTNAME = re.compile(r"[a-z0-9-]+(?:\.[a-z0-9-]+)*")
 
 
 class Refusal(ValueError):
@@ -206,9 +207,15 @@ def message_email_allowed(email: str, allowed: set[str]) -> bool:
     lower = email.lower()
     if lower.count("@") != 1:
         return False  # Never let a trailing allowed address vouch for a prefix.
-    return (lower in allowed or lower in GENERIC_ALLOWED
-            or lower.endswith(RESERVED_SUFFIXES)
-            or GITHUB_USER_NOREPLY.fullmatch(lower) is not None)
+    if lower in allowed or lower in GENERIC_ALLOWED:
+        return True
+    if GITHUB_USER_NOREPLY.fullmatch(lower):
+        return True
+    # Reserved names count only when the whole part after @ is a hostname,
+    # so a URL that merely ends in a reserved suffix is not accepted.
+    domain = lower.partition("@")[2]
+    return HOSTNAME.fullmatch(domain) is not None and (
+        domain in RESERVED_DOMAINS or domain.endswith(RESERVED_TLDS))
 
 
 def message_addresses(line: str) -> list[str]:
@@ -216,8 +223,8 @@ def message_addresses(line: str) -> list[str]:
     found = []
     for word in re.split(r"[\s,;]+", line):
         word = word.strip(WORD_EDGE)
-        if "@" not in word or word.endswith("@"):
-            continue
+        if word.count("@") == 0 or (word.count("@") == 1 and word.endswith("@")):
+            continue  # No address, or a lone trailing at-sign such as name@.
         # Exemptions apply only when the whole word has exactly that shape.
         body = word[1:] if word.startswith("@") else word
         if "@" not in body:
