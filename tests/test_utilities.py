@@ -1817,7 +1817,8 @@ class GuidanceConsistencyTests(unittest.TestCase):
         for path in ("templates/AGENTS.template.md", "tools/prloop/README.md", "tools/prloop/prloop.mjs"):
             with self.subTest(path=path):
                 text = (ROOT / path).read_text(encoding="utf-8")
-                self.assertRegex(text, r"leave them unresolved,? \(?except a finding proven to misread (AGENTS\.md|this file), which (you|it) resolves? after the evidence reply")
+                self.assertRegex(text, r"leave them unresolved,? \(?except a finding proven to misread (AGENTS\.md|this file), which (you|it) resolves? after the evidence reply once every AGENTS\.md that applies to its path confirms it is invalid")
+                self.assertRegex(text, r"(?i)read only the referenced files plus [^;\n]*?every (nested )?AGENTS\.md that applies to them")
 
 if __name__ == "__main__":
     unittest.main()
