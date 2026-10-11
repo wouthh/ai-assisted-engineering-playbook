@@ -3,9 +3,10 @@ import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import {
-  EXIT, OUTPUT_TAIL, main, slotDir, agentFailure, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, unmarkTested, editLines, agentEnv, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, syncBranch, unionLines, waitFor,
+  EXIT, OUTPUT_TAIL, main, slotDir, agentFailure, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, syncBranch, unionLines, waitFor,
 } from '../prloop.mjs';
 
 const pick = (o, keys) => Object.fromEntries(keys.map((k) => [k, o[k]]));
@@ -1443,6 +1444,23 @@ test('run blocks with the session error and keeps the agent log when an agent en
   assert.ok(res.next.includes(res.agentLog));
 });
 
+test('agent usage: totals from a recorded claude wrapper, blank for output without usage', async (t) => {
+  const wrapper = readFileSync(new URL('./claude-wrapper.json', import.meta.url), 'utf8');
+  assert.deepEqual(agentUsage(wrapper), { turns: 14, costUsd: 0.4182, inputTokens: 159200, outputTokens: 3400 });
+  assert.equal(agentUsage('codex final message without usage'), null);
+  const st = {};
+  addUsage(st, 'codex final message without usage');
+  assert.deepEqual(st.usage, { agentRuns: 1, turns: null, costUsd: null, inputTokens: null, outputTokens: null });
+  addUsage(st, wrapper);
+  addUsage(st, wrapper);
+  assert.deepEqual(st.usage, { agentRuns: 3, turns: 28, costUsd: 0.8364, inputTokens: 318400, outputTokens: 6800 });
+  // A run records the agent's usage in the state file, `run --status` and the final summary.
+  const { res } = await runNoResultAgent(t, false, { body: `cat "${fileURLToPath(new URL('./claude-wrapper.json', import.meta.url))}"` });
+  const expected = { agentRuns: 1, turns: 14, costUsd: 0.4182, inputTokens: 159200, outputTokens: 3400 };
+  assert.deepEqual(res.usage, expected);
+  assert.deepEqual(runStatus('example-org/example-repo').prs[0].usage, expected);
+});
+
 test('run kills an agent that outlives --agent-timeout and blocks with "agent timed out"', async (t) => {
   const started = Date.now();
   const { res, r } = await runNoResultAgent(t, false, { body: 'sleep 30 & wait', extra: { agentTimeout: 300 } });
@@ -1500,8 +1518,9 @@ test('ready rereads the PR after its gate: a head pushed meanwhile is not report
   writeFileSync(join(r.dir, 'moved.json'), readFileSync(join(r.dir, 'pr.json'), 'utf8').replaceAll(head, moved));
   // The "gate" passes while another worktree pushes a new head.
   // Many slots: the suite may itself run as a prloop gate that holds one of the shared machine-wide slots.
+  // No real resource waits: a busy machine must not stall this test for --resource-wait.
   const res = spawnSync(process.execPath, [PRLOOP, 'ready', '7', '--repo', 'example-org/example-repo', '--gate', `cp "${r.dir}/moved.json" "${r.dir}/pr.json"`],
-    { cwd: r.work, encoding: 'utf8', env: { ...process.env, PRLOOP_LOCK_TOKEN: '', PRLOOP_GATE_SLOTS: '64' } });
+    { cwd: r.work, encoding: 'utf8', env: { ...process.env, PRLOOP_LOCK_TOKEN: '', PRLOOP_GATE_SLOTS: '64', PRLOOP_MAX_LOAD: '100000', PRLOOP_MIN_FREE_MEM: '1K' } });
   const out = JSON.parse(res.stdout);
   assert.equal(res.status, 50, res.stdout);
   assert.deepEqual([out.ready, out.head], [false, moved]);
