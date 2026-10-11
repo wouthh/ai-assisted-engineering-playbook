@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import {
-  buildPrompt, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, syncBranch, unionLines, waitFor,
+  buildPrompt, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, syncBranch, unionLines, waitFor,
 } from '../prloop.mjs';
 
 const fixture = () => JSON.parse(readFileSync(new URL('./pr-fixture.json', import.meta.url), 'utf8'));
@@ -147,6 +147,7 @@ test('run exit code: blocked wins, then the first verdict needing action', () =>
   assert.equal(runExitCode([{ verdict: 'clean' }, { verdict: 'merged' }]), 0);
   assert.equal(runExitCode([{ verdict: 'clean' }, { verdict: 'findings' }, { verdict: 'timeout' }]), 10);
   assert.equal(runExitCode([{ verdict: 'not_requested' }, { verdict: 'blocked' }]), 50);
+  assert.equal(runExitCode([{ verdict: 'clean' }, { verdict: 'merge_pending' }]), 50); // the PR is still open
 });
 
 test('the default reviewer login is anchored', () => {
@@ -566,4 +567,32 @@ test('worktree check: branch and PR head commit must match', (t) => {
   assert.match(checkWorktree(r.work, { branch: 'feat', head: 'f'.repeat(40) }), /HEAD is not PR head/);
   r.commit('local only', { 'app.txt': 'two\n' }); // PR head still present, but HEAD is ahead of it
   assert.match(checkWorktree(r.work, { branch: 'feat', head }), /HEAD is not PR head/);
+});
+
+test('value options need a value; only --help and --status are flags', () => {
+  assert.throws(() => parseArgs(['ready', '5', '--gate']), /--gate needs a value/);
+  assert.throws(() => parseArgs(['ready', '5', '--gate', '--repo', 'o/r']), /--gate needs a value/);
+  assert.deepEqual(parseArgs(['run', '--status', '--repo', 'o/r', '--gate=make check']), { _: ['run'], union: [], status: true, repo: 'o/r', gate: 'make check' });
+});
+
+test('--agent none never runs a local reviewer', async () => {
+  const v = await localReview('example-org/example-repo', { pr: 7, head: 'abc', unresolvedThreads: [] }, config({ agent: 'none' }, {}), '/nonexistent');
+  assert.equal(v.verdict, 'blocked');
+  assert.match(v.reason, /--agent none/);
+});
+
+test('sync clears only the old head marker, not other PR heads', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  const other = r.run(r.work, 'rev-parse', 'HEAD');
+  markTested(other, r.work); // another PR's head in the same repository
+  r.commit('feature', { 'app.txt': 'feature\n' });
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  markTested(head, r.work);
+  divergeOnMain(r, { 'log.csv': 'id\na\nbase\n' });
+  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true } });
+  assert.equal(v.verdict, 'synced', JSON.stringify(v));
+  assert.equal(isTested(head, r.work), false);
+  assert.equal(isTested(other, r.work), true);
 });
