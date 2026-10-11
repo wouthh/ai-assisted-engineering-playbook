@@ -47,10 +47,10 @@ Fix agents never wait for or poll reviews, merge, touch other PRs, rewrite histo
 | `--gate "<cmd>"` | `PRLOOP_GATE` | The project's full validation command, run by `prloop ready`. Without it the agent runs the gate documented in AGENTS.md or README and calls `prloop mark-tested`. |
 | `--agent claude` | yes | `claude -p <prompt> --model claude-opus-5-5 --effort medium --permission-mode auto --output-format json`, run in the worktree so the CLI loads that project's instructions. |
 | `--agent codex` | | `codex exec` with a workspace-write sandbox that allows network access. |
-| `--agent none` | | Stops the PR at `needs_agent` with the generated `prompt` in its summary, so the coordinator can spawn its own agent and rerun `run`. |
+| `--agent none` | | Stops the PR at `needs_agent` with the generated `prompt` in its summary, so the coordinator can spawn its own agent and rerun `run`. A needed local review stops the PR at `blocked` instead of running a reviewer. |
 | `--model`, `--effort` | | Override the agent model and effort (`PRLOOP_MODEL`, `PRLOOP_EFFORT`). |
 | `--max-agents 2` | 2 | Agents and local reviews running at the same time. |
-| `--merge rebase\|squash\|merge` | off | Merges only a head whose fresh snapshot is clean with no unresolved threads, marked tested in the PR worktree with a clean pushed tree, and reported mergeable, using `gh pr merge --match-head-commit <sha>`. A clean but untested head goes to an agent for the gate only. The result is `merged`, or `merge_pending` when a merge queue or auto-merge accepted it without merging yet. |
+| `--merge rebase\|squash\|merge` | off | Merges only a head whose fresh snapshot is clean with no unresolved threads, marked tested in the PR worktree with a clean pushed tree, and reported mergeable, using `gh pr merge --match-head-commit <sha>`. A clean but untested head goes to an agent for the gate only. The result is `merged`, or `merge_pending` (exit 50) when a merge queue or auto-merge accepted it without merging yet. |
 | `--union <glob>` | | Passed to sync. Reviewer and timing options apply as for `wait`. |
 
 Failsafes end a PR in `blocked` (or `needs_human` for disputed findings) with a reason, never in a loop: maximum rounds per PR (`--max-rounds 8`), an agent that exits non-zero, prints no parseable result line, reports `blocked` or a permission denial, or makes no progress (no new commit, resolved thread, request or tested head), the same finding (path plus normalized first line) returning after two fixes, the overall deadline, and every local-review failsafe.
@@ -77,7 +77,7 @@ The manual alternative, for an agent that drives one PR itself. Every command pr
 | `requested_while_unresolved` | 21 | A request was posted while older threads were still open. |
 | `timeout` | 30 | No reaction within `--ack-timeout` (3m) of the request, or no result within `--timeout` (40m). Both are measured from the request time, so running `wait` again does not restart the clock. Includes `rerequestBody`, a copy of your last trigger comment, to repost unchanged. A timed-out request no longer blocks `prloop ready`. |
 | `unavailable` | 31 | Only with `--reviewer cloud`: the bot replied that it cannot review (usage limit, failure), or two requests on this head timed out. |
-| `blocked` | 50 | A local review could not run or post, or its per-head or per-PR limit is used up. |
+| `blocked` | 50 | A local review could not run or post, `--agent none` selects no reviewer, or its per-head or per-PR limit is used up. |
 | `error` | 40 | GitHub could not be read three times in a row, bad input, or history prloop cannot fully see (more than 100 review threads, or more than 100 comments since the head) so it fails closed. |
 
 ```bash
@@ -101,7 +101,7 @@ esac
 
 Conflicts in files matching `--union` globs (append-only changelogs, CSV ledgers) are resolved as a union of both sides, base lines first, with identical lines kept once. Any other conflict aborts the merge or rebase, leaves the checkout as it was, and exits 41 with `verdict: "conflict"` and the conflicted files, for the agent to resolve by hand. Union resolution suits files where every line is an independent record; do not use it for files whose lines depend on order or on each other.
 
-A successful sync changes the head, so it clears the tested marker: run `prloop ready` (which reruns the gate), then request a review.
+A successful sync changes the head, so it clears the tested marker of the old head (markers of other PR heads stay): run `prloop ready` (which reruns the gate), then request a review.
 
 ## Local reviewer fallback
 
