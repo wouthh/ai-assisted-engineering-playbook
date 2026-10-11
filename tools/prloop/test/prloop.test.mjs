@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -361,6 +361,21 @@ test('wait admits a local review only when load and memory allow', async () => {
   assert.equal(v.error, 'stop');
   assert.equal(startedAt, 5000);
   assert.deepEqual(x.events.map((e) => e.event), ['waiting_for_resources']);
+});
+
+test('wait re-fetches the PR after resource admission and reviews the current head', async () => {
+  const pr = fixture();
+  request(pr).reactions.nodes.push({ content: 'EYES', createdAt: at('10:05'), user: BOT });
+  pr.comments.nodes.push(botComment('IC_q', QUOTA, '10:06'));
+  const x = idle({ load: 7 });
+  const c = { ...cfg, mode: 'local', interval: 1000, resourceWait: 60e3, timeout: 24 * 3600e3, ackTimeout: 24 * 3600e3 };
+  let current = pr;
+  const v = await waitFor('example-org/example-repo', 7, c, {
+    interval: c.interval, fetch: () => current, metrics: x.metrics, log: x.log, now: () => NOW + x.clock.t,
+    pause: async (ms) => { x.clock.t += ms; if (x.clock.t >= 5000) { x.m.load = 2; current = { ...pr, headRefOid: 'f'.repeat(40) }; } },
+    runLocal: (repo, s) => ({ verdict: 'error', error: s.head }),
+  });
+  assert.equal(v.error, 'f'.repeat(40));
 });
 
 test('local review payload: inline comments with a prefix, body fallback without a line', () => {
@@ -786,6 +801,10 @@ test('self-check warns about a dirty, off-branch or behind prloop checkout, and 
   assert.match(selfCheck(r.work).warning, /is on feat, not main: update it with `git -C .* pull --ff-only`/);
   r.run(r.work, 'switch', '-q', 'main');
   assert.equal(selfCheck(r.work), null);
+  const index = join(r.work, '.git', 'index'), before = readFileSync(index);
+  utimesSync(join(r.work, 'app.txt'), new Date(), new Date(Date.now() + 60e3)); // stale stat info: plain status would rewrite the index
+  assert.equal(selfCheck(r.work), null);
+  assert.deepEqual(readFileSync(index), before);
   writeFileSync(join(r.work, 'stray.txt'), 'local\n');
   assert.match(selfCheck(r.work).warning, /has uncommitted changes/);
   rmSync(join(r.work, 'stray.txt'));
