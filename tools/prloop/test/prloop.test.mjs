@@ -608,6 +608,27 @@ test('gate slots: exclusive up to N, released, and a dead owner\'s slot is recla
   assert.equal(acquireSlot(dir, 1), null);
 });
 
+test('a slot or lock claim whose PID now names another process is reclaimed', { skip: !existsSync('/proc/self/stat') }, (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'prloop-slots-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  writeFileSync(join(dir, `slot-0.${process.pid}.99`), '1'); // this PID, but a process that started at tick 1
+  assert.equal(slotsInUse(dir), 0);
+  const release = acquireSlot(dir, 1);
+  assert.ok(release);
+  assert.equal(slotsInUse(dir), 1); // the real owner's start time matches
+  release();
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  const lockDir = join(r.run(r.work, 'rev-parse', '--absolute-git-dir'), 'prloop-lock');
+  mkdirSync(lockDir);
+  writeFileSync(join(lockDir, `${process.pid}.99`), JSON.stringify({ pid: process.pid, start: '1', purpose: 'crashed run', token: 'x' }));
+  assert.equal(lockHolder(r.work, null), null);
+  const lock = takeLock(r.work, 'fix agent');
+  assert.ok(lock.token);
+  assert.equal(lockHolder(r.work, null).pid, process.pid);
+  lock.release();
+});
+
 test('the slot directory is per user without XDG_RUNTIME_DIR and must not be writable by others', (t) => {
   const old = process.env.XDG_RUNTIME_DIR;
   t.after(() => { if (old === undefined) delete process.env.XDG_RUNTIME_DIR; else process.env.XDG_RUNTIME_DIR = old; });

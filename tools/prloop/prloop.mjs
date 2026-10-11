@@ -375,7 +375,14 @@ export async function admit(cfg, { metrics = machineMetrics, now = Date.now, pau
   }
 }
 
-const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
+// A process instance is its PID plus, where /proc exposes it (Linux), its start time in clock ticks since boot,
+// so a claim of a crashed process is not kept alive by an unrelated process that later reuses its PID.
+export const procStart = (pid) => { try { return readFileSync(`/proc/${pid}/stat`, 'utf8').split(') ').at(-1).split(' ')[19] ?? null; } catch { return null; } };
+const alive = (pid, start) => {
+  try { process.kill(pid, 0); } catch (e) { if (e.code !== 'EPERM') return false; }
+  return !start || procStart(pid) === null || procStart(pid) === start;
+};
+const claimStart = (file) => { try { return readFileSync(file, 'utf8').trim() || null; } catch { return null; } };
 
 function ensureSlotDir(dir) {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -385,13 +392,13 @@ function ensureSlotDir(dir) {
   }
 }
 
-// Slot claims are files named slot-<i>.<pid>.<n>. A claim whose process is gone (killed, crashed) is stale and
-// removed; its name is unique, so removing it can never delete a live claim.
+// Slot claims are files named slot-<i>.<pid>.<n> holding the owner's start time. A claim whose process is gone
+// (killed, crashed, PID reused) is stale and removed; its name is unique, so removing it can never delete a live claim.
 let claims = 0;
 const liveClaims = (dir, i, mine) => readdirSync(dir).filter((f) => {
   const m = /^slot-(\d+)\.(\d+)\.\d+$/.exec(f);
   if (!m || Number(m[1]) !== i || f === mine) return false;
-  if (alive(Number(m[2]))) return true;
+  if (alive(Number(m[2]), claimStart(join(dir, f)))) return true;
   rmSync(join(dir, f), { force: true });
   return false;
 });
@@ -404,7 +411,7 @@ export function acquireSlot(dir, slots, pid = process.pid) {
   for (let i = 0; i < slots; i++) {
     if (liveClaims(dir, i).length) continue;
     const name = `slot-${i}.${pid}.${claims++}`;
-    writeFileSync(join(dir, name), '', { flag: 'wx' });
+    writeFileSync(join(dir, name), procStart(pid) ?? '', { flag: 'wx' });
     if (!liveClaims(dir, i, name).length) return () => rmSync(join(dir, name), { force: true });
     rmSync(join(dir, name), { force: true });
   }
@@ -413,7 +420,7 @@ export function acquireSlot(dir, slots, pid = process.pid) {
 
 // ---------- worktree lock ----------
 
-// One writer per worktree. Claims are files <git-dir>/prloop-lock/<pid>.<n> holding { pid, startedAt, purpose, token },
+// One writer per worktree. Claims are files <git-dir>/prloop-lock/<pid>.<n> holding { pid, start, startedAt, purpose, token },
 // taken with the same claim-then-recheck scheme as gate slots; a claim of a dead process is removed (its name is unique).
 // The token reaches a spawned agent as PRLOOP_LOCK_TOKEN, so its own `ready`, `sync` and `mark-tested` calls pass.
 const lockDir = (cwd) => { const g = tryGit(['rev-parse', '--absolute-git-dir'], cwd); return g && join(g, 'prloop-lock'); };
@@ -421,7 +428,7 @@ const lockClaims = (dir, mine) => (existsSync(dir) ? readdirSync(dir) : []).flat
   if (f === mine) return [];
   let c;
   try { c = JSON.parse(readFileSync(join(dir, f), 'utf8')); } catch { c = { pid: Number(f.split('.')[0]) }; } // still being written
-  if (alive(c.pid)) return [c];
+  if (alive(c.pid, c.start)) return [c];
   rmSync(join(dir, f), { force: true });
   return [];
 });
@@ -434,7 +441,7 @@ export function takeLock(cwd, purpose, pid = process.pid) {
   const [held] = lockClaims(dir);
   if (held) return { holder: held };
   const name = `${pid}.${claims++}`, token = randomUUID();
-  writeFileSync(join(dir, name), JSON.stringify({ pid, startedAt: new Date().toISOString(), purpose, token }), { flag: 'wx', mode: 0o600 });
+  writeFileSync(join(dir, name), JSON.stringify({ pid, start: procStart(pid), startedAt: new Date().toISOString(), purpose, token }), { flag: 'wx', mode: 0o600 });
   const [other] = lockClaims(dir, name);
   if (other) { rmSync(join(dir, name), { force: true }); return { holder: other }; }
   return { token, release: () => rmSync(join(dir, name), { force: true }) };
@@ -449,7 +456,7 @@ export function lockHolder(cwd, token = process.env.PRLOOP_LOCK_TOKEN) {
 export const lockMessage = (cwd, h) => `worktree ${cwd} is locked by prloop process ${h.pid} (${h.purpose ?? 'unknown purpose'}, since ${h.startedAt ?? 'unknown'}): wait until it finishes`;
 
 export const slotsInUse = (dir) => {
-  try { return new Set(readdirSync(dir).flatMap((f) => { const m = /^slot-(\d+)\.(\d+)\.\d+$/.exec(f); return m && alive(Number(m[2])) ? [m[1]] : []; })).size; } catch { return 0; }
+  try { return new Set(readdirSync(dir).flatMap((f) => { const m = /^slot-(\d+)\.(\d+)\.\d+$/.exec(f); return m && alive(Number(m[2]), claimStart(join(dir, f))) ? [m[1]] : []; })).size; } catch { return 0; }
 };
 
 // Runs `gate` after admission, holding a machine-wide slot, optionally with a private TMPDIR that is removed
