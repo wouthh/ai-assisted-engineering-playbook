@@ -59,8 +59,9 @@ ZERO_OID = re.compile(r"0+")
 # run of characters that cannot delimit an address. Over-matching only makes
 # the guard stricter, never more permissive.
 EMAIL = re.compile(r"(?:\"(?:[^\"\\\r\n]|\\.)*\"|[^\s<>()\[\],;:@\"]+)"
-                   r"@(?:[A-Za-z0-9-]+\.)*[A-Za-z][A-Za-z0-9-]*"
-                   r"(?![A-Za-z0-9.-]*[A-Za-z0-9])")
+                   r"@(?:\[[^\[\]\s\\]*\]"  # domain literal such as [192.0.2.1]
+                   r"|(?:[A-Za-z0-9-]+\.)*[A-Za-z][A-Za-z0-9-]*"
+                   r"(?![A-Za-z0-9.-]*[A-Za-z0-9]))")
 GITHUB_USER_NOREPLY = re.compile(
     r"(?:[1-9][0-9]*\+)?[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?"
     r"@users\.noreply\.github\.com")
