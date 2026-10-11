@@ -61,6 +61,8 @@ Install [`prloop`](https://github.com/wouthh/ai-assisted-engineering-playbook/tr
 - Group ready PRs into one batch and start the supervisor once, in the background: `prloop run --repo <owner/name> --pr <N,...> --gate "<full local gate>" --max-agents 2 &`.
 - Check `prloop run --status --repo <owner/name>` only on a notification or every 20-30 minutes or more, never in a tight loop.
 - Act only on the final summary or on `blocked`, `needs_human` and `needs_agent` items. Never poll GitHub or wait for reviews yourself.
+- At the round cap (`max rounds (6) reached`), judge each remaining finding by its real impact, not the reviewer's severity label, and check the edge cases yourself. Low-risk leftovers: merge when authorized, reply on each thread that it is deferred, and record a follow-up. Important defects: run `prloop reset-rounds <pr>` once for another full cap; if they still remain, hand over to a human.
+- Do not request a review only because a branch was synced: `prloop` carries a clean review across a sync that leaves the PR's own change identical, and `prloop run --merge` merges a behind but mergeable clean head directly.
 - Cap parallel load with `--max-agents`, and keep this file and shared templates current when the workflow changes.
 
 ### Fix agent (one session, one step)
