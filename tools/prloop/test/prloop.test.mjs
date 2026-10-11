@@ -336,14 +336,16 @@ test('wait runs one local review on fallback, then classifies the posted result'
   let calls = 0;
   const v = await waitFor('example-org/example-repo', 7, cfg, {
     interval: 1, now: () => NOW, pause: async () => {}, fetch: () => pr, metrics: idle().metrics,
-    runLocal: (repo, s) => {
+    runLocal: (repo, s, c, cwd, onLog) => {
       calls++;
+      onLog('/state/agents/review.log');
       pr.comments.nodes.push({ id: 'IC_l', databaseId: 951, body: localCleanBody(s.head), createdAt: at('10:07'), author: { login: 'example-dev' }, reactions: { nodes: [] } });
       return null;
     },
   });
   assert.equal(calls, 1);
   assert.equal(v.verdict, 'clean');
+  assert.equal(v.agentLog, '/state/agents/review.log');
 });
 
 test('wait admits a local review only when load and memory allow', async () => {
@@ -784,7 +786,7 @@ test('machine options: defaults, validation, and the status line', (t) => {
   assert.deepEqual(pick(e, ['gateSlots', 'maxLoad', 'minFreeMem', 'resourceWait']), { gateSlots: 3, maxLoad: 4.5, minFreeMem: 512 * 2 ** 20, resourceWait: 5 * 60e3 });
   assert.equal(parseSize('4GiB'), 4 * GiB);
   assert.equal(parseSize('1000'), 1000);
-  for (const [k, v] of [['gateSlots', '0'], ['maxLoad', '-1'], ['maxLoad', 'high'], ['minFreeMem', '4X'], ['minFreeMem', '0'], ['resourceWait', '0']]) {
+  for (const [k, v] of [['gateSlots', '0'], ['maxLoad', '-1'], ['maxLoad', 'high'], ['maxLoad', '9'.repeat(400)], ['minFreeMem', '4X'], ['minFreeMem', '0'], ['resourceWait', '0']]) {
     assert.throws(() => config({ [k]: v }, {}), /must be a positive/, `${k}=${v}`);
   }
   const dir = mkdtempSync(join(tmpdir(), 'prloop-slots-'));
@@ -1072,6 +1074,21 @@ test('threads from a dismissed bot review are not findings', () => {
   assert.equal(s.unresolvedThreads.length, 0);
   t.comments.nodes[0].pullRequestReview.state = 'COMMENTED';
   assert.equal(classify(pr, cfg, NOW).verdict, 'findings');
+});
+
+test('a dismissed bot review thread with a human reply stays unresolved and blocks a clean verdict', () => {
+  const pr = fixture();
+  const t = thread('T1', at('10:20'));
+  t.comments.nodes[0].pullRequestReview = { state: 'DISMISSED' };
+  t.comments.nodes.push({ body: 'This still matters', createdAt: at('10:25'), author: { login: 'example-dev' } });
+  pr.reviewThreads.nodes.push(t);
+  request(pr).reactions.nodes.push({ content: 'THUMBS_UP', createdAt: at('10:30'), user: BOT });
+  const s = classify(pr, cfg, NOW);
+  assert.equal(s.unresolvedThreads.length, 1);
+  assert.notEqual(s.verdict, 'clean');
+  t.comments.nodes.pop();
+  assert.equal(classify(pr, cfg, NOW).unresolvedThreads.length, 0);
+  assert.equal(classify(pr, cfg, NOW).verdict, 'clean');
 });
 
 test('threads from a dismissed human review stay unresolved and block a clean verdict', () => {
