@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import {
-  EXIT, main, slotDir, agentFailure, saveAgentLog, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, syncBranch, unionLines, waitFor,
+  EXIT, main, slotDir, agentFailure, saveAgentLog, pruneAgentLogs, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, syncBranch, unionLines, waitFor,
 } from '../prloop.mjs';
 
 const pick = (o, keys) => Object.fromEntries(keys.map((k) => [k, o[k]]));
@@ -493,6 +493,27 @@ test('a local review fails closed when the base cannot be fetched', async (t) =>
   assert.match(v.reason, /could not fetch origin\/no-such-base/);
 });
 
+test('a local reviewer\'s raw output is kept and named when its result is malformed', async (t) => {
+  const state = tempState(t);
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  markTested(head, r.work);
+  const old = process.env.PATH;
+  t.after(() => { process.env.PATH = old; });
+  mkdirSync(join(r.dir, 'bin'));
+  writeFileSync(join(r.dir, 'bin', 'claude'), '#!/bin/sh\necho \'{"type":"result","subtype":"success","result":"Looks fine to me."}\'\necho warn >&2\n', { mode: 0o755 });
+  process.env.PATH = `${join(r.dir, 'bin')}:${old}`;
+  const s = { pr: 7, head, branch: 'feat', base: 'main', baseOid: head, unresolvedThreads: [] };
+  let seen;
+  const v = await localReview('example-org/example-repo', s, cfg, r.work, (p) => { seen = p; });
+  assert.equal(v.verdict, 'blocked');
+  assert.equal(v.agentLog, seen);
+  assert.ok(v.agentLog.startsWith(join(state, 'agents', 'example-org__example-repo__7__')));
+  assert.match(readFileSync(v.agentLog, 'utf8'), /Looks fine to me[\s\S]*## stderr\nwarn/);
+});
+
 test('sync refuses a base ref that lacks the PR base commit', (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
@@ -692,10 +713,16 @@ test('agent failure: the CLI wrapper names why the session ended without a resul
   const w = (o) => JSON.stringify({ type: 'result', result: '', ...o });
   assert.equal(agentFailure(w({ subtype: 'error_max_turns', is_error: true })), 'the agent session ended at its max-turns limit');
   assert.equal(agentFailure(w({ subtype: 'error_during_execution', is_error: true })), 'the agent session ended with error_during_execution');
-  assert.match(agentFailure(w({ subtype: 'success', permission_denials: [{ tool_name: 'Bash' }] })), /1 permission denial/);
-  assert.match(agentFailure(w({ subtype: 'success', is_error: true, result: 'API error' })), /ended on an error: API error/);
-  assert.equal(agentFailure(w({ subtype: 'success', result: 'no line' })), null);
-  assert.equal(agentFailure('plain text'), null);
+  assert.equal(agentFailure(w({ subtype: 'success', terminal_reason: 'completed', permission_denials: [
+    { tool_name: 'Bash', tool_input: { command: 'git push origin feat' } }, { tool_name: 'Write', tool_input: { file_path: '/etc/x' } }] })),
+  'permission denied for Bash (git push origin feat), Write (/etc/x)');
+  assert.equal(agentFailure(w({ subtype: 'success', is_error: true, api_error_status: 529, result: 'Overloaded' })),
+    'the agent session ended on an error: Overloaded; API error status 529');
+  assert.equal(agentFailure(w({ subtype: 'success', terminal_reason: 'aborted' })), 'terminal reason aborted');
+  // Nothing specific: the tail of the final message, so prose is visible in the reason.
+  assert.equal(agentFailure(w({ subtype: 'success', terminal_reason: 'completed', result: `${'x'.repeat(400)}I fixed it.` })),
+    `the agent output had no parseable result line; it ended: ${'x'.repeat(289)}I fixed it.`);
+  assert.equal(agentFailure('plain text'), 'the agent output had no parseable result line; it ended: plain text');
 });
 
 test('agent logs keep raw output owner-only and prune logs older than 14 days', (t) => {
@@ -703,6 +730,10 @@ test('agent logs keep raw output owner-only and prune logs older than 14 days', 
   const now = Date.parse('2026-02-01T00:00:00Z');
   const old = saveAgentLog('example-org/example-repo', 7, { status: 0, stdout: 'old', stderr: '', final: 'old' }, now - 15 * 864e5);
   execFileSync('touch', ['-d', '2026-01-10', old]);
+  const recent = saveAgentLog('example-org/example-repo', 7, { status: 0, stdout: 'recent', stderr: '', final: 'recent' }, now - 864e5);
+  execFileSync('touch', ['-d', '2026-01-31', recent]);
+  pruneAgentLogs(now);
+  assert.ok(existsSync(recent));
   const f = saveAgentLog('example-org/example-repo', 7, { status: 1, stdout: 'out', stderr: 'err', final: 'last' }, now);
   assert.equal(f, join(dir, 'agents', 'example-org__example-repo__7__2026-02-01T00-00-00-000Z.log'));
   assert.equal(readFileSync(f, 'utf8'), '# exit status 1\n## stdout\nout\n## stderr\nerr\n## final message\nlast\n');
@@ -715,7 +746,8 @@ test('the fix prompt carries only the trigger data and the contract', () => {
     findings: [{ id: 'T1', path: 'src/a.js', line: 3, body: '**<sub>![P1 Badge](https://img.shields.io/badge/P1-orange)</sub> P1 Off by one**\n\nUseful? React with a thumb.' }], gate: 'npm test', requestBody: '@codex review' });
   for (const part of ['PR #7 in example-org/example-repo', 'branch feat/x', 'head abc123', 'worktree /work/x', 'Trigger: findings',
     '- T1 src/a.js:3 P1 Off by one', 'runs the gate (npm test)', 'reusing exactly:\n@codex review', '"status":"requested|blocked|nothing_to_do"',
-    'Never wait for or poll reviews']) assert.ok(p.includes(part), part);
+    'Never wait for or poll reviews', 'on its own last line, always, also when you stop early or are blocked',
+    'report "blocked" with the denied command or missing tool named']) assert.ok(p.includes(part), part);
   assert.match(buildPrompt({ repo: 'o/n', pr: 1, trigger: 'local_review', findings: [], summaries: ['[local review] 1 finding(s) on x.\n- README.md [P3] Stale flag'] }),
     /Reviewer summary[\s\S]*README\.md \[P3\] Stale flag/);
   assert.match(buildPrompt({ repo: 'o/n', pr: 1, trigger: 'conflict', conflicts: ['a.txt'], localReview: true }), /Conflicted files: a\.txt[\s\S]*Do not post a review request/);
@@ -1105,4 +1137,6 @@ test('run keeps polling when an agent without a result line still made progress'
   assert.ok(existsSync(res.agentLog));
   const events = runStatus('example-org/example-repo').prs[0].events.map((e) => e.phase);
   assert.ok(events.includes('agent_no_result'), events.join(','));
+  const log = readFileSync(join(process.env.XDG_STATE_HOME, 'prloop', readdirSync(join(process.env.XDG_STATE_HOME, 'prloop')).find((f) => f.startsWith('run-'))), 'utf8');
+  assert.match(log, /agent made progress without a result line \(the agent session ended at its max-turns limit\)/);
 });

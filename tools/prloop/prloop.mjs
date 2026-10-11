@@ -675,19 +675,21 @@ export function localReviewPayload(head, findings, inline = true) {
   };
 }
 
-async function runReviewer(cfg, prompt, cwd) {
+async function runReviewer(cfg, prompt, cwd, keep) {
   const dir = mkdtempSync(join(tmpdir(), 'prloop-review-'));
   try {
     if (cfg.agent === 'codex') { // otherwise claude; localReview never gets here with --agent none
       writeFileSync(join(dir, 'schema.json'), JSON.stringify(REVIEW_SCHEMA));
       const r = await spawnAsync('codex', ['exec', '--sandbox', 'read-only', '--output-schema', join(dir, 'schema.json'), '-o', join(dir, 'out.json'),
         ...(cfg.model ? ['-m', cfg.model] : []), ...(cfg.effort ? ['-c', `model_reasoning_effort=${cfg.effort}`] : []), prompt], cwd);
+      keep({ ...r, final: existsSync(join(dir, 'out.json')) ? readFileSync(join(dir, 'out.json'), 'utf8') : r.stdout });
       if (r.status !== 0) throw new Error(`codex reviewer exited with ${r.status}: ${(r.stderr ?? '').slice(-300)}`);
       return parseReview(readFileSync(join(dir, 'out.json'), 'utf8'));
     }
     const r = await spawnAsync('claude', ['-p', prompt, '--model', cfg.model ?? 'claude-opus-5-5', '--effort', cfg.effort ?? 'medium',
       '--permission-mode', 'dontAsk', '--allowedTools', 'Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git show:*)',
       '--output-format', 'json', '--json-schema', JSON.stringify(REVIEW_SCHEMA)], cwd);
+    keep({ ...r, final: r.stdout });
     if (r.status !== 0) throw new Error(`claude reviewer exited with ${r.status}: ${(r.stderr ?? '').slice(-300)}`);
     const out = JSON.parse(r.stdout);
     return parseReview(out.structured_output ?? out.result);
@@ -703,7 +705,8 @@ Return JSON {"findings":[{"path","line","severity":"P0".."P3","body"}]} with "li
 
 // Runs one read-only review of the current head in `cwd` and posts it. Returns a verdict to stop on,
 // or null when the result was posted and the next poll should classify it.
-export async function localReview(repo, s, cfg, cwd) {
+// `onLog` receives the path of the reviewer's saved raw output.
+export async function localReview(repo, s, cfg, cwd, onLog = () => {}) {
   if (cfg.agent === 'none') return { verdict: 'blocked', pr: s.pr, head: s.head,
     reason: '--agent none runs no local reviewer: review the head yourself or rerun with --agent claude or codex' };
   const missing = s.unresolvedThreads.length ? [`${s.unresolvedThreads.length} unresolved threads`] : [];
@@ -713,9 +716,10 @@ export async function localReview(repo, s, cfg, cwd) {
   const baseError = fetchBase(cwd, s.base, s.baseOid);
   if (baseError) return { verdict: 'blocked', pr: s.pr, head: s.head, reason: `local review: ${baseError}` };
   const prompt = localReviewPrompt(s);
-  let findings;
-  try { findings = await runReviewer(cfg, prompt, cwd); } catch (e) {
-    return { verdict: 'blocked', pr: s.pr, head: s.head, reason: `local reviewer failed: ${String(e.message).slice(0, 400)}` };
+  let findings, agentLog;
+  const keep = (r) => onLog(agentLog = saveAgentLog(repo, s.pr, r));
+  try { findings = await runReviewer(cfg, prompt, cwd, keep); } catch (e) {
+    return { verdict: 'blocked', pr: s.pr, head: s.head, reason: `local reviewer failed: ${String(e.message).slice(0, 400)}`, ...(agentLog ? { agentLog } : {}) };
   }
   if (dirty(cwd) || git(['rev-parse', 'HEAD'], cwd) !== s.head) {
     return { verdict: 'blocked', pr: s.pr, head: s.head, reason: 'the local reviewer changed the checkout; review discarded' };
@@ -816,11 +820,11 @@ Do these steps in order, in this session:
 4. Resolve the threads you fixed; reply on the disputed ones.
 5. Gate: ${gate}. If it reports a gate failure, do not rerun \`prloop ready\` straight away: rerun the failing tests or step with their focused command, fix them (including failures you did not cause when they block the gate), commit and push, and call \`prloop ready\` again only when you are confident the full gate passes. At most 5 \`prloop ready\` calls; stop as blocked only if the same failure persists after 3 consecutive fix attempts, or the failure is environmental (missing tool, no network, permission denied), and report the exact failing step. If \`prloop ready\` fails for another reason, make one repair attempt, then stop as blocked.
 6. ${request}
-7. Exit by printing ONE JSON line as your final output:
+7. End your final message with this JSON on its own last line, always, also when you stop early or are blocked:
 {"status":"requested|blocked|nothing_to_do","head":"<sha>","fixed":["<thread ids>"],"disputed":["<thread ids>"],"reason":"<short>"}
 Use "blocked" with the reason when disputed findings remain unresolved.
 
-Never wait for or poll reviews, merge, touch other PRs, rewrite history except through \`prloop sync\`, or retry in a loop. A permission denial or a missing tool means stop immediately as blocked with the reason.`;
+Never wait for or poll reviews, merge, touch other PRs, rewrite history except through \`prloop sync\`, or retry in a loop. A denied action or a missing tool means stop immediately and report "blocked" with the denied command or missing tool named in "reason".`;
 }
 
 // Finds the agent's final JSON line, also inside a JSON wrapper such as `claude --output-format json`.
@@ -840,28 +844,41 @@ export function parseAgentResult(text) {
   return null;
 }
 
-// Why a CLI session ended without a result line, when its JSON wrapper says so; null otherwise.
+// Why a session ended without a result line: what the CLI JSON wrapper reports (error subtype, API error status,
+// permission denials, terminal reason), else the tail of the final message.
+const tail = (t) => String(t ?? '').trim().slice(-300);
 export function agentFailure(text) {
   const w = cliWrapper(text);
-  if (!w) return null;
-  if (w.permission_denials?.length) return `the agent session hit ${w.permission_denials.length} permission denial(s)`;
-  if (w.subtype === 'error_max_turns') return 'the agent session ended at its max-turns limit';
-  if (typeof w.subtype === 'string' && w.subtype.startsWith('error')) return `the agent session ended with ${w.subtype}`;
-  if (w.is_error) return `the agent session ended on an error: ${String(w.result ?? '').slice(0, 200)}`;
-  return null;
+  if (!w) return `the agent output had no parseable result line; it ended: ${tail(text) || '(empty)'}`;
+  const why = [];
+  if (w.subtype === 'error_max_turns') why.push('the agent session ended at its max-turns limit');
+  else if (typeof w.subtype === 'string' && w.subtype.startsWith('error')) why.push(`the agent session ended with ${w.subtype}`);
+  else if (w.is_error) why.push(`the agent session ended on an error: ${tail(w.result)}`);
+  if (w.api_error_status) why.push(`API error status ${w.api_error_status}`);
+  if (w.permission_denials?.length) {
+    const input = (i) => String(i?.command ?? i?.file_path ?? i?.url ?? JSON.stringify(i ?? '')).slice(0, 80);
+    why.push(`permission denied for ${w.permission_denials.map((d) => `${d.tool_name ?? 'a tool'} (${input(d.tool_input)})`).join(', ')}`);
+  }
+  if (w.terminal_reason && w.terminal_reason !== 'completed') why.push(`terminal reason ${w.terminal_reason}`);
+  return why.length ? why.join('; ') : `the agent output had no parseable result line; it ended: ${tail(w.result) || '(empty)'}`;
 }
 
-// Keeps each fix agent's raw output for diagnosis (owner-only), and prunes logs older than 14 days.
+// Keeps each spawned agent's raw output for diagnosis (owner-only); see pruneAgentLogs.
 export function saveAgentLog(repo, pr, r, now = Date.now()) {
   const dir = join(stateDir(), 'agents');
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  for (const f of readdirSync(dir)) {
-    try { if (now - statSync(join(dir, f)).mtimeMs > 14 * 864e5) rmSync(join(dir, f)); } catch { /* gone */ }
-  }
   const file = join(dir, `${repo.replace('/', '__')}__${pr}__${new Date(now).toISOString().replace(/[:.]/g, '-')}.log`);
   const final = r.final !== r.stdout ? `\n## final message\n${r.final}` : '';
   writeFileSync(file, `# exit status ${r.status}\n## stdout\n${r.stdout}\n## stderr\n${r.stderr}${final}\n`, { mode: 0o600 });
   return file;
+}
+
+// Run on startup of `run` and `wait`: deletes agent logs older than 14 days.
+export function pruneAgentLogs(now = Date.now()) {
+  const dir = join(stateDir(), 'agents');
+  for (const f of existsSync(dir) ? readdirSync(dir) : []) {
+    try { if (now - statSync(join(dir, f)).mtimeMs > 14 * 864e5) rmSync(join(dir, f)); } catch { /* gone */ }
+  }
 }
 
 const spawnAsync = (cmd, args, cwd) => new Promise((done) => {
@@ -916,6 +933,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
   const deadline = Date.now() + cfg.deadline;
   const { maxAgents, maxRounds } = cfg;
   mkdirSync(stateDir(), { recursive: true });
+  pruneAgentLogs();
   const log = join(stateDir(), `run-${new Date().toISOString().replace(/[:.]/g, '-')}.jsonl`);
   // Rounds and seen findings persist across runs on purpose; `prloop reset-rounds` resets the rounds once.
   const states = prs.map((n) => ({ ...loadState(repo, n), repo, pr: n, log, phase: 'polling', reason: undefined, next: undefined, agentLog: undefined }));
@@ -952,17 +970,17 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     const fail = (reason) => event(st, 'blocked', { reason, next: `a human decision is needed; the agent output is in ${agentLog}`, agentLog });
     const result = parseAgentResult(r.final);
     if (DENIED.test(`${r.final}\n${r.stderr}`)) return fail('the agent reported a permission denial');
-    if (r.status !== 0) return fail(`the agent exited with status ${r.status}: ${r.stderr.slice(-300)}`);
+    if (r.status !== 0) return fail(`the agent exited with status ${r.status}: ${cliWrapper(r.final) ? agentFailure(r.final) : tail(r.stderr)}`);
     const progressed = () => {
       const after = classify(fetchPr(repo, st.pr), cfg);
       return after.head !== s.head || after.unresolvedThreads.length < s.unresolvedThreads.length
         || after.trigger?.id !== s.trigger?.id || (!testedBefore && isTested(after.head, cwd));
     };
     if (!result) {
-      const reason = agentFailure(r.final) ?? 'the agent output had no parseable result line';
+      const reason = agentFailure(r.final);
       // A pushed head, resolved thread, request or gate is real progress: keep polling instead of blocking.
       if (!progressed()) return fail(reason);
-      logEvent(st, { phase: 'agent_no_result', reason, agentLog });
+      logEvent(st, { phase: 'agent_no_result', reason: `agent made progress without a result line (${reason})`, agentLog });
       return event(st, 'polling', { status: 'no_result' });
     }
     if (result.disputed?.length && result.status !== 'requested') {
@@ -1005,9 +1023,9 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
       if (!cwd) return block(st, `no worktree has ${s.branch} for a local review; pass --worktree`);
       if (!slot()) return;
       event(st, 'local_review');
-      const r = await localReview(repo, s, cfg, cwd);
-      if (!r) return event(st, 'polling', { verdict: 'local_review_posted' });
-      if (r.verdict === 'blocked') return block(st, r.reason);
+      const r = await localReview(repo, s, cfg, cwd, (p) => { st.agentLog = p; });
+      if (!r) return event(st, 'polling', { verdict: 'local_review_posted', agentLog: st.agentLog });
+      if (r.verdict === 'blocked') return r.agentLog ? event(st, 'blocked', { reason: r.reason, next: `a human decision is needed; the reviewer output is in ${r.agentLog}`, agentLog: r.agentLog }) : block(st, r.reason);
       return fix(st, s, cwd, { verdict: 'not_requested', trigger: 'local_review', missing: r.missing, localReview: true });
     }
     if (s.verdict === 'pending') return st.phase === 'waiting' ? undefined : event(st, 'waiting', { verdict: 'pending' });
@@ -1142,6 +1160,7 @@ export async function main(argv) {
       return out({ ready: !missing.length, pr: s.pr, head: s.head, missing, trigger: cfg.trigger }, missing.length ? EXIT.blocked : 0);
     }
     if (cmd === 'wait') {
+      pruneAgentLogs();
       const v = await waitFor(repo, prArg, cfg, { interval: cfg.interval });
       return out(v, EXIT[v.verdict]);
     }
