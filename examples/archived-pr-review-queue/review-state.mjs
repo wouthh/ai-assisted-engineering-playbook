@@ -1,5 +1,7 @@
 export const DEFAULT_SELECTED_REVIEWER = "codex";
 export const SUPPORTED_REVIEWERS = ["codex", "copilot"];
+// loginPattern is the reviewer bot's exact login (or a /regex/); replace these
+// placeholders with the logins your repository trusts.
 export const REVIEWER_CONFIGS = Object.freeze({
   codex: Object.freeze({
     key: "codex",
@@ -24,7 +26,6 @@ export const DEFAULT_REVIEWER_LOGIN_PATTERN =
   REVIEWER_CONFIGS[DEFAULT_SELECTED_REVIEWER].loginPattern;
 export const DEFAULT_REVIEW_REQUEST_COMMENT_BODY =
   REVIEWER_CONFIGS[DEFAULT_SELECTED_REVIEWER].requestCommentBody;
-const FALLBACK_REVIEWER_LOGIN_REGEX = /codex/i;
 
 export function isSupportedReviewer(value) {
   return SUPPORTED_REVIEWERS.includes(
@@ -84,11 +85,13 @@ export function buildReviewerLoginRegex(
     }
   }
 
-  try {
-    return new RegExp(escapeRegex(raw), "i");
-  } catch {
-    return buildFallbackReviewerLoginRegex(fallbackPatternSource);
-  }
+  return exactLoginRegex(raw);
+}
+
+// A plain pattern is the reviewer's complete login, compared case-insensitively.
+// Configure the exact bot login; a substring would admit other actors.
+function exactLoginRegex(login) {
+  return new RegExp(`^${escapeRegex(login)}$`, "i");
 }
 
 export function reviewerLoginMatches(
@@ -109,11 +112,7 @@ function buildFallbackReviewerLoginRegex(
   patternSource = DEFAULT_REVIEWER_LOGIN_PATTERN,
 ) {
   const raw = trimToNull(patternSource) ?? DEFAULT_REVIEWER_LOGIN_PATTERN;
-  try {
-    return new RegExp(escapeRegex(raw), "i");
-  } catch {
-    return FALLBACK_REVIEWER_LOGIN_REGEX;
-  }
+  return exactLoginRegex(raw);
 }
 
 function trimToNull(value) {
@@ -342,7 +341,12 @@ export function stripReviewerBoilerplate(body) {
       /Here are some automated review suggestions for this pull request\.\s*/iu,
       "",
     )
-    .replace(/<details>[\s\S]*?<\/details>/giu, "")
+    // Remove only the provider's own help block; any other details block may
+    // carry a finding.
+    .replace(
+      /<details>\s*<summary>[^<]*About (?:Codex|Copilot) in GitHub\s*<\/summary>[\s\S]*?<\/details>/giu,
+      "",
+    )
     .replace(/\s+/g, " ")
     .trim();
 }
