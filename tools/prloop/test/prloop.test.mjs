@@ -901,7 +901,7 @@ test('the fix prompt carries only the trigger data and the contract', () => {
   assert.match(buildPrompt({ repo: 'o/n', pr: 1, trigger: 'conflict', conflicts: ['a.txt'], localReview: true }), /Conflicted files: a\.txt[\s\S]*Do not post a review request/);
 });
 
-test('a passed gate is cached by clean tree and command: no second run, until the tree, the command or --force-gate changes', async (t) => {
+test('a passed gate is cached by exact clean head, repository and command: no second run, until one changes or --force-gate', async (t) => {
   tempState(t);
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
@@ -910,11 +910,10 @@ test('a passed gate is cached by clean tree and command: no second run, until th
   const gate = `echo a >> "${runs}"`;
   const deps = { ...idle(), dir: join(r.dir, 'slots') };
   let head = r.run(r.work, 'rev-parse', 'HEAD');
-  const tree = r.run(r.work, 'rev-parse', 'HEAD^{tree}');
   assert.deepEqual(await readyGate({ branch: 'feat', head }, { ...cfg, gate }, r.work, deps), { ok: true });
   assert.equal(count(), 1);
   unmarkTested(head, r.work);
-  assert.deepEqual(await readyGate({ branch: 'feat', head }, { ...cfg, gate }, r.work, deps), { ok: true, cached: tree }); // hit
+  assert.deepEqual(await readyGate({ branch: 'feat', head }, { ...cfg, gate }, r.work, deps), { ok: true, cached: head }); // hit
   assert.equal(count(), 1);
   assert.equal(isTested(head, r.work), true);
   unmarkTested(head, r.work);
@@ -926,17 +925,23 @@ test('a passed gate is cached by clean tree and command: no second run, until th
   writeFileSync(join(r.work, 'scratch.txt'), 'x\n');
   assert.equal(gatePassed(gate, r.work), null); // a dirty tree never hits
   rmSync(join(r.work, 'scratch.txt'));
-  assert.equal(gatePassed(gate, r.work), tree);
+  assert.equal(gatePassed(gate, r.work), head);
+  const twin = gitRepo(); // another repository whose HEAD tree is identical
+  t.after(() => rmSync(twin.dir, { recursive: true, force: true }));
+  assert.equal(twin.run(twin.work, 'rev-parse', 'HEAD^{tree}'), r.run(r.work, 'rev-parse', 'HEAD^{tree}'));
+  assert.equal(gatePassed(gate, twin.work), null);
+  r.run(r.work, 'commit', '-q', '--allow-empty', '-m', 'metadata only'); // same tree, new head
+  assert.equal(gatePassed(gate, r.work), null);
   r.commit('change', { 'app.txt': 'changed\n' });
   head = r.run(r.work, 'rev-parse', 'HEAD');
-  assert.equal(gatePassed(gate, r.work), null); // the tree changed
+  assert.equal(gatePassed(gate, r.work), null); // the head changed
   await readyGate({ branch: 'feat', head }, { ...cfg, gate }, r.work, deps);
   assert.equal(count(), 4);
   // A gate the caller ran itself is recorded by mark-tested --gate, so ready does not rerun it.
   const other = 'npm test';
   const res = spawnSync(process.execPath, [PRLOOP, 'mark-tested', '--gate', other], { cwd: r.work, encoding: 'utf8', env: { ...process.env, PRLOOP_LOCK_TOKEN: '' } });
-  assert.equal(JSON.parse(res.stdout).gatePassedTree, r.run(r.work, 'rev-parse', 'HEAD^{tree}'), res.stderr);
-  assert.equal(gatePassed(other, r.work), r.run(r.work, 'rev-parse', 'HEAD^{tree}'));
+  assert.equal(JSON.parse(res.stdout).gatePassedHead, head, res.stderr);
+  assert.equal(gatePassed(other, r.work), head);
 });
 
 // Points the state directory at a temporary one for the duration of a test.
