@@ -169,7 +169,7 @@ export function config(opts, env = process.env) {
 
 const PR_QUERY = `query($owner:String!,$name:String!,$pr:Int!){viewer{login} repository(owner:$owner,name:$name){
   mergeCommitAllowed squashMergeAllowed rebaseMergeAllowed
-  pullRequest(number:$pr){number url state headRefName reactions(last:50){nodes{content createdAt user{login}}} baseRefName baseRefOid headRefOid mergeable mergeStateStatus mergeCommit{oid}
+  pullRequest(number:$pr){number url state headRefName reactions(last:50){pageInfo{hasPreviousPage} nodes{content createdAt user{login}}} baseRefName baseRefOid headRefOid mergeable mergeStateStatus mergeCommit{oid}
     timelineItems(last:1,itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT]){nodes{... on HeadRefForcePushedEvent{createdAt}}}
     commits(last:1){nodes{commit{oid committedDate}}}
     reviewThreads(first:100){pageInfo{hasNextPage} nodes{id isResolved isOutdated path line comments(first:100){pageInfo{hasNextPage} nodes{body createdAt author{login} pullRequestReview{state}}}}}
@@ -269,11 +269,12 @@ export function classify(pr, cfg, nowMs = Date.now()) {
   // A requested review reacts on the request, or on the PR body after the request. Without a request, PR-body reactions
   // count only once the bot has started (👀) after this head, so a late 👍 from a review of the previous head cannot clear this one.
   // PR-body reactions carry no commit or request: with a request, a body 👍 counts only after this cycle's 👀, or when no
-  // earlier review cycle exists (no older request, no earlier bot reaction on the PR body, full history seen) that could finish late.
+  // earlier review cycle exists (no older request, no earlier bot reaction on the PR body, full comment and reaction history seen)
+  // that could finish late.
   const bodyReactions = (pr.reactions?.nodes ?? []).filter((r) => isBot(r) && r.createdAt >= headTime);
   const ackAt = [...(current ? triggerNode.reactions.nodes.filter((r) => r.createdAt >= since) : []), ...bodyReactions]
     .filter((r) => isBot(r) && r.content === 'EYES').map((r) => r.createdAt).sort()[0];
-  const earlierCycle = !current || pr.comments.pageInfo?.hasPreviousPage
+  const earlierCycle = !current || pr.comments.pageInfo?.hasPreviousPage || pr.reactions?.pageInfo?.hasPreviousPage
     || pr.comments.nodes.some((c) => !isBot(c) && c.createdAt < triggerNode.createdAt && c.body.toLowerCase().includes(cfg.trigger.toLowerCase()))
     || (pr.reactions?.nodes ?? []).some((r) => isBot(r) && r.createdAt < headTime);
   const bodyOk = (r) => r.content === 'EYES' || !earlierCycle || (!!ackAt && r.createdAt >= ackAt);
@@ -1194,7 +1195,9 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     const prompt = buildPrompt(t);
     if (cfg.agent === 'none') return event(st, 'needs_agent', { verdict: v.verdict, prompt, next: 'spawn an agent with this prompt, then rerun prloop run' });
     event(st, 'agent', { verdict: v.verdict });
-    const testedBefore = isTested(s.head, cwd);
+    // With a configured gate, progress is that gate's pass: a generic marker may come from another gate.
+    const tested = (sha) => (cfg.gate ? gatePassed(cfg.gate, cwd) === sha : isTested(sha, cwd));
+    const testedBefore = tested(s.head);
     const r = await runFixAgent({ ...cfg, lock }, prompt, cwd);
     lock.release(); // the spawn ended; the progress check below only reads
     addUsage(st, r.stdout);
@@ -1207,7 +1210,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     const progressed = () => {
       const after = classify(fetchPr(repo, st.pr), cfg);
       return after.head !== s.head || after.unresolvedThreads.length < s.unresolvedThreads.length
-        || after.trigger?.id !== s.trigger?.id || (!testedBefore && isTested(after.head, cwd));
+        || after.trigger?.id !== s.trigger?.id || (!testedBefore && tested(after.head));
     };
     if (!result) {
       const reason = agentFailure(r.final);
