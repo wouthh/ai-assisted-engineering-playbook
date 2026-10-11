@@ -49,8 +49,22 @@ State what each command proves and which environment is authoritative.
 4. Verify whether Codex automatic review starts on PR creation. Inspect the PR-body reactions and review-request reactions as well as reviews, inline threads, ordinary comments, resolution states, checks and change requests. Do not duplicate a running automatic cycle; request `@codex review` if needed.
 5. Treat eyes as acknowledgement, not completion. A Codex thumbs-up can be clean completion only when attributable to the latest head and cycle; stale/ambiguous reactions and silence do not qualify, and bot review does not replace required human approval. Record reviewer or tool identity, automated or human review type, exact head, scope and coverage, outcome, and remaining findings. A clean automated review is evidence of that recorded automated outcome only; record any actual human inspection or acceptance separately.
 6. Fix valid in-scope findings narrowly, add normal commits, validate, push, inspect the hosted diff, reply with fixing SHA/evidence, then resolve. Explain incorrect feedback and resolve only when clearly non-blocking. Keep ambiguous or disputed security concerns open; route out-of-scope issues for a decision.
-7. Every substantive head needs a fresh completed review. Repeat until no actionable finding, unresolved relevant thread, outstanding change request, failed applicable check, or conflict remains. Use bounded review polling (normally 30–60 seconds, up to about 15 minutes per cycle); hand off the exact pending head if unavailable.
+7. Every substantive head needs a fresh completed review. Repeat until no actionable finding, unresolved relevant thread, outstanding change request, failed applicable check, or conflict remains. Use bounded review polling, preferably through the PR review loop below; hand off the exact pending head if unavailable.
 8. Leave the PR for human review unless merging is authorized. Re-query all gates immediately before an authorized GitHub merge, use an expected-head guard, follow the repository merge method, and never use admin bypass. Verify the live target afterward; delete only the merged feature branch when cleanup is authorized. Deployment and rollback have separate checkpoints.
+
+## PR review loop
+
+Install [`prloop`](https://github.com/wouthh/ai-assisted-engineering-playbook/tree/main/tools/prloop) on `PATH` (a symlink to `bin/prloop` is enough). It waits for the review bot and prints one JSON verdict; it never posts or fixes anything. Remove this section if the project does not use an automated reviewer.
+
+1. Implement the change, run the full local gate above, commit and push.
+2. `prloop mark-tested` once the gate passes on the pushed head.
+3. Reply to and resolve every addressed review thread.
+4. `prloop ready <pr>`; if it fails, fix exactly what it lists.
+5. Post the review request once (default `@codex review`; configure other bots with `PRLOOP_REVIEWER_LOGIN`, `PRLOOP_TRIGGER` and `PRLOOP_CLEAN_REGEX`).
+6. `prloop wait <pr>`, then act on the verdict: `clean` (0) stop or hand over for merge; `findings` (10) fix and restart at step 1; `not_requested` (20) restart at step 4; `requested_while_unresolved` (21) resolve threads, then step 4; `timeout` (30) run `prloop ready`, then repost `rerequestBody` unchanged; `error` (40) report.
+7. If GitHub reports the branch behind or conflicting, run `prloop sync <pr>` in the PR checkout and restart at step 1; on `conflict` (41) resolve the listed files by hand.
+
+Failsafes: stop and report on `blocked` (50) or `error`, after the project's round limit (default 8), or when the same finding returns after two fixes. Never poll GitHub manually, never post a second request while one is running on the same head, and never loop without new commits, replies or resolved threads.
 
 ## Instruction maintenance
 
