@@ -68,7 +68,7 @@ With [`prloop`](../../tools/prloop/README.md), the same gate and review wait cou
 ```bash
 prloop run --repo example-org/order-service --pr 12 \
   --gate "python3 -m unittest discover -s examples/fictional-order-service/tests" \
-  --gate-tmpdir /var/tmp &
+  --gate-tmpdir /var/tmp --deadline 6h &
 prloop run --status --repo example-org/order-service
 ```
 
