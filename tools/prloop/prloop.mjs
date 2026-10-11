@@ -341,7 +341,8 @@ const GiB = 2 ** 30;
 const SLOT_POLL = 5e3;
 const gib = (b) => (b / GiB).toFixed(1);
 const logStderr = (e) => console.error(JSON.stringify({ at: new Date().toISOString(), ...e }));
-export const slotDir = () => join(process.env.XDG_RUNTIME_DIR || '/tmp', 'prloop-slots');
+// Per user: without XDG_RUNTIME_DIR (cron, CI, sudo) a shared /tmp path would collide between accounts.
+export const slotDir = () => (process.env.XDG_RUNTIME_DIR ? join(process.env.XDG_RUNTIME_DIR, 'prloop-slots') : join('/tmp', `prloop-slots-${process.getuid?.() ?? 'user'}`));
 
 // MemAvailable counts reclaimable page cache; os.freemem() does not, so it is only the fallback.
 export function machineMetrics() {
@@ -364,9 +365,8 @@ export function admitStep(w, cfg, m, now, log) {
   return 'expired';
 }
 
-// Blocks until admitted; checks every --interval.
-export async function admit(cfg, { metrics = machineMetrics, now = Date.now, pause = sleep, log = logStderr } = {}) {
-  const w = {};
+// Blocks until admitted; checks every --interval. Pass the same `w` to keep one wait period across calls.
+export async function admit(cfg, { metrics = machineMetrics, now = Date.now, pause = sleep, log = logStderr } = {}, w = {}) {
   for (;;) {
     const r = admitStep(w, cfg, metrics(), now(), log);
     if (r !== 'wait') return r;
@@ -376,42 +376,54 @@ export async function admit(cfg, { metrics = machineMetrics, now = Date.now, pau
 
 const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
 
-// A slot file holds its owner's PID. It is stale when that process is gone (killed or crashed), or when it is
-// still empty a minute after creation; a file that vanished meanwhile counts as free.
-function staleSlot(f) {
-  try {
-    const pid = Number(readFileSync(f, 'utf8'));
-    return Number.isSafeInteger(pid) && pid > 0 ? !alive(pid) : Date.now() - statSync(f).mtimeMs > 60e3;
-  } catch (e) { return e.code === 'ENOENT'; }
+function ensureSlotDir(dir) {
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const st = lstatSync(dir);
+  if (!st.isDirectory() || (process.getuid && st.uid !== process.getuid()) || (st.mode & 0o022)) {
+    throw new Error(`gate slot directory ${dir} must be a directory owned by you and writable only by you`);
+  }
 }
 
-// Takes the first free of `slots` slot files with an exclusive create; returns a release function or null.
+// Slot claims are files named slot-<i>.<pid>.<n>. A claim whose process is gone (killed, crashed) is stale and
+// removed; its name is unique, so removing it can never delete a live claim.
+let claims = 0;
+const liveClaims = (dir, i, mine) => readdirSync(dir).filter((f) => {
+  const m = /^slot-(\d+)\.(\d+)\.\d+$/.exec(f);
+  if (!m || Number(m[1]) !== i || f === mine) return false;
+  if (alive(Number(m[2]))) return true;
+  rmSync(join(dir, f), { force: true });
+  return false;
+});
+
+// Takes the first free of `slots` slots; returns a release function or null. A process writes its claim and then
+// keeps it only if no other live claim exists for that slot: of two racing claims, the later check always sees
+// the earlier claim, so at most one keeps the slot (both may back off and retry on the next poll).
 export function acquireSlot(dir, slots, pid = process.pid) {
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  ensureSlotDir(dir);
   for (let i = 0; i < slots; i++) {
-    const f = join(dir, `slot-${i}`);
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        writeFileSync(f, `${pid}\n`, { flag: 'wx' });
-        return () => { try { if (readFileSync(f, 'utf8') === `${pid}\n`) rmSync(f); } catch { /* already gone */ } };
-      } catch (e) { if (e.code !== 'EEXIST') throw e; }
-      if (!staleSlot(f)) break;
-      // ponytail: two processes freeing the same stale file at once can briefly exceed N; files only go stale when a process dies.
-      rmSync(f, { force: true });
-    }
+    if (liveClaims(dir, i).length) continue;
+    const name = `slot-${i}.${pid}.${claims++}`;
+    writeFileSync(join(dir, name), '', { flag: 'wx' });
+    if (!liveClaims(dir, i, name).length) return () => rmSync(join(dir, name), { force: true });
+    rmSync(join(dir, name), { force: true });
   }
   return null;
 }
 
-export const slotsInUse = (dir) => { try { return readdirSync(dir).filter((f) => /^slot-\d+$/.test(f) && !staleSlot(join(dir, f))).length; } catch { return 0; } };
+export const slotsInUse = (dir) => {
+  try { return new Set(readdirSync(dir).flatMap((f) => { const m = /^slot-(\d+)\.(\d+)\.\d+$/.exec(f); return m && alive(Number(m[2])) ? [m[1]] : []; })).size; } catch { return 0; }
+};
 
 // Runs `gate` after admission, holding a machine-wide slot, optionally with a private TMPDIR that is removed
-// afterwards (a full test suite can fill a small tmpfs /tmp). Returns spawnSync's result.
+// afterwards (a full test suite can fill a small tmpfs /tmp). Admission is rechecked on every slot poll, so a
+// gate never starts on a machine that became busy while it waited. Returns spawnSync's result.
 export async function runGate(gate, cwd, cfg, deps = {}) {
   const { dir = slotDir(), pause = sleep, log = logStderr } = deps;
-  const slots = (await admit(cfg, deps)) === 'expired' ? 1 : cfg.gateSlots;
+  const w = {};
   let release, logged = false;
-  while (!(release = acquireSlot(dir, slots))) {
+  for (;;) {
+    const slots = (await admit(cfg, deps, w)) === 'expired' ? 1 : cfg.gateSlots;
+    if ((release = acquireSlot(dir, slots))) break;
     if (!logged) { logged = true; log({ event: 'waiting_for_gate_slot', slots, inUse: slotsInUse(dir) }); }
     await pause(SLOT_POLL);
   }
@@ -812,16 +824,44 @@ Never wait for or poll reviews, merge, touch other PRs, rewrite history except t
 }
 
 // Finds the agent's final JSON line, also inside a JSON wrapper such as `claude --output-format json`.
+const cliWrapper = (text) => { try { const w = JSON.parse(String(text ?? '')); return w && typeof w === 'object' ? w : null; } catch { return null; } };
+
+// The last flat JSON object with a known status anywhere in the agent's final message: on its own line, inline,
+// or pretty-printed inside a ```json fence. With `--output-format json` the CLI wrapper's `result` is searched.
 export function parseAgentResult(text) {
-  let body = String(text ?? '');
-  try { const w = JSON.parse(body); if (typeof w?.result === 'string') body = w.result; } catch { /* plain text */ }
-  for (const line of body.trim().split('\n').reverse()) {
+  const w = cliWrapper(text);
+  const body = typeof w?.result === 'string' ? w.result : String(text ?? '');
+  for (const m of [...body.matchAll(/\{[^{}]*"status"[^{}]*\}/g)].reverse()) {
     try {
-      const r = JSON.parse(line.trim().replace(/^`+|`+$/g, ''));
+      const r = JSON.parse(m[0]);
       if (['requested', 'blocked', 'nothing_to_do'].includes(r?.status)) return { fixed: [], disputed: [], ...r };
     } catch { /* keep looking */ }
   }
   return null;
+}
+
+// Why a CLI session ended without a result line, when its JSON wrapper says so; null otherwise.
+export function agentFailure(text) {
+  const w = cliWrapper(text);
+  if (!w) return null;
+  if (w.permission_denials?.length) return `the agent session hit ${w.permission_denials.length} permission denial(s)`;
+  if (w.subtype === 'error_max_turns') return 'the agent session ended at its max-turns limit';
+  if (typeof w.subtype === 'string' && w.subtype.startsWith('error')) return `the agent session ended with ${w.subtype}`;
+  if (w.is_error) return `the agent session ended on an error: ${String(w.result ?? '').slice(0, 200)}`;
+  return null;
+}
+
+// Keeps each fix agent's raw output for diagnosis (owner-only), and prunes logs older than 14 days.
+export function saveAgentLog(repo, pr, r, now = Date.now()) {
+  const dir = join(stateDir(), 'agents');
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  for (const f of readdirSync(dir)) {
+    try { if (now - statSync(join(dir, f)).mtimeMs > 14 * 864e5) rmSync(join(dir, f)); } catch { /* gone */ }
+  }
+  const file = join(dir, `${repo.replace('/', '__')}__${pr}__${new Date(now).toISOString().replace(/[:.]/g, '-')}.log`);
+  const final = r.final !== r.stdout ? `\n## final message\n${r.final}` : '';
+  writeFileSync(file, `# exit status ${r.status}\n## stdout\n${r.stdout}\n## stderr\n${r.stderr}${final}\n`, { mode: 0o600 });
+  return file;
 }
 
 const spawnAsync = (cmd, args, cwd) => new Promise((done) => {
@@ -878,12 +918,12 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
   mkdirSync(stateDir(), { recursive: true });
   const log = join(stateDir(), `run-${new Date().toISOString().replace(/[:.]/g, '-')}.jsonl`);
   // Rounds and seen findings persist across runs on purpose; `prloop reset-rounds` resets the rounds once.
-  const states = prs.map((n) => ({ ...loadState(repo, n), repo, pr: n, log, phase: 'polling', reason: undefined, next: undefined }));
+  const states = prs.map((n) => ({ ...loadState(repo, n), repo, pr: n, log, phase: 'polling', reason: undefined, next: undefined, agentLog: undefined }));
   const busy = new Map();
   const event = (st, phase, extra = {}) => {
     Object.assign(st, { phase, updatedAt: new Date().toISOString() }, extra);
     saveState(st);
-    logEvent(st, { phase, ...pick(extra, ['verdict', 'reason', 'status']) });
+    logEvent(st, { phase, ...pick(extra, ['verdict', 'reason', 'status', 'agentLog']) });
   };
   const block = (st, reason, next = 'a human decision is needed') => event(st, 'blocked', { reason, next });
   // One resource wait for the whole run: the machine is the same for every PR.
@@ -908,18 +948,28 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     event(st, 'agent', { verdict: v.verdict });
     const testedBefore = isTested(s.head, cwd);
     const r = await runFixAgent(cfg, prompt, cwd);
+    const agentLog = st.agentLog = saveAgentLog(repo, st.pr, r);
+    const fail = (reason) => event(st, 'blocked', { reason, next: `a human decision is needed; the agent output is in ${agentLog}`, agentLog });
     const result = parseAgentResult(r.final);
-    if (DENIED.test(`${r.final}\n${r.stderr}`)) return block(st, 'the agent reported a permission denial');
-    if (r.status !== 0) return block(st, `the agent exited with status ${r.status}: ${r.stderr.slice(-300)}`);
-    if (!result) return block(st, 'the agent output had no parseable result line');
+    if (DENIED.test(`${r.final}\n${r.stderr}`)) return fail('the agent reported a permission denial');
+    if (r.status !== 0) return fail(`the agent exited with status ${r.status}: ${r.stderr.slice(-300)}`);
+    const progressed = () => {
+      const after = classify(fetchPr(repo, st.pr), cfg);
+      return after.head !== s.head || after.unresolvedThreads.length < s.unresolvedThreads.length
+        || after.trigger?.id !== s.trigger?.id || (!testedBefore && isTested(after.head, cwd));
+    };
+    if (!result) {
+      const reason = agentFailure(r.final) ?? 'the agent output had no parseable result line';
+      // A pushed head, resolved thread, request or gate is real progress: keep polling instead of blocking.
+      if (!progressed()) return fail(reason);
+      logEvent(st, { phase: 'agent_no_result', reason, agentLog });
+      return event(st, 'polling', { status: 'no_result' });
+    }
     if (result.disputed?.length && result.status !== 'requested') {
       return event(st, 'needs_human', { status: result.status, reason: `disputed findings: ${result.disputed.join(', ')}`, next: 'decide the disputed threads' });
     }
-    if (result.status === 'blocked') return block(st, `agent: ${result.reason ?? 'blocked'}`);
-    const after = classify(fetchPr(repo, st.pr), cfg);
-    const progressed = after.head !== s.head || after.unresolvedThreads.length < s.unresolvedThreads.length
-      || after.trigger?.id !== s.trigger?.id || (!testedBefore && isTested(after.head, cwd));
-    if (!progressed) return block(st, `agent made no progress (${result.status}): no commit, resolved thread, request or gate`);
+    if (result.status === 'blocked') return fail(`agent: ${result.reason ?? 'blocked'}`);
+    if (!progressed()) return fail(`agent made no progress (${result.status}): no commit, resolved thread, request or gate`);
     event(st, 'polling', { status: result.status });
   }
 
@@ -996,7 +1046,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     await Promise.race([sleep(cfg.interval), ...busy.values()]);
   }
   return states.map((st) => ({ pr: st.pr, verdict: st.phase === 'needs_agent' ? st.verdict : st.phase, reason: st.reason, head: st.head,
-    rounds: st.rounds, next: st.next, ...(st.prompt && st.phase === 'needs_agent' ? { prompt: st.prompt } : {}) }));
+    rounds: st.rounds, next: st.next, ...(st.agentLog ? { agentLog: st.agentLog } : {}), ...(st.prompt && st.phase === 'needs_agent' ? { prompt: st.prompt } : {}) }));
 }
 
 const pick = (o, keys) => Object.fromEntries(keys.filter((k) => o[k] !== undefined).map((k) => [k, o[k]]));
@@ -1015,7 +1065,7 @@ export function runStatus(repoFilter, last = 5) {
       let events = [];
       for (const f of [st.log, ...logs].filter(Boolean)) if ((events = read(f).filter(mine(f))).length) break;
       return { repo: st.repo, pr: st.pr, phase: st.phase, head: short(st.head), rounds: st.rounds, roundResets: st.roundResets, reason: st.reason, next: st.next,
-        updatedAt: st.updatedAt, carry: st.carry, events: events.slice(-last) };
+        updatedAt: st.updatedAt, carry: st.carry, agentLog: st.agentLog, events: events.slice(-last) };
     });
   return { prs };
 }
@@ -1040,11 +1090,12 @@ export function selfCheck(dir) {
   const current = tryGit(['branch', '--show-current'], dir);
   if (current !== branch) problems.push(`is on ${current || 'a detached HEAD'}, not ${branch}`);
   let note;
+  // ls-remote only reads: no fetched objects, refs or FETCH_HEAD are written.
   try {
-    sh('git', ['fetch', '--quiet', 'origin', branch], { cwd: dir, timeout: 10e3, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } });
-    const behind = Number(git(['rev-list', '--count', 'HEAD..FETCH_HEAD'], dir));
-    if (behind) problems.push(`is ${behind} commit(s) behind origin/${branch}`);
-  } catch { note = `could not fetch origin ${branch} within 10s; skipped the behind check`; }
+    const remote = sh('git', ['ls-remote', '--exit-code', 'origin', `refs/heads/${branch}`], { cwd: dir, timeout: 10e3, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } }).split(/\s/)[0];
+    // Behind unless the remote tip is HEAD or already contained in it; an unknown commit is newer work.
+    if (tryGit(['merge-base', '--is-ancestor', remote, 'HEAD'], dir) === null) problems.push(`is behind origin/${branch}`);
+  } catch { note = `could not read origin ${branch} within 10s; skipped the behind check`; }
   if (!problems.length) return note ? { note } : null;
   return { note, warning: `prloop checkout ${dir} ${problems.join(', ')}: update it with \`git -C ${dir} pull --ff-only\` on ${branch}, and move local changes to a PR` };
 }
