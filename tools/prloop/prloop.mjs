@@ -38,10 +38,13 @@ Options (flag or env):
   --agent claude|codex|none PRLOOP_AGENT           fix agent and local reviewer; --model, --effort
 
 Exit codes: 0 clean/ok/merged, 10 findings, 20 not_requested, 21 requested_while_unresolved, 22 not_tested,
-            30 timeout, 31 unavailable, 40 error, 41 conflict, 50 blocked / not ready / needs a human.`;
+            30 timeout, 31 unavailable, 40 error, 41 conflict, 50 blocked / not ready / needs a human / merge pending.`;
 
 // ---------- small helpers ----------
 
+const FLAGS = new Set(['help', 'status']);
+
+// Every option except FLAGS takes a value; a missing one fails instead of becoming `true`.
 export function parseArgs(argv) {
   const out = { _: [], union: [] };
   for (let i = 0; i < argv.length; i++) {
@@ -49,7 +52,8 @@ export function parseArgs(argv) {
     if (!a.startsWith('--')) { out._.push(a); continue; }
     const [k, inline] = a.slice(2).split(/=(.*)/s);
     const key = k.replace(/-(\w)/g, (_, c) => c.toUpperCase());
-    const val = inline ?? (argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[++i] : true);
+    const val = FLAGS.has(key) ? true : inline ?? (argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[++i] : undefined);
+    if (val === undefined) throw new Error(`--${k} needs a value`);
     if (key === 'union') out.union.push(val); else out[key] = val;
   }
   return out;
@@ -295,7 +299,11 @@ export function readyGate(s, gate, cwd) {
   return { ok: false, status: r.status, tail: String(r.stdout ?? r.error?.message ?? '').trimEnd().split('\n').slice(-60).join('\n') };
 }
 
-const clearTested = (cwd) => { const f = markerFile(cwd); if (f) rmSync(f, { force: true }); };
+// Drops only `sha`, so syncing one PR keeps the markers of other PR heads in the same repository.
+export function unmarkTested(sha, cwd) {
+  const f = markerFile(cwd);
+  if (f && existsSync(f)) writeFileSync(f, readFileSync(f, 'utf8').split('\n').filter((l) => l && l !== sha).map((l) => `${l}\n`).join(''));
+}
 
 export function localGate(s, cwd) {
   const reasons = [];
@@ -385,7 +393,7 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
   }
   const push = rebase ? ['push', `--force-with-lease=${branch}:${head}`, headRemote, `HEAD:${branch}`] : ['push', headRemote, `HEAD:${branch}`];
   if (!step(push)) return { verdict: 'error', error: 'push failed; the branch is updated locally only' };
-  clearTested(cwd);
+  unmarkTested(head, cwd);
   const newHead = git(['rev-parse', 'HEAD'], cwd);
   return { verdict: 'synced', method: rebase ? 'rebase' : 'merge', head: newHead, previousHead: head, next: 'head changed: run your gate, `prloop mark-tested`, then request a review' };
 }
@@ -473,7 +481,7 @@ export function localReviewPayload(head, findings, inline = true) {
 async function runReviewer(cfg, prompt, cwd) {
   const dir = mkdtempSync(join(tmpdir(), 'prloop-review-'));
   try {
-    if (cfg.agent === 'codex') { // any other agent setting, including none, reviews with claude
+    if (cfg.agent === 'codex') { // otherwise claude; localReview never gets here with --agent none
       writeFileSync(join(dir, 'schema.json'), JSON.stringify(REVIEW_SCHEMA));
       const r = await spawnAsync('codex', ['exec', '--sandbox', 'read-only', '--output-schema', join(dir, 'schema.json'), '-o', join(dir, 'out.json'),
         ...(cfg.model ? ['-m', cfg.model] : []), ...(cfg.effort ? ['-c', `model_reasoning_effort=${cfg.effort}`] : []), prompt], cwd);
@@ -499,6 +507,8 @@ Return JSON {"findings":[{"path","line","severity":"P0".."P3","body"}]} with "li
 // Runs one read-only review of the current head in `cwd` and posts it. Returns a verdict to stop on,
 // or null when the result was posted and the next poll should classify it.
 export async function localReview(repo, s, cfg, cwd) {
+  if (cfg.agent === 'none') return { verdict: 'blocked', pr: s.pr, head: s.head,
+    reason: '--agent none runs no local reviewer: review the head yourself or rerun with --agent claude or codex' };
   const missing = s.unresolvedThreads.length ? [`${s.unresolvedThreads.length} unresolved threads`] : [];
   missing.push(...localGate(s, cwd));
   if (missing.length) return { verdict: 'not_requested', pr: s.pr, head: s.head, missing, next: `a local review needs: ${missing.join('; ')}` };
@@ -768,16 +778,17 @@ export function runStatus(repoFilter) {
   return { prs, events };
 }
 
-// blocked wins; otherwise the first verdict that still needs action; 0 when all are done.
+// blocked (also a merge still pending) wins; otherwise the first verdict that still needs action; 0 when all are done.
 export function runExitCode(results) {
-  const codes = results.map((r) => (['needs_human', 'deadline'].includes(r.verdict) ? EXIT.blocked : EXIT[r.verdict] ?? 0));
+  const codes = results.map((r) => (['needs_human', 'deadline', 'merge_pending'].includes(r.verdict) ? EXIT.blocked : EXIT[r.verdict] ?? 0));
   return codes.includes(EXIT.blocked) ? EXIT.blocked : codes.find(Boolean) ?? 0;
 }
 
 // ---------- CLI ----------
 
 export async function main(argv) {
-  const opts = parseArgs(argv);
+  let opts;
+  try { opts = parseArgs(argv); } catch (e) { console.log(JSON.stringify({ verdict: 'error', error: e.message })); return EXIT.error; }
   const [cmd, prArg] = opts._;
   if (!cmd || opts.help || cmd === 'help') { console.log(HELP); return 0; }
   const out = (obj, code) => { console.log(JSON.stringify(obj)); return code; };
