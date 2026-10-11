@@ -537,23 +537,19 @@ export function markTested(sha, cwd) {
   return full;
 }
 
-// Rewrites the lines of a shared state file under an exclusive <file>.lock, so concurrent `ready` processes
-// cannot lose each other's updates (a failed gate's removal undone by another gate's stale rewrite). A lock
-// whose owner died is removed. The new content is written to a temporary file and renamed into place.
+// Rewrites the lines of a shared state file under an exclusive lock, so concurrent `ready` processes cannot
+// lose each other's updates (a failed gate's removal undone by another gate's stale rewrite). The lock is a
+// one-slot claim directory <file>.lock.d (see acquireSlot): a dead owner's claim has a unique name, so removing
+// it can never delete a live claim. The new content is written to a temporary file and renamed into place.
 export function editLines(f, edit, { pid = process.pid } = {}) {
-  const lock = `${f}.lock`, wait = new Int32Array(new SharedArrayBuffer(4));
-  for (;;) {
-    try { writeFileSync(lock, `${pid} ${procStart(pid) ?? ''}`, { flag: 'wx' }); break; } catch (e) { if (e.code !== 'EEXIST') throw e; }
-    let owner;
-    try { owner = readFileSync(lock, 'utf8').split(' '); } catch { continue; }
-    if (owner[0] && !alive(Number(owner[0]), owner[1])) { rmSync(lock, { force: true }); continue; }
-    Atomics.wait(wait, 0, 0, 20);
-  }
+  const wait = new Int32Array(new SharedArrayBuffer(4));
+  let release;
+  while (!(release = acquireSlot(`${f}.lock.d`, 1, pid))) Atomics.wait(wait, 0, 0, 10 + Math.random() * 20);
   try {
     const lines = existsSync(f) ? readFileSync(f, 'utf8').split('\n').filter(Boolean) : [];
-    writeFileSync(`${lock}.tmp`, edit(lines).map((l) => `${l}\n`).join(''));
-    renameSync(`${lock}.tmp`, f);
-  } finally { rmSync(lock, { force: true }); }
+    writeFileSync(`${f}.tmp`, edit(lines).map((l) => `${l}\n`).join(''));
+    renameSync(`${f}.tmp`, f);
+  } finally { release(); }
 }
 
 // Passed gates, keyed by the clean checkout's exact HEAD, its repository and the gate command, since a gate may

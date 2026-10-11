@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import {
-  EXIT, OUTPUT_TAIL, main, slotDir, agentFailure, saveAgentLog, pruneAgentLogs, takeLock, lockHolder, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, unmarkTested, editLines, agentEnv, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, syncBranch, unionLines, waitFor,
+  EXIT, OUTPUT_TAIL, main, slotDir, agentFailure, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, unmarkTested, editLines, agentEnv, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, syncBranch, unionLines, waitFor,
 } from '../prloop.mjs';
 
 const pick = (o, keys) => Object.fromEntries(keys.map((k) => [k, o[k]]));
@@ -969,21 +969,27 @@ test('a passed gate is cached by exact clean head, repository and command: no se
 test('validation state edits are serialized: a writer waits for a live lock and takes over a dead one', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'prloop-edit-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
-  const f = join(dir, 'prloop-tested');
+  const f = join(dir, 'prloop-tested'), lock = `${f}.lock.d`;
   writeFileSync(f, 'X\n');
   const holder = spawn('sleep', ['30']);
   t.after(() => holder.kill());
-  writeFileSync(`${f}.lock`, `${holder.pid}`); // another ready process is mid-update
-  const writer = spawn(process.execPath, ['--input-type=module', '-e',
-    `import { editLines } from ${JSON.stringify(new URL('../prloop.mjs', import.meta.url).href)}; editLines(${JSON.stringify(f)}, (l) => [...l, 'Y']);`]);
-  const done = new Promise((r) => writer.on('exit', r));
+  mkdirSync(lock, { mode: 0o700 });
+  writeFileSync(join(lock, `slot-0.${holder.pid}.0`), procStart(holder.pid) ?? ''); // another ready process is mid-update
+  const writer = (v) => {
+    const c = spawn(process.execPath, ['--input-type=module', '-e',
+      `import { editLines } from ${JSON.stringify(new URL('../prloop.mjs', import.meta.url).href)}; editLines(${JSON.stringify(f)}, (l) => [...l, '${v}']);`]);
+    return new Promise((r) => c.on('exit', r));
+  };
+  const done = [1, 2, 3, 4, 5, 6].map((i) => writer(`Y${i}`));
   await new Promise((r) => setTimeout(r, 300));
   assert.equal(readFileSync(f, 'utf8'), 'X\n'); // no read-modify-write while the lock is held
   writeFileSync(f, ''); // the holder withdraws X, then dies without removing its lock
   holder.kill();
-  assert.equal(await done, 0);
-  assert.equal(readFileSync(f, 'utf8'), 'Y\n'); // read after the holder's update, so X stays withdrawn
-  assert.ok(!existsSync(`${f}.lock`));
+  assert.deepEqual(await Promise.all(done), [0, 0, 0, 0, 0, 0]);
+  // Writers racing to take over the dead lock never remove each other's live claim, so no update is lost,
+  // and each read happened after the holder's update, so X stays withdrawn.
+  assert.deepEqual(readFileSync(f, 'utf8').split('\n').filter(Boolean).sort(), ['Y1', 'Y2', 'Y3', 'Y4', 'Y5', 'Y6']);
+  assert.deepEqual(readdirSync(lock), []);
 });
 
 // Points the state directory at a temporary one for the duration of a test.
