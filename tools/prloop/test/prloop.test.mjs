@@ -90,8 +90,18 @@ test('a current request answered by a PR-body thumbs-up and a clean comment nami
   const thumbOnly = cleanWithoutAck('2603924');
   thumbOnly.comments.nodes.pop();
   thumbOnly.reactions.nodes.push({ content: 'THUMBS_UP', createdAt: '2026-01-01T22:06:11Z', user: BOT });
+  thumbOnly.comments.nodes.shift(); // no earlier request whose review could finish late
   assert.equal(classify(thumbOnly, cfg, AFTER).verdict, 'clean'); // (a) a 👍 on the PR body after the request
   assert.equal(classify(cleanWithoutAck('2603924'), cfg, AFTER).verdict, 'clean'); // (b) the comment names this head
+});
+
+test('a PR-body thumbs-up after a new request counts only after this cycle\'s eyes when an earlier cycle exists', () => {
+  const pr = cleanWithoutAck('2603924');
+  pr.comments.nodes.pop(); // only the PR-body reaction answers; IC_old's review could still finish late
+  pr.reactions.nodes.push({ content: 'THUMBS_UP', createdAt: '2026-01-01T22:06:11Z', user: BOT });
+  assert.equal(classify(pr, cfg, AFTER).reviewerState.state, 'none'); // a late 👍 from the earlier cycle must not clear this head
+  request(pr).reactions.nodes.push({ content: 'EYES', createdAt: '2026-01-01T22:04:00Z', user: BOT });
+  assert.equal(classify(pr, cfg, AFTER).verdict, 'clean'); // this cycle acknowledged before the 👍
 });
 
 test('an unacknowledged clean comment naming an older commit does not clear the head', () => {
@@ -1612,6 +1622,24 @@ test('ready rereads the PR after its gate: a head pushed meanwhile is not report
   assert.deepEqual([out.ready, out.head], [false, moved]);
   assert.ok(out.missing.some((m) => m.includes(`head ${moved.slice(0, 7)} not marked tested`)), res.stdout);
   assert.equal(isTested(head, r.work), true); // the gated old head stays marked
+});
+
+test('status reports tested from the configured gate, not from another gate\'s marker', (t) => {
+  tempState(t);
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  markTested(head, r.work); // a generic marker, as left by another gate
+  const pr = fixture();
+  Object.assign(pr, { headRefName: 'feat', headRefOid: head });
+  fakeGh(t, r.dir, pr);
+  const status = (gate) => JSON.parse(spawnSync(process.execPath, [PRLOOP, 'status', '7', '--repo', 'example-org/example-repo', ...gate],
+    { cwd: r.work, encoding: 'utf8', env: { ...process.env, PRLOOP_LOCK_TOKEN: '', PRLOOP_GATE: '' } }).stdout);
+  assert.equal(status([]).tested, true);
+  const s = status(['--gate', 'true']);
+  assert.equal(s.tested, false);
+  assert.ok(s.reasons.some((m) => m.includes('not marked tested')));
 });
 
 test('a standalone sync holds the worktree lock for its whole run unless its token already owns it', (t) => {

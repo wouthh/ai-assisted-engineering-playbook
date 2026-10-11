@@ -268,8 +268,17 @@ export function classify(pr, cfg, nowMs = Date.now()) {
 
   // A requested review reacts on the request, or on the PR body after the request. Without a request, PR-body reactions
   // count only once the bot has started (👀) after this head, so a late 👍 from a review of the previous head cannot clear this one.
+  // PR-body reactions carry no commit or request: with a request, a body 👍 counts only after this cycle's 👀, or when no
+  // earlier review cycle exists (no older request, no earlier bot reaction on the PR body, full history seen) that could finish late.
   const bodyReactions = (pr.reactions?.nodes ?? []).filter((r) => isBot(r) && r.createdAt >= headTime);
-  const reactions = current ? [...triggerNode.reactions.nodes, ...bodyReactions] : bodyReactions.some((r) => r.content === 'EYES') ? bodyReactions : [];
+  const ackAt = [...(current ? triggerNode.reactions.nodes.filter((r) => r.createdAt >= since) : []), ...bodyReactions]
+    .filter((r) => isBot(r) && r.content === 'EYES').map((r) => r.createdAt).sort()[0];
+  const earlierCycle = !current || pr.comments.pageInfo?.hasPreviousPage
+    || pr.comments.nodes.some((c) => !isBot(c) && c.createdAt < triggerNode.createdAt && c.body.toLowerCase().includes(cfg.trigger.toLowerCase()))
+    || (pr.reactions?.nodes ?? []).some((r) => isBot(r) && r.createdAt < headTime);
+  const bodyOk = (r) => r.content === 'EYES' || !earlierCycle || (!!ackAt && r.createdAt >= ackAt);
+  const reactions = current ? [...triggerNode.reactions.nodes, ...bodyReactions.filter(bodyOk)]
+    : bodyReactions.some((r) => r.content === 'EYES') ? bodyReactions : [];
   const signals = reactions
     .filter((r) => isBot(r) && r.createdAt >= since && (r.content === 'EYES' || r.content === 'THUMBS_UP'))
     .map((r) => ({ at: r.createdAt, state: r.content === 'EYES' ? 'reviewing' : 'clean' }));
@@ -280,19 +289,13 @@ export function classify(pr, cfg, nowMs = Date.now()) {
   // delayed comment about the previous head cannot clear this one, even after a new request. Local clean
   // bodies name the head.
   const started = current || bodyReactions.some((r) => r.content === 'EYES');
-  const ackAt = [...(current ? triggerNode.reactions.nodes.filter((r) => r.createdAt >= since) : []), ...bodyReactions]
-    .filter((r) => isBot(r) && r.content === 'EYES').map((r) => r.createdAt).sort()[0];
   const botComments = pr.comments.nodes.filter((c) => isBot(c) && c.createdAt >= since && (started || trusted(c)));
   const summaries = [...botReviews.map((r) => ({ at: r.submittedAt, body: r.body, local: trusted(r), acked: true })),
     ...botComments.map((c) => ({ at: c.createdAt, body: c.body, local: trusted(c), acked: !!ackAt && c.createdAt >= ackAt,
       named: /Reviewed commit:\W*([0-9a-f]{7,40})/i.exec(c.body)?.[1] }))]
     .filter((s) => s.body);
   // Without an acknowledgement, a clean comment after the current request counts when it names this head, or names no
-  // commit while no earlier review cycle exists (no older request, no earlier bot reaction on the PR body, full history seen)
-  // that could finish late. A comment naming another commit never clears this head.
-  const earlierCycle = !current || pr.comments.pageInfo?.hasPreviousPage
-    || pr.comments.nodes.some((c) => !isBot(c) && c.createdAt < triggerNode.createdAt && c.body.toLowerCase().includes(cfg.trigger.toLowerCase()))
-    || (pr.reactions?.nodes ?? []).some((r) => isBot(r) && r.createdAt < headTime);
+  // commit while no earlier review cycle exists that could finish late. A comment naming another commit never clears this head.
   const cleanOk = (s) => (s.named ? head.startsWith(s.named.toLowerCase()) && (s.acked || current) : s.acked || !earlierCycle);
   for (const s of summaries) {
     if (s.local ? s.body.includes(localCleanBody(head)) : cleanOk(s) && cfg.clean.test(s.body)) signals.push({ at: s.at, state: 'clean' });
@@ -1404,7 +1407,7 @@ export async function main(argv) {
       const local = tryGit(['rev-parse', '--git-dir']) ? localGate(s, process.cwd(), cfg.gate) : [];
       const unresolvedThreads = s.unresolvedThreads.map((t) => ({ ...t, body: t.body.slice(0, 300) }));
       return out({ ...s, unresolvedThreads, reasons: [...s.reasons, ...local], readyToRequest: s.readyToRequest && !local.length,
-        tested: isTested(s.head, process.cwd()) }, 0);
+        tested: cfg.gate ? gatePassed(cfg.gate, process.cwd()) === s.head : isTested(s.head, process.cwd()) }, 0);
     }
     if (cmd === 'ready') {
       let s = classify(fetchPr(repo, prArg), cfg);
