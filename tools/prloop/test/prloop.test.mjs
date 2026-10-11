@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import {
-  classify, config, globToRegex, parseDuration, recordFindings, syncBranch, unionLines, waitFor,
+  classify, config, globToRegex, runExitCode, parseDuration, recordFindings, syncBranch, unionLines, waitFor,
 } from '../prloop.mjs';
 
 const fixture = () => JSON.parse(readFileSync(new URL('./pr-fixture.json', import.meta.url), 'utf8'));
@@ -93,6 +93,28 @@ test('the gate refuses while threads are unresolved', () => {
   assert.deepEqual(s.unresolvedThreads.map((t) => t.id), ['T0']);
 });
 
+test('a force-push to an older commit invalidates an earlier clean signal', () => {
+  const pr = fixture();
+  request(pr).reactions.nodes.push({ content: 'THUMBS_UP', createdAt: at('10:20'), user: BOT });
+  pr.commits.nodes[0].commit.committedDate = at('08:00'); // older commit becomes the head
+  pr.timelineItems = { nodes: [{ createdAt: at('10:30') }] };
+  const s = classify(pr, cfg, Date.parse(at('10:31')));
+  assert.equal(s.trigger.afterHead, false);
+  assert.equal(s.verdict, 'not_requested');
+});
+
+test('more than one page of review threads fails closed', () => {
+  const pr = fixture();
+  pr.reviewThreads.pageInfo = { hasNextPage: true };
+  assert.throws(() => classify(pr, cfg, NOW), /more than 100 review threads/);
+});
+
+test('run exit code: blocked wins, then the first verdict needing action', () => {
+  assert.equal(runExitCode([{ verdict: 'clean' }, { verdict: 'merged' }]), 0);
+  assert.equal(runExitCode([{ verdict: 'clean' }, { verdict: 'findings' }, { verdict: 'timeout' }]), 10);
+  assert.equal(runExitCode([{ verdict: 'not_requested' }, { verdict: 'blocked' }]), 50);
+});
+
 test('custom reviewer and trigger', () => {
   const pr = fixture();
   pr.comments.nodes.push({ id: 'IC_x', databaseId: 103, body: '/review please', createdAt: '2026-01-01T11:00:00Z',
@@ -151,10 +173,11 @@ test('outdated threads are flagged but still block a request', () => {
 
 test('wait returns findings immediately', async () => {
   const pr = fixture();
-  pr.reviewThreads.nodes.push(thread('T1', '2026-01-01T10:20:00Z'));
+  pr.reviewThreads.nodes.push(thread('T1', '2026-01-01T10:20:00Z', `P1: Handle the empty retry list\n\n${'detail '.repeat(100)}`));
   const v = await waitFor('example-org/example-repo', 7, cfg, { interval: 1, fetch: () => pr, now: () => NOW });
   assert.equal(v.verdict, 'findings');
   assert.equal(v.findings[0].path, 'src/retry.js');
+  assert.ok(v.findings[0].body.length > 300, 'wait keeps enough of each finding to act on it');
 });
 
 test('fingerprint failsafe trips when a finding returns after two fixes', () => {
