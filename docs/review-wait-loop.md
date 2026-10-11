@@ -5,7 +5,7 @@ An external review bot can take minutes to answer. An agent that polls GitHub it
 ## The loop
 
 1. **Implement** the change in the PR branch.
-2. **Gate**: `prloop ready <pr> --gate "<cmd>"` runs the project's full gate on the clean, pushed head and marks it tested (`prloop mark-tested` is the manual alternative). It also passes only when no review thread is unresolved and no request is already pending on this head, and lists exactly what is missing otherwise.
+2. **Gate**: `prloop ready <pr> --gate "<cmd>"` runs the project's full gate on the clean, pushed head and marks it tested, at most once per clean tree and gate command (`--force-gate` reruns it; `prloop mark-tested --gate "<cmd>"` records a gate already run by hand). Agents run it in the foreground and never run the full gate directly. It also passes only when no review thread is unresolved and no request is already pending on this head, and lists exactly what is missing otherwise.
 3. **Request**: post the review trigger comment once, for example `@codex review`.
 4. **Wait**: prloop polls quietly until one verdict: `clean`, `findings`, `not_requested`, `requested_while_unresolved`, or `timeout` with the previous request text to repost. When the bot is unavailable, the default `auto` mode runs one read-only local review of the head and posts it, so the loop continues.
 5. **Fix**: for findings, fix valid ones, reply with evidence to invalid ones, resolve addressed threads, and go back to step 2.
