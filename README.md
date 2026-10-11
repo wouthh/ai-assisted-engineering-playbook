@@ -88,7 +88,7 @@ Checks text reports against named regular expressions. Findings report the rule,
 ### Review wait loop (`prloop`)
 
 ```bash
-prloop run --repo owner/name --pr 42,43 --gate "npm test" &   # background supervisor
+prloop run --repo owner/name --pr 42,43 --gate "npm test" --deadline 6h &   # background job of your shell
 prloop run --status --repo owner/name                        # cheap check-in
 ```
 
