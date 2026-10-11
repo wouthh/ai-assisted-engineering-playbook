@@ -59,9 +59,10 @@ ZERO_OID = re.compile(r"0+")
 # is treated as an address unless the whole word is a mention such as @name or
 # a package version such as name@1.2.3 or @scope/name@1.2.3. Unusual but valid address
 # syntax is therefore refused unless it is allowlisted.
-# Trim only characters that can never belong to an address at that end: a
-# local part may start with ! ' ? or `, but a domain never ends in punctuation.
-LEADING_EDGE = "<([{\""
+# Trim only characters that can never belong to an address at that end: an
+# unquoted local part may start with any atext such as ! ' ? ` or {, but never
+# with < ( [ or a quote, and a domain never ends in punctuation.
+LEADING_EDGE = "<([\""
 TRAILING_EDGE = ">)]},;:!?'\"`."
 # A whole word such as name@1.2.3, name@v1.2.3-beta.1 or @scope/name@1.2.
 PACKAGE_VERSION = re.compile(

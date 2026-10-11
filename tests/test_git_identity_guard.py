@@ -193,7 +193,8 @@ class MessageTests(GuardFixture):
     def test_valid_leading_punctuation_is_not_trimmed_into_an_allowed_address(self) -> None:
         self.write_config({"expected_email": EXPECTED,
                            "allowed_message_emails": ["user@synthetic-mail.net"]})
-        for word in ("<!user@synthetic-mail.net>", "?user@synthetic-mail.net",
+        for word in ("<!user@synthetic-mail.net>", "<{user@synthetic-mail.net>",
+                     "?user@synthetic-mail.net",
                      "`user@synthetic-mail.net", "'user@synthetic-mail.net"):
             with self.subTest(word=word):
                 path = self.message(f"Add feature\n\nCo-authored-by: Synthetic {word}\n")
