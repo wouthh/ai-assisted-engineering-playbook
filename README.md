@@ -31,6 +31,7 @@ It is useful for individual contributors, reviewers, and teams writing repositor
 - [Validation and review](docs/validation-and-review.md)
 - [Review wait loop](docs/review-wait-loop.md)
 - [Privacy and secrets](docs/privacy-and-secrets.md)
+- [Git identity guard](docs/git-identity-guard.md)
 - [Rollback and handoff](docs/rollback-and-handoff.md)
 
 Use the root [AGENTS.md](AGENTS.md) as a small working example of repository guidance. Copy and adapt [the reusable template](templates/AGENTS.template.md) rather than copying workstation-specific policy from another project.
@@ -93,7 +94,15 @@ prloop run --status --repo owner/name                        # cheap check-in
 
 Keeps PRs moving through an external reviewer bot with minimal model tokens: a plain script polls, gates review requests, syncs branches with their base, and starts a fresh agent only when there is work, with failsafes against loops. `prloop ready` and `prloop wait` are the manual, agent-in-the-loop alternative. It is a single dependency-free Node.js file that reads GitHub through `gh`. `status` and `ready` only read; `wait` reads, and posts a read-only local review only when the bot is unavailable or `--reviewer local` is set; `sync` pushes the PR branch and `run` starts agents, each only when invoked. See [the review wait loop](docs/review-wait-loop.md) and [the command reference](tools/prloop/README.md).
 
-The inspection utilities use only Bash, Python's standard library, and Git; `prloop` uses Node.js, Git and the GitHub CLI. Tests create temporary synthetic repositories or use fixture JSON and never contact the network.
+### Git identity guard
+
+```bash
+python3 scripts/git-identity-guard.py --help
+```
+
+A global Git hook that refuses commits, merges, patches, and pushes recording an unexpected author or committer email, and commit, patch, and outgoing commit messages containing email addresses outside an allowlist, such as co-author trailers added by coding agents. Personal values come from a private configuration file, never from the script. Throwaway test repositories in temporary storage without a remote URL are skipped. It is an accident guard: `--no-verify` and hosting-platform merges bypass it. See [the Git identity guard guide](docs/git-identity-guard.md) for installation, configuration, and limits.
+
+The inspection utilities and the Git identity guard use only Bash, Python's standard library, and Git; `prloop` uses Node.js, Git and the GitHub CLI. Tests create temporary synthetic repositories or use fixture JSON and never contact the network.
 
 ## Fictional delivery example
 
