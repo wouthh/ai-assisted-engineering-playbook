@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import {
-  EXIT, main, slotDir, agentFailure, saveAgentLog, pruneAgentLogs, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, syncBranch, unionLines, waitFor,
+  EXIT, main, slotDir, agentFailure, saveAgentLog, pruneAgentLogs, takeLock, lockHolder, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, syncBranch, unionLines, waitFor,
 } from '../prloop.mjs';
 
 const pick = (o, keys) => Object.fromEntries(keys.map((k) => [k, o[k]]));
@@ -512,6 +512,39 @@ test('a local reviewer\'s raw output is kept and named when its result is malfor
   assert.equal(v.agentLog, seen);
   assert.ok(v.agentLog.startsWith(join(state, 'agents', 'example-org__example-repo__7__')));
   assert.match(readFileSync(v.agentLog, 'utf8'), /Looks fine to me[\s\S]*## stderr\nwarn/);
+});
+
+const PRLOOP = join(import.meta.dirname, '..', 'prloop.mjs');
+
+test('a held worktree lock refuses ready, sync and mark-tested unless the caller carries its token', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  const lock = takeLock(r.work, 'fix agent for PR #7'); // held by this live test process
+  t.after(() => lock.release());
+  const cli = (args, env = {}) => spawnSync(process.execPath, [PRLOOP, ...args], { cwd: r.work, encoding: 'utf8', env: { ...process.env, PRLOOP_LOCK_TOKEN: '', ...env } });
+  for (const args of [['mark-tested'], ['ready', '7'], ['sync', '7']]) {
+    const res = cli(args);
+    assert.equal(res.status, 40, args.join(' '));
+    assert.match(JSON.parse(res.stdout).error, new RegExp(`locked by prloop process ${process.pid} \\(fix agent for PR #7, since `));
+  }
+  assert.equal(cli(['mark-tested'], { PRLOOP_LOCK_TOKEN: 'wrong' }).status, 40);
+  assert.equal(cli(['mark-tested'], { PRLOOP_LOCK_TOKEN: lock.token }).status, 0);
+  assert.equal(takeLock(r.work, 'another run').holder.pid, process.pid);
+  lock.release();
+  assert.equal(lockHolder(r.work, null), null);
+  assert.equal(cli(['mark-tested']).status, 0);
+});
+
+test('a worktree lock held by a dead process is reclaimed', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  const dead = spawnSync(process.execPath, ['-e', '']).pid;
+  const stale = takeLock(r.work, 'crashed run', dead);
+  assert.ok(stale.token);
+  assert.equal(lockHolder(r.work, null), null);
+  const lock = takeLock(r.work, 'fix agent for PR #7');
+  assert.ok(lock.token && !lock.holder);
+  lock.release();
 });
 
 test('sync refuses a base ref that lacks the PR base commit', (t) => {
@@ -1116,16 +1149,19 @@ async function runNoResultAgent(t, resolves) {
   const reply = JSON.stringify({ data: { viewer: { login: 'example-dev' }, repository: { mergeCommitAllowed: true, squashMergeAllowed: true, rebaseMergeAllowed: true, pullRequest: done } } });
   writeFileSync(join(r.dir, 'done.json'), reply);
   writeFileSync(join(r.dir, 'bin', 'claude'), `#!/bin/sh
+echo "$PRLOOP_LOCK_TOKEN" > "${r.dir}/token"
 ${resolves ? `cp "${r.dir}/done.json" "${r.dir}/pr.json"` : ''}
 echo '{"type":"result","subtype":"error_max_turns","is_error":true,"result":"Ran out of turns."}'
 `, { mode: 0o755 });
   const [res] = await runAll({ repo: 'example-org/example-repo', pr: '7', worktree: r.work, deadline: '1h' }, { ...cfg, interval: 1 }, { metrics: idle().metrics });
-  return { res };
+  return { res, r };
 }
 
 test('run blocks with the session error and keeps the agent log when an agent ends without a result line', async (t) => {
-  const { res } = await runNoResultAgent(t, false);
+  const { res, r } = await runNoResultAgent(t, false);
   assert.equal(res.verdict, 'blocked', JSON.stringify(res));
+  assert.match(readFileSync(join(r.dir, 'token'), 'utf8'), /^[0-9a-f-]{36}\n$/); // the agent inherited the lock token
+  assert.equal(lockHolder(r.work, null), null); // and the lock was released when it ended
   assert.equal(res.reason, 'the agent session ended at its max-turns limit');
   assert.match(readFileSync(res.agentLog, 'utf8'), /error_max_turns/);
   assert.ok(res.next.includes(res.agentLog));
