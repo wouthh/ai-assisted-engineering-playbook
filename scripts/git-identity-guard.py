@@ -56,14 +56,16 @@ ENV.update(GIT_OPTIONAL_LOCKS="0", GIT_NO_LAZY_FETCH="1", GIT_NO_REPLACE_OBJECTS
            GIT_TRACE2="0", GIT_TRACE2_EVENT="0", GIT_TRACE2_PERF="0")
 ZERO_OID = re.compile(r"0+")
 # Message checks fail closed: every whitespace-separated word containing "@"
-# is treated as an address unless the whole word is a mention such as @name or
-# a package version such as name@1.2.3 or @scope/name@1.2.3. Unusual but valid address
+# is treated as an address unless the whole word is a mention such as @name, a
+# package scope such as @scope/name, or a package version such as name@1.2.3. Unusual but valid address
 # syntax is therefore refused unless it is allowlisted.
 # Trim only characters that can never belong to an address at that end: an
 # unquoted local part may start with any atext such as ! ' ? ` or {, but never
 # with < ( [ or a quote, and a domain never ends in punctuation.
 LEADING_EDGE = "<([\""
 TRAILING_EDGE = ">)]},;:!?'\"`."
+MENTION = re.compile(r"@[A-Za-z0-9_-]+")
+SCOPED_PACKAGE = re.compile(r"@[A-Za-z0-9][\w.-]*/[\w./-]*")
 # A whole word such as name@1.2.3, name@v1.2.3-beta.1 or @scope/name@1.2.
 PACKAGE_VERSION = re.compile(
     r"(?:@[A-Za-z0-9][\w.-]*/)?[A-Za-z0-9][\w.-]*"
@@ -232,12 +234,13 @@ def message_addresses(line: str) -> list[str]:
     found = []
     for word in re.split(r"[\s,;]+", line):
         word = word.lstrip(LEADING_EDGE).rstrip(TRAILING_EDGE)
-        if word.count("@") == 0 or (word.count("@") == 1 and word.endswith("@")):
-            continue  # No address, or a lone trailing at-sign such as name@.
+        if "@" not in word or word == "@":
+            continue
         # Exemptions apply only when the whole word has exactly that shape.
-        body = word[1:] if word.startswith("@") else word
-        if "@" not in body:
-            continue  # A mention or decorator such as @name.
+        # Anything else, including a split address such as "name @domain" or
+        # "name@ domain", must match the allowlist and is refused otherwise.
+        if MENTION.fullmatch(word) or SCOPED_PACKAGE.fullmatch(word):
+            continue  # A mention such as @name or a scope such as @scope/name.
         if PACKAGE_VERSION.fullmatch(word):
             continue  # A package version such as name@1.2.3 or @scope/name@1.2.3.
         found.append(word)
