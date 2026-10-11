@@ -1,6 +1,6 @@
 # prloop
 
-`prloop` waits for an external pull-request reviewer bot so a coding agent does not have to. It polls GitHub quietly, then prints one compact JSON verdict and exits with a code the agent can branch on. The agent still does the work: fixing code, running tests, replying to and resolving threads, and posting the review request.
+`prloop` keeps pull requests moving through an external reviewer bot while spending as few model tokens as possible. A plain script does all the polling, gating and syncing; a fresh coding agent is started only when there is real work (findings, a conflict, a missing or timed-out review request, a local review), finishes that one step and exits. The agents do the engineering: fixing code, running tests, replying to and resolving threads, and posting the review request.
 
 The default reviewer is the Codex GitHub connector (login `chatgpt-codex-connector`, triggered by a `@codex review` comment). Any bot with a similar request-and-react pattern can be configured.
 
@@ -15,18 +15,57 @@ prloop --help
 
 `bin/prloop` is a symlink to `tools/prloop/prloop.mjs`. Run the tests with `node --test` from the repository root; they use fixture JSON and temporary Git repositories and never contact the network.
 
-## Commands
+## Recommended workflow: one background supervisor
 
-Every command prints one JSON object on stdout. `--repo owner/name` defaults to the repository of the current directory.
+A coordinator (a person or an orchestrating agent) starts one supervisor for a set of PRs and checks in rarely:
+
+```bash
+prloop run --repo owner/name --pr 42,43,44 --gate "npm test" --merge squash &   # runs until every PR is done
+prloop run --status --repo owner/name                                          # cheap check-in, no GitHub calls
+```
+
+`run` polls every PR round-robin every `--interval`, in one process. It syncs a branch that GitHub reports behind or conflicting, waits for the reviewer, runs local reviews when needed, and spawns a fix agent only for findings, a manual conflict, a missing request, a timed-out request or a local-review gate gap. At most `--max-agents` (2) agents or local reviews run at once. It never needs the coordinator between steps and exits only when every PR is `merged`, `merge_pending`, `clean` (without `--merge`), `blocked`, `needs_human`, `needs_agent` (with `--agent none`) or past the `--deadline` (6h). It then prints one JSON line per PR: `verdict`, `reason`, last `head`, `rounds`, and `next`, what a human or the coordinator must do.
+
+Each PR's state lives in `${XDG_STATE_HOME:-~/.local/state}/prloop/<owner>__<name>__<pr>.json`, and every state change is appended to that run's `run-<time>.jsonl` event log in the same directory. `prloop run --status` prints all PR states and the latest events as one JSON object. Rounds and seen findings persist across runs on purpose; delete a PR's state file to reset them.
+
+### Fix agents
+
+Each fix agent runs in the PR's worktree (found with `git worktree list` by branch name, or `--worktree <path>`, which must have the PR branch checked out). Its prompt carries only the current trigger, never the round history: repository, PR, branch, head, worktree, the trigger (`findings`, `conflict`, `not_requested`, `timeout`, `local_review`), its data (compact findings with thread id, path, line and body; the conflicted files; or the previous request body), and the gate command. In one session it must:
+
+1. read only the referenced files plus AGENTS.md;
+2. fix each valid finding with a regression test, reply with evidence on invalid ones and leave them unresolved, resolve conflicts;
+3. run focused tests while fixing, then commit and push normally (`prloop sync` first if the base moved);
+4. resolve the fixed threads and reply on the disputed ones;
+5. run `prloop ready`, which runs the gate; after a gate failure, rerun the failing tests or step with their focused command and fix them, including failures it did not cause, before calling `prloop ready` again (at most 5 calls; blocked only when the same failure survives 3 consecutive fixes or the cause is environmental, such as a missing tool, no network or a permission denial);
+6. post the review request, reusing the previous request body (skipped with `--reviewer local`);
+7. exit with one JSON line: `{"status":"requested|blocked|nothing_to_do","head":"…","fixed":[…],"disputed":[…],"reason":"…"}`.
+
+Fix agents never wait for or poll reviews, merge, touch other PRs, rewrite history except through `prloop sync`, or retry in a loop.
+
+| Option | Default | |
+|---|---|---|
+| `--gate "<cmd>"` | `PRLOOP_GATE` | The project's full validation command, run by `prloop ready`. Without it the agent runs the gate documented in AGENTS.md or README and calls `prloop mark-tested`. |
+| `--agent claude` | yes | `claude -p <prompt> --model claude-opus-5-5 --effort medium --permission-mode auto --output-format json`, run in the worktree so the CLI loads that project's instructions. |
+| `--agent codex` | | `codex exec` with a workspace-write sandbox that allows network access. |
+| `--agent none` | | Stops the PR at `needs_agent` with the generated `prompt` in its summary, so the coordinator can spawn its own agent and rerun `run`. |
+| `--model`, `--effort` | | Override the agent model and effort (`PRLOOP_MODEL`, `PRLOOP_EFFORT`). |
+| `--max-agents 2` | 2 | Agents and local reviews running at the same time. |
+| `--merge rebase\|squash\|merge` | off | Merges only a head whose fresh snapshot is clean with no unresolved threads, marked tested in the PR worktree with a clean pushed tree, and reported mergeable, using `gh pr merge --match-head-commit <sha>`. A clean but untested head goes to an agent for the gate only. The result is `merged`, or `merge_pending` when a merge queue or auto-merge accepted it without merging yet. |
+| `--union <glob>` | | Passed to sync. Reviewer and timing options apply as for `wait`. |
+
+Failsafes end a PR in `blocked` (or `needs_human` for disputed findings) with a reason, never in a loop: maximum rounds per PR (`--max-rounds 8`), an agent that exits non-zero, prints no parseable result line, reports `blocked` or a permission denial, or makes no progress (no new commit, resolved thread, request or tested head), the same finding (path plus normalized first line) returning after two fixes, the overall deadline, and every local-review failsafe.
+
+## Agent-in-the-loop commands
+
+The manual alternative, for an agent that drives one PR itself. Every command prints one JSON object on stdout; `--repo owner/name` defaults to the repository of the current directory.
 
 | Command | Purpose | Exit codes |
 |---|---|---|
 | `prloop status <pr>` | Head SHA, unresolved threads (id, path, line, first 300 characters), latest trigger comment and whether it is newer than the head commit, reviewer state on the head (`none`, `reviewing`, `clean`, `findings`), and `readyToRequest` with reasons. | 0, 40 |
-| `prloop ready <pr>` | Gate before posting a review request, run inside the PR checkout. Passes only with no unresolved threads, no request already pending on the head, a tested head, and a clean tree on the PR branch whose `HEAD` equals the remote PR head. Lists exactly what is missing. | 0 ready, 50 not ready |
-| `prloop mark-tested [--sha <sha>]` | Records that your gate passed for `HEAD` (or `--sha`). Stored as `prloop-tested` in the Git common directory; never pushed. | 0, 40 |
+| `prloop ready <pr>` | Gate before posting a review request, run inside the PR checkout. With `--gate` (or `PRLOOP_GATE`) it first runs the gate on the clean, pushed head and marks it tested; a failure prints the last 60 lines of output. Then it passes only with no unresolved threads, no request already pending on the head, a tested head, and a clean tree on the PR branch whose `HEAD` equals the remote PR head, and lists exactly what is missing. | 0 ready, 50 not ready |
+| `prloop mark-tested [--sha <sha>]` | Manual escape hatch for projects without a gate command: records that the gate passed for `HEAD` (or `--sha`). Stored as `prloop-tested` in the Git common directory; never pushed. | 0, 40 |
 | `prloop wait <pr>` | Polls every `--interval` (75s) until a verdict. A 👀 reaction means the bot is still reviewing. Posts nothing except a [local review](#local-reviewer-fallback) when one is needed. | see below |
 | `prloop sync <pr> [--union <glob>]...` | Brings the PR branch up to date with its base, inside the PR checkout. See [Syncing with the base](#syncing-with-the-base). | 0, 40, 41 |
-| `prloop run --repo o/n --pr N[,N...]` | Optional supervisor that waits, spawns one fresh agent per round and stops on failsafes. See [Supervisor](#supervisor). | 50 if any PR is blocked, else the first verdict code that needs action, else 0 |
 
 `wait` verdicts:
 
@@ -39,15 +78,11 @@ Every command prints one JSON object on stdout. `--repo owner/name` defaults to 
 | `timeout` | 30 | No reaction within `--ack-timeout` (3m) of the request, or no result within `--timeout` (40m). Both are measured from the request time, so running `wait` again does not restart the clock. Includes `rerequestBody`, a copy of your last trigger comment, to repost unchanged. A timed-out request no longer blocks `prloop ready`. |
 | `unavailable` | 31 | Only with `--reviewer cloud`: the bot replied that it cannot review (usage limit, failure), or two requests on this head timed out. |
 | `blocked` | 50 | A local review could not run or post, or its per-head or per-PR limit is used up. |
-| `error` | 40 | GitHub could not be read three times in a row, bad input, or more than 100 review threads (prloop fails closed rather than miss one). |
-
-## Agent workflow
+| `error` | 40 | GitHub could not be read three times in a row, bad input, or history prloop cannot fully see (more than 100 review threads, or more than 100 comments since the head) so it fails closed. |
 
 ```bash
-npm test                          # or whatever the project's gate is
 git push
-prloop mark-tested
-prloop ready 42 && gh pr comment 42 --body "@codex review"
+prloop ready 42 --gate "npm test" && gh pr comment 42 --body "@codex review"
 prloop wait 42                    # one call instead of dozens of polls
 case $? in
   0)  echo "clean on the current head" ;;
@@ -59,36 +94,14 @@ esac
 
 ## Syncing with the base
 
-`prloop sync <pr>` runs inside a clean checkout of the PR branch whose `HEAD` equals the remote head. It fetches the base and:
+`prloop sync <pr>` runs inside a clean checkout of the PR branch whose `HEAD` equals the remote head. It fetches the base, checks that `origin/<base>` contains the base commit GitHub reports for the PR (so a fork's stale branch is never used), and:
 
 - merges the base when the repository allows merge or squash merges, then pushes normally;
 - rebases onto the base when the repository allows only rebase merges, then pushes with `--force-with-lease=<branch>:<expected-sha>`, so it never overwrites commits it has not seen.
 
 Conflicts in files matching `--union` globs (append-only changelogs, CSV ledgers) are resolved as a union of both sides, base lines first, with identical lines kept once. Any other conflict aborts the merge or rebase, leaves the checkout as it was, and exits 41 with `verdict: "conflict"` and the conflicted files, for the agent to resolve by hand. Union resolution suits files where every line is an independent record; do not use it for files whose lines depend on order or on each other.
 
-A successful sync changes the head, so it clears the tested marker: run your gate, `prloop mark-tested`, then request a review.
-
-## Supervisor
-
-```bash
-prloop run --repo owner/name --pr 42,43 --agent claude --max-rounds 8 --merge rebase
-```
-
-For each PR, sequentially: sync if GitHub reports the branch behind or conflicting, wait, and on `findings`, `timeout`, `not_requested`, `requested_while_unresolved` or a manual `conflict` spawn one fresh agent in the PR's worktree (found with `git worktree list` by branch name, or `--worktree <path>`, which must have the PR branch checked out). The prompt contains the PR number, the verdict, compact findings and the rules: fix, test, `prloop mark-tested`, reply and resolve, `prloop ready`, then post the request.
-
-| Option | Default | |
-|---|---|---|
-| `--agent claude` | yes | `claude -p <prompt> --model claude-opus-5-5 --effort medium --permission-mode auto --output-format json`, run in the worktree so the CLI loads that project's instructions. |
-| `--agent codex` | | `codex exec` with a workspace-write sandbox that allows network access. |
-| `--agent none` | | Prints the verdict with the generated `prompt` and exits with the verdict code, so a coordinator can spawn its own agent. |
-| `--model`, `--effort` | | Override the agent model and effort (`PRLOOP_MODEL`, `PRLOOP_EFFORT`). |
-| `--merge rebase\|squash\|merge` | off | Merges only when the current head is clean, marked tested in the PR worktree with a clean pushed tree, and GitHub reports it mergeable, with `gh pr merge --match-head-commit <sha>`. A clean but untested head returns `not_tested` (22) and goes to the agent for the gate. The result is `merged` with the merge commit, or `merge_pending` when a merge queue or auto-merge accepted it without merging yet. |
-| `--deadline 4h` | 4h | Overall deadline for the whole run. |
-| `--union` | | Passed to sync. Reviewer and timing options apply as for `wait`. |
-
-A single wait is bounded by `--timeout`, so the overall deadline is checked between rounds. Every failsafe ends in `verdict: "blocked"` with a reason (exit 50) instead of looping: maximum rounds per PR, the agent exiting non-zero, the agent pushing no commit, resolving no thread and posting no request, the same finding (path plus normalized first line) returning after two fixes, the overall deadline, or agent output reporting a permission denial.
-
-State (rounds, seen findings, last verdict) lives in `${XDG_STATE_HOME:-~/.local/state}/prloop/<owner>__<name>__<pr>.json`. Rounds persist across runs on purpose; delete the file to reset the budget for a PR.
+A successful sync changes the head, so it clears the tested marker: run `prloop ready` (which reruns the gate), then request a review.
 
 ## Local reviewer fallback
 
@@ -109,6 +122,7 @@ Failsafes: one local review per head, a fetched and verified base branch, at mos
 | Flag | Environment | Default |
 |---|---|---|
 | `--reviewer-login <regex>` | `PRLOOP_REVIEWER_LOGIN` | `^chatgpt-codex-connector(\[bot\])?$` |
+| `--unavailable-regex <regex>` | `PRLOOP_UNAVAILABLE_REGEX` | usage-limit and failure replies |
 | `--trigger <text>` | `PRLOOP_TRIGGER` | `@codex review` |
 | `--clean-regex <regex>` | `PRLOOP_CLEAN_REGEX` | `didn.t find any major issues` |
 | `--timeout <dur>` | `PRLOOP_TIMEOUT` | `40m` |

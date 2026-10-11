@@ -5,18 +5,18 @@ An external review bot can take minutes to answer. An agent that polls GitHub it
 ## The loop
 
 1. **Implement** the change in the PR branch.
-2. **Gate**: run the project's documented validation on the exact tree, then commit and push.
-3. **Mark tested**: `prloop mark-tested` records that the gate passed for this head. The marker is local and is cleared when `prloop sync` changes the head.
-4. **Ready**: `prloop ready <pr>` passes only when no review thread is unresolved, no request is already pending on this head, the head is marked tested, and it runs inside the PR checkout with a clean, pushed tree. It lists exactly what is missing otherwise.
-5. **Request**: post the review trigger comment once, for example `@codex review`.
-6. **Wait**: `prloop wait <pr>` polls quietly and exits with one verdict: `clean`, `findings`, `not_requested`, `requested_while_unresolved`, or `timeout` with the previous request text to repost. When the bot is unavailable, the default `auto` mode runs one read-only local review of the head and posts it, so the loop continues.
-7. **Fix**: for findings, fix valid ones, reply with evidence to invalid ones, resolve addressed threads, and go back to step 2.
+2. **Gate**: `prloop ready <pr> --gate "<cmd>"` runs the project's full gate on the clean, pushed head and marks it tested (`prloop mark-tested` is the manual alternative). It also passes only when no review thread is unresolved and no request is already pending on this head, and lists exactly what is missing otherwise.
+3. **Request**: post the review trigger comment once, for example `@codex review`.
+4. **Wait**: prloop polls quietly until one verdict: `clean`, `findings`, `not_requested`, `requested_while_unresolved`, or `timeout` with the previous request text to repost. When the bot is unavailable, the default `auto` mode runs one read-only local review of the head and posts it, so the loop continues.
+5. **Fix**: for findings, fix valid ones, reply with evidence to invalid ones, resolve addressed threads, and go back to step 2.
 
-When GitHub reports the branch behind or conflicting with its base, `prloop sync <pr>` updates it with the method the repository allows. Append-only files can be merged as a union of lines; any other conflict is aborted and handed back to the agent with the file list.
+When GitHub reports the branch behind or conflicting with its base, `prloop sync <pr>` updates it with the method the repository allows. Append-only files can be merged as a union of lines; any other conflict is aborted and handed back to an agent with the file list.
+
+The recommended way to run the loop is one background supervisor: `prloop run --repo <owner/name> --pr <N,...> --gate "<cmd>"`. It polls all PRs round-robin without a model, spawns a fresh agent only when there is work, and each agent does one step (fix, gate through `prloop ready`, reply and resolve, request) and exits. A coordinator checks in with `prloop run --status`, which reads local state and an event log instead of GitHub. Agents running `prloop wait` themselves is the manual alternative.
 
 ## Why
 
-- **Fewer tokens.** One `wait` call replaces dozens of agent-driven polls, and its output is one compact JSON object.
+- **Fewer tokens.** Polling, gating and syncing cost no model tokens. Agents start only when there is work, see only the current trigger, and exit after one step; a coordinator reads one compact status object.
 - **Current-head evidence.** Only reactions, comments and reviews newer than the head commit or the current request count, matching [review signal interpretation](validation-and-review.md#codex-cloud-review-signals). Eyes, silence and an older thumbs-up are not a clean review.
 - **No duplicate requests.** `ready` refuses while a request on the current head is still running; a request becomes repeatable only after it times out.
 - **No infinite loops.** The optional `prloop run` supervisor stops with a `blocked` reason on a round limit, an overall deadline, an agent that makes no progress or reports a permission denial, or the same finding returning after two fixes.

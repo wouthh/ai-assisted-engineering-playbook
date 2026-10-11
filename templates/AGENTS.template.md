@@ -54,17 +54,28 @@ State what each command proves and which environment is authoritative.
 
 ## PR review loop
 
-Install [`prloop`](https://github.com/wouthh/ai-assisted-engineering-playbook/tree/main/tools/prloop) on `PATH` (a symlink to `bin/prloop` is enough). It waits for the review bot and prints one JSON verdict. It never fixes code or posts review requests; it posts only its own read-only local review when the bot is unavailable. Remove this section if the project does not use an automated reviewer.
+Install [`prloop`](https://github.com/wouthh/ai-assisted-engineering-playbook/tree/main/tools/prloop) on `PATH` (a symlink to `bin/prloop` is enough). It does the polling, gating and syncing as a plain script so agents spend tokens only on real work. Remove this section if the project does not use an automated reviewer.
 
-1. Implement the change, run the full local gate above, commit and push.
-2. `prloop mark-tested` once the gate passes on the pushed head.
-3. Reply to and resolve every addressed review thread.
-4. `prloop ready <pr>`; if it fails, fix exactly what it lists.
-5. Post the review request once (default `@codex review`; configure other bots with `PRLOOP_REVIEWER_LOGIN`, `PRLOOP_TRIGGER` and `PRLOOP_CLEAN_REGEX`).
-6. `prloop wait <pr>`, then act on the verdict: `clean` (0) stop or hand over for merge; `findings` (10) fix and restart at step 1; `not_requested` (20) restart at step 4; `requested_while_unresolved` (21) resolve threads, then step 4; `timeout` (30) run `prloop ready`, then repost `rerequestBody` unchanged; `unavailable` (31) report, or rerun with `--reviewer local`; `error` (40) report. In the default `--reviewer auto` mode, `wait` posts a read-only local review itself when the bot is unavailable.
-7. If GitHub reports the branch behind or conflicting, run `prloop sync <pr>` in the PR checkout and restart at step 1; on `conflict` (41) resolve the listed files by hand.
+Recommended: the coordinator starts one background supervisor for its PRs and checks in rarely.
 
-Failsafes: stop and report on `blocked` (50) or `error`, after the project's round limit (default 8), or when the same finding returns after two fixes. Never poll GitHub manually, never post a second request while one is running on the same head, and never loop without new commits, replies or resolved threads.
+```text
+prloop run --repo <owner/name> --pr <N,...> --gate "<full local gate>" &
+prloop run --status --repo <owner/name>
+```
+
+It spawns a fresh fix agent only for findings, a conflict, a missing or timed-out review request, or a local-review gap. A fix agent does one step and exits:
+
+1. Read only the referenced files plus this file.
+2. Fix each valid finding with a regression test; reply with evidence on invalid ones and leave them unresolved; resolve conflicts.
+3. Run focused tests, then commit and push normally (`prloop sync <pr>` first if the base moved).
+4. Resolve the fixed threads; reply on disputed ones.
+5. `prloop ready <pr>`: it runs the gate and marks the head tested. After a gate failure, rerun the failing tests or step with their focused command and fix them before calling `prloop ready` again (at most 5 calls).
+6. Post the review request once, reusing the previous request body.
+7. Exit with one JSON line: `{"status":"requested|blocked|nothing_to_do","head":"…","fixed":[…],"disputed":[…],"reason":"…"}`.
+
+Without a supervisor, run the same steps yourself and then `prloop wait <pr>`, acting on its verdict: `clean` (0) stop; `findings` (10) start again at step 1; `not_requested` (20) step 5; `requested_while_unresolved` (21) step 4; `timeout` (30) repost `rerequestBody` after `prloop ready`; `unavailable` (31) report or use `--reviewer local`; `error` (40) report.
+
+Failsafes: stop and report on `blocked`, `needs_human` or `error`, on the round limit (default 8), when the same finding returns after two fixes, or when the same gate failure survives 3 consecutive fixes or is environmental (missing tool, no network, permission denied). Never poll reviews yourself, never post a second request while one runs on the same head, never retry in a loop.
 
 ## Instruction maintenance
 
