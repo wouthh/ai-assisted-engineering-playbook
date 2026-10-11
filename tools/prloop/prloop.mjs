@@ -559,6 +559,10 @@ export function recordGatePass(gate, cwd, key = gateKey(gate, cwd)) {
   writeFileSync(f, [...prev, key].join('\n') + '\n');
   return key.split(' ')[0];
 }
+function forgetGatePass(key) {
+  const f = gateCacheFile();
+  if (key && existsSync(f)) writeFileSync(f, readFileSync(f, 'utf8').split('\n').filter((l) => l && l !== key).map((l) => `${l}\n`).join(''));
+}
 
 // Runs the project gate for `ready` when one is configured and the clean, pushed PR head is not yet
 // tested (or always with --force-gate); a pass marks the head tested and a failure unmarks it. Returns null
@@ -574,7 +578,8 @@ export async function readyGate(s, cfg, cwd, deps = {}) {
     markTested(s.head, cwd);
     return { ok: true };
   }
-  unmarkTested(s.head, cwd); // a forced rerun that fails withdraws the earlier validation
+  unmarkTested(s.head, cwd); // a forced rerun that fails withdraws the earlier validation, cached pass included
+  forgetGatePass(key);
   return { ok: false, status: r.status, tail: String(r.stdout || r.stderr).trimEnd().split('\n').slice(-60).join('\n') };
 }
 
