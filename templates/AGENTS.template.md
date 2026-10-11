@@ -88,9 +88,10 @@ Run the fix-agent steps, then `prloop wait <pr>` and act on its verdict: `clean`
 - Index before adopting new instructions. During authorized implementation, narrowly improve missing or inaccurate guidance in the same PR; do not overwrite stronger rules or edit outside a strict allowlist without approval.
 - New projects require a runnable test baseline and real documented commands; do not assume an existing remote, base branch, or commit history. Creating or publishing a repository requires task authorization. Existing projects retain their authoritative gates. Read-only tasks report guidance gaps without modifying files.
 - Update this file when layout, commands, invariants, safety or delivery rules change. Keep durable guidance concise and link detailed docs; do not store transient logs, private workstation paths, or secrets here.
+- When a reviewer finding comes from misreading this file (for example a wrong-identity claim based on commits the review sandbox created itself, while the hosting record of the exact PR commit is correct), verify it against the hosting record, reply with that evidence, resolve the thread, and correct the misleading wording or add a review-guidelines entry in a normal PR without waiting to be asked.
 - Make onboarding idempotent: preserve custom and nested instructions, add only missing or inaccurate guidance, and leave files unchanged on a second pass without new facts.
 - Propose a normal playbook PR only for a material reusable gap when cross-repository maintenance is authorized. Project-specific updates alone do not require one. Never propagate proprietary rules or private data, automatically adopt unreviewed templates, or broaden global authority.
 
 ## Code Review Rules
 
-Add two or three consequential repository-specific rules, including the safe path or exception. Keep mechanical formatting in CI; do not invent guarantees outside the documented operating boundary.
+Add two or three consequential repository-specific rules, including the safe path or exception. Judge commit identity only from the hosting record of the exact PR commit, never from commits created inside the review environment. Keep mechanical formatting in CI; do not invent guarantees outside the documented operating boundary.
