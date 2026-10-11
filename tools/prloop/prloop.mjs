@@ -89,7 +89,7 @@ const positiveInt = (name, v) => {
 // Undefined keeps the per-machine default, computed when the metrics are read.
 const positiveNumber = (name, v) => {
   if (v === undefined) return undefined;
-  if (!/^\d+(\.\d+)?$/.test(String(v)) || !(Number(v) > 0)) throw new Error(`--${name} must be a positive number, not ${v}`);
+  if (!/^\d+(\.\d+)?$/.test(String(v)) || !(Number(v) > 0) || !Number.isFinite(Number(v))) throw new Error(`--${name} must be a positive number, not ${v}`);
   return Number(v);
 };
 
@@ -166,7 +166,7 @@ const PR_QUERY = `query($owner:String!,$name:String!,$pr:Int!){viewer{login} rep
   pullRequest(number:$pr){number url state headRefName reactions(last:50){nodes{content createdAt user{login}}} baseRefName baseRefOid headRefOid mergeable mergeStateStatus mergeCommit{oid}
     timelineItems(last:1,itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT]){nodes{... on HeadRefForcePushedEvent{createdAt}}}
     commits(last:1){nodes{commit{oid committedDate}}}
-    reviewThreads(first:100){pageInfo{hasNextPage} nodes{id isResolved isOutdated path line comments(first:1){nodes{body createdAt author{login} pullRequestReview{state}}}}}
+    reviewThreads(first:100){pageInfo{hasNextPage} nodes{id isResolved isOutdated path line comments(first:100){pageInfo{hasNextPage} nodes{body createdAt author{login} pullRequestReview{state}}}}}
     comments(last:100){pageInfo{hasPreviousPage} nodes{id databaseId body createdAt author{login} reactions(last:50){nodes{content createdAt user{login}}}}}
     reviews(last:50){pageInfo{hasPreviousPage} nodes{id body state submittedAt author{login} commit{oid} comments{totalCount}}}}}}`;
 
@@ -245,9 +245,10 @@ export function classify(pr, cfg, nowMs = Date.now()) {
   const trusted = (n) => isLocal(n.body) && !!pr.viewer?.login && login(n) === pr.viewer.login;
   const isBot = (n) => cfg.reviewer.test(login(n)) || trusted(n);
   // Inline comments of a dismissed bot review stay as unresolved threads; that review was withdrawn, so they are
-  // dropped too. A dismissed human review's threads still hold unresolved human feedback and stay.
-  const dismissedBot = (c) => c?.pullRequestReview?.state === 'DISMISSED' && isBot(c);
-  const threads = pr.reviewThreads.nodes.filter((t) => !t.isResolved && !dismissedBot(t.comments.nodes[0])).map((t) => {
+  // dropped too, unless any reply is not from a bot (or unseen): that is human feedback, as are a dismissed human review's threads.
+  const dismissedBot = (t) => t.comments.nodes[0]?.pullRequestReview?.state === 'DISMISSED' && !t.comments.pageInfo?.hasNextPage
+    && t.comments.nodes.every(isBot);
+  const threads = pr.reviewThreads.nodes.filter((t) => !t.isResolved && !dismissedBot(t)).map((t) => {
     const c = t.comments.nodes[0] ?? {};
     return { id: t.id, path: t.path, line: t.line, outdated: !!t.isOutdated, author: login(c), fromReviewer: isBot(c), createdAt: c.createdAt, body: (c.body ?? '').slice(0, 2000) };
   });
@@ -667,6 +668,7 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
 // `cfg.timeout`; transient GitHub errors are retried until three fail in a row.
 export async function waitFor(repo, prNum, cfg, { interval, fetch = fetchPr, now = Date.now, pause = sleep, cwd = process.cwd(), runLocal = localReview, metrics = machineMetrics, log = logStderr }) {
   const resources = {}; // one resource wait across polls, as in `run`
+  let agentLog; // the saved output of a local review that posted, kept for the final result
   for (let failures = 0; ; await pause(interval)) {
     let s;
     try { s = classify(fetch(repo, prNum), cfg, now()); failures = 0; } catch (e) {
@@ -680,11 +682,11 @@ export async function waitFor(repo, prNum, cfg, { interval, fetch = fetchPr, now
       // The head may have moved while waiting for resources: review the current snapshot, or poll again.
       try { s = classify(fetch(repo, prNum), cfg, now()); } catch { continue; }
       if (!reviewPlan(s, cfg).local) continue;
-      const r = await runLocal(repo, s, cfg, cwd);
+      const r = await runLocal(repo, s, cfg, cwd, (p) => { agentLog = p; });
       if (r) return r; // gate missing or reviewer failed; otherwise the posted result is classified next poll
       continue;
     }
-    if (s.verdict !== 'pending') return finish(s);
+    if (s.verdict !== 'pending') return { ...finish(s), ...(agentLog ? { agentLog } : {}) };
   }
 }
 
