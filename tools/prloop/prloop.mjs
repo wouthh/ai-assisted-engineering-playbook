@@ -7,7 +7,7 @@ import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-export const EXIT = { clean: 0, findings: 10, not_requested: 20, requested_while_unresolved: 21, timeout: 30, error: 40, conflict: 41, blocked: 50 };
+export const EXIT = { clean: 0, findings: 10, not_requested: 20, requested_while_unresolved: 21, not_tested: 22, timeout: 30, error: 40, conflict: 41, blocked: 50 };
 
 const HELP = `prloop - wait for a PR review bot and report the next step as JSON.
 
@@ -29,7 +29,7 @@ Reviewer options (flag or env):
   --ack-timeout <dur>       PRLOOP_ACK_TIMEOUT     default: 3m without any reaction
   --interval <dur>          PRLOOP_INTERVAL        default: 75s between polls
 
-Exit codes: 0 clean/ok, 10 findings, 20 not_requested, 21 requested_while_unresolved,
+Exit codes: 0 clean/ok/merged, 10 findings, 20 not_requested, 21 requested_while_unresolved, 22 not_tested,
             30 timeout, 40 error, 41 conflict, 50 blocked (run) / not ready (ready).`;
 
 // ---------- small helpers ----------
@@ -87,9 +87,10 @@ export function config(opts, env = process.env) {
 
 const PR_QUERY = `query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){
   mergeCommitAllowed squashMergeAllowed rebaseMergeAllowed
-  pullRequest(number:$pr){number url state headRefName reactions(last:50){nodes{content createdAt user{login}}} baseRefName headRefOid mergeable mergeStateStatus
+  pullRequest(number:$pr){number url state headRefName reactions(last:50){nodes{content createdAt user{login}}} baseRefName headRefOid mergeable mergeStateStatus mergeCommit{oid}
+    timelineItems(last:1,itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT]){nodes{... on HeadRefForcePushedEvent{createdAt}}}
     commits(last:1){nodes{commit{oid committedDate}}}
-    reviewThreads(first:100){nodes{id isResolved isOutdated path line comments(first:1){nodes{body createdAt author{login}}}}}
+    reviewThreads(first:100){pageInfo{hasNextPage} nodes{id isResolved isOutdated path line comments(first:1){nodes{body createdAt author{login}}}}}
     comments(last:100){nodes{id databaseId body createdAt author{login} reactions(last:50){nodes{content createdAt user{login}}}}}
     reviews(last:50){nodes{id body state submittedAt author{login} commit{oid}}}}}}`;
 
@@ -136,11 +137,15 @@ export const fingerprint = (t) => `${t.path ?? ''}::${title(t.body).toLowerCase(
 // - outdated threads stay unresolved until someone resolves them: an outdated anchor is not a fix.
 export function classify(pr, cfg, nowMs = Date.now()) {
   const head = pr.headRefOid;
-  const headTime = pr.commits.nodes[0]?.commit.committedDate ?? '1970-01-01T00:00:00Z';
+  // ponytail: GitHub exposes no push time. A force-push event covers a head replaced by an older
+  // commit; a fast-forward to a commit dated before an existing request is still not detected.
+  const headTime = [pr.commits.nodes[0]?.commit.committedDate, pr.timelineItems?.nodes[0]?.createdAt]
+    .filter(Boolean).sort().at(-1) ?? '1970-01-01T00:00:00Z';
+  if (pr.reviewThreads.pageInfo?.hasNextPage) throw new Error('more than 100 review threads: prloop cannot see them all, so it fails closed');
   const isBot = (n) => cfg.reviewer.test(login(n));
   const threads = pr.reviewThreads.nodes.filter((t) => !t.isResolved).map((t) => {
     const c = t.comments.nodes[0] ?? {};
-    return { id: t.id, path: t.path, line: t.line, outdated: !!t.isOutdated, author: login(c), createdAt: c.createdAt, body: (c.body ?? '').slice(0, 300) };
+    return { id: t.id, path: t.path, line: t.line, outdated: !!t.isOutdated, author: login(c), createdAt: c.createdAt, body: (c.body ?? '').slice(0, 2000) };
   });
   const triggerNode = [...pr.comments.nodes].reverse()
     .find((c) => !isBot(c) && c.body.toLowerCase().includes(cfg.trigger.toLowerCase()));
@@ -182,7 +187,7 @@ export function classify(pr, cfg, nowMs = Date.now()) {
   if (reviewer === 'clean') reasons.push(`head ${short(head)} is already reviewed clean`);
 
   return {
-    pr: pr.number, url: pr.url, head, branch: pr.headRefName, base: pr.baseRefName,
+    pr: pr.number, url: pr.url, state: pr.state, mergeCommit: pr.mergeCommit?.oid ?? null, head, branch: pr.headRefName, base: pr.baseRefName,
     mergeable: pr.mergeable, mergeState: pr.mergeStateStatus,
     unresolvedThreads: threads,
     trigger: triggerNode && { id: triggerNode.id, databaseId: triggerNode.databaseId, createdAt: triggerNode.createdAt, afterHead: current, body: triggerNode.body },
@@ -417,10 +422,18 @@ async function supervise(repo, prNum, cfg, opts, deadline) {
         if (++st.rounds > maxRounds) return blocked(`max rounds (${maxRounds}) reached while syncing`);
         continue;
       }
-      if (s.mergeable !== 'MERGEABLE') return blocked(`GitHub reports mergeable=${s.mergeable}, mergeState=${s.mergeState}`);
-      sh('gh', ['pr', 'merge', String(prNum), '--repo', repo, `--${opts.merge}`, '--match-head-commit', s.head]);
-      st.result = 'merged'; saveState(repo, prNum, st);
-      return { pr: prNum, verdict: 'merged', head: s.head };
+      const missing = cwd ? localGate(s, cwd) : [`no worktree for ${s.branch} to confirm the head was tested; pass --worktree`];
+      if (!missing.length) {
+        if (s.mergeable !== 'MERGEABLE') return blocked(`GitHub reports mergeable=${s.mergeable}, mergeState=${s.mergeState}`);
+        sh('gh', ['pr', 'merge', String(prNum), '--repo', repo, `--${opts.merge}`, '--match-head-commit', s.head]);
+        // A merge queue or auto-merge accepts the command without merging yet: report the real state.
+        for (let i = 0; i < 6 && s.state !== 'MERGED'; i++) { await sleep(5000); s = classify(fetchPr(repo, prNum), cfg); }
+        st.result = s.state === 'MERGED' ? 'merged' : 'merge_pending'; saveState(repo, prNum, st);
+        return { pr: prNum, verdict: st.result, head: v.head, state: s.state, mergeCommit: s.mergeCommit };
+      }
+      if (!cwd) return blocked(missing[0]);
+      v = { verdict: 'not_tested', pr: prNum, head: s.head, missing,
+        next: `review is clean but the merge gate is not met: ${missing.join('; ')}. Run the gate on this head and \`prloop mark-tested\`; do not request another review unless the head changes` };
     }
     if (++st.rounds > maxRounds) return blocked(`max rounds (${maxRounds}) reached`, { last: v.verdict });
     if (v.verdict === 'findings') {
@@ -437,9 +450,15 @@ async function supervise(repo, prNum, cfg, opts, deadline) {
     if (r.status !== 0) return blocked(`agent exited with status ${r.status}`, { output: r.output.slice(-800) });
     const after = classify(fetchPr(repo, prNum), cfg);
     const progressed = after.head !== before.head || after.unresolvedThreads.length < before.unresolvedThreads.length
-      || (after.trigger?.id && after.trigger.id !== before.trigger?.id);
+      || (after.trigger?.id && after.trigger.id !== before.trigger?.id) || (v.verdict === 'not_tested' && isTested(after.head, cwd));
     if (!progressed) return blocked('agent pushed no commit, resolved no thread and posted no request');
   }
+}
+
+// blocked wins; otherwise the first verdict that still needs action; 0 when all are done.
+export function runExitCode(results) {
+  const codes = results.map((r) => EXIT[r.verdict] ?? 0);
+  return codes.includes(EXIT.blocked) ? EXIT.blocked : codes.find(Boolean) ?? 0;
 }
 
 // ---------- CLI ----------
@@ -459,8 +478,7 @@ export async function main(argv) {
       const results = [];
       // ponytail: PRs run sequentially; parallel supervisors per PR if throughput matters.
       for (const n of String(opts.pr).split(',')) results.push(await supervise(opts.repo, Number(n), cfg, opts, deadline));
-      const code = results.length === 1 && opts.agent === 'none' ? (EXIT[results[0].verdict] ?? 0)
-        : results.some((r) => r.verdict === 'blocked') ? EXIT.blocked : 0;
+      const code = runExitCode(results);
       return out(results.length === 1 ? results[0] : { results }, code);
     }
     if (!prArg) throw new Error(`${cmd} needs a PR number`);
@@ -468,7 +486,8 @@ export async function main(argv) {
     if (cmd === 'status') {
       const s = classify(fetchPr(repo, prArg), cfg);
       const local = tryGit(['rev-parse', '--git-dir']) ? localGate(s, process.cwd()) : [];
-      return out({ ...s, reasons: [...s.reasons, ...local], readyToRequest: s.readyToRequest && !local.length,
+      const unresolvedThreads = s.unresolvedThreads.map((t) => ({ ...t, body: t.body.slice(0, 300) }));
+      return out({ ...s, unresolvedThreads, reasons: [...s.reasons, ...local], readyToRequest: s.readyToRequest && !local.length,
         tested: isTested(s.head, process.cwd()) }, 0);
     }
     if (cmd === 'ready') {
