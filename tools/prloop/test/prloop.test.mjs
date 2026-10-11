@@ -112,6 +112,13 @@ test('a PR-body eyes from before the current request does not let a late thumbs-
   assert.equal(classify(pr, cfg, Date.parse(at('10:08'))).verdict, 'clean'); // this cycle's eyes, then thumbs-up
 });
 
+test('a PR-body eyes after the head but before the request marks an earlier cycle even without an older request', () => {
+  const pr = fixture();
+  pr.comments.nodes = pr.comments.nodes.filter((c) => c.createdAt >= at('10:00')); // an automatic review: no older request
+  pr.reactions = { nodes: [{ content: 'EYES', createdAt: at('10:02'), user: BOT }, { content: 'THUMBS_UP', createdAt: at('10:06'), user: BOT }] };
+  assert.equal(classify(pr, cfg, NOW).reviewerState.state, 'none'); // the 👍 may finish the earlier automatic review
+});
+
 test('a PR-body thumbs-up without eyes does not count when older PR-body reactions were truncated', () => {
   const pr = cleanWithoutAck('2603924');
   pr.comments.nodes.pop();
@@ -1094,6 +1101,22 @@ test('sync linearizes a branch with merge commits on a rebase-only repository an
   assert.equal(r.run(r.work, 'rev-list', '--merges', 'origin/main..origin/feat'), '');
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), v.head);
   assert.equal(syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head: v.head, settings: { merge: false, squash: false } }).verdict, 'up_to_date');
+});
+
+test('sync linearizes a branch with merge commits when the new base conflicts only in a union file', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.commit('feature', { 'log.csv': 'id\na\nfeature\n' });
+  divergeOnMain(r, { 'app.txt': 'two\n' });
+  r.run(r.work, 'merge', '-q', '--no-edit', 'main');
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  divergeOnMain(r, { 'log.csv': 'id\na\nbase\n' }); // conflicts with the feature only in the union file
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: false, squash: false }, union: ['*.csv'] });
+  assert.equal(v.verdict, 'synced', JSON.stringify(v));
+  assert.equal(v.linearized, true);
+  assert.equal(readFileSync(join(r.work, 'log.csv'), 'utf8'), 'id\na\nbase\nfeature\n');
+  assert.equal(r.run(r.work, 'rev-list', '--merges', 'origin/main..origin/feat'), '');
 });
 
 test('sync refuses to linearize when a merge commit carries its own edits', (t) => {
