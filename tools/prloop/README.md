@@ -162,7 +162,7 @@ export PRLOOP_REVIEWER_LOGIN='^example-review-bot' PRLOOP_TRIGGER='/review' PRLO
 ## Limits
 
 - GitHub exposes no push time, so "after the head" uses the latest of the head commit's committer date, the last force-push event, and when prloop first saw this head become the PR head (kept per PR in `heads.json` in the state directory). A signal posted before prloop noticed a head change is ignored, which can cost a re-request but never accepts a review of another head.
-- Dismissed bot reviews are ignored: they are neither clean nor findings signals.
+- Dismissed bot reviews are ignored, including their inline threads: they are neither clean nor findings signals.
 - Reads up to 100 review threads, the latest 100 comments and the latest 50 reviews. More threads fail closed; on a longer history a local review is refused because its limits cannot be verified.
 - Transient GitHub errors are retried; three failed polls in a row end `wait` with `error`.
 - Outdated threads are flagged `outdated: true` but still count as unresolved: a moved anchor does not prove the finding is fixed.
