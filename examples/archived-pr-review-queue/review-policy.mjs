@@ -938,13 +938,45 @@ function assertCurrentRequest(policy) {
   const bound = generation
     ? ["head_sha", "status", "request_type", "request_comment_body", "request_timestamp", "github_comment_id"]
         .every((field) => generation[field] === request[field])
-    : request.budget_charged === false &&
+    : policy.epoch_type === REVIEW_EPOCH_LEGACY_CLOSURE &&
+      request.budget_charged === false &&
       request.request_type === REVIEW_REQUEST_TARGETED_CLOSURE &&
       Date.parse(requestedAt) < Date.parse(policy.policy_activated_at);
   if (!bound) {
     throw new Error(
       `state_corruption: ${request.status} current_request has no matching generation`,
     );
+  }
+}
+
+// The latest terminal result must describe a real event: a terminal or
+// timed-out request or generation with the same cycle, or a recorded budget
+// exhaustion.
+function assertLatestTerminalResult(policy) {
+  const latest = policy.latest_terminal_result;
+  if (latest === null) {
+    return;
+  }
+  requirePlainObject(latest, "review policy latest_terminal_result");
+  requireIsoTimestamp(latest.recorded_at, "latest_terminal_result.recorded_at");
+  if (latest.result === "review_budget_exhausted") {
+    requireNonEmptyString(policy.budget_exhaustion_reason, "budget_exhaustion_reason");
+    return;
+  }
+  const expectedStatus = { clear: "clear", findings: "findings", timeout: "timed_out" }[latest.result];
+  if (!expectedStatus) {
+    throw new Error("state_corruption: latest_terminal_result has an unsupported result");
+  }
+  const cycleId = requireMarkerToken(latest.cycle_id, "latest_terminal_result.cycle_id");
+  const matches = (record) =>
+    record?.cycle_id === cycleId &&
+    record.status === expectedStatus &&
+    (latest.result === "timeout" || record.head_sha === latest.head_sha);
+  const bound =
+    matches(policy.current_request) ||
+    policy.external_review_generations.some(matches);
+  if (!bound) {
+    throw new Error("state_corruption: latest_terminal_result has no matching request or generation");
   }
 }
 
@@ -1124,6 +1156,7 @@ export function assertReviewPolicy(
   }
   assertOwnerOverrideLedger(policy);
   assertCurrentRequest(policy);
+  assertLatestTerminalResult(policy);
   if (!Array.isArray(policy.legacy_request_evidence)) {
     throw new Error(
       "state_corruption: legacy_request_evidence must be an array",

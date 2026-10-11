@@ -67,6 +67,8 @@ export function getReviewerConfig(
   };
 }
 
+const NEVER_MATCHES = /(?!)/;
+
 export function buildReviewerLoginRegex(
   patternSource = DEFAULT_REVIEWER_LOGIN_PATTERN,
   fallbackPatternSource = DEFAULT_REVIEWER_LOGIN_PATTERN,
@@ -81,7 +83,8 @@ export function buildReviewerLoginRegex(
     try {
       return new RegExp(slashPattern[1], slashPattern[2] || "i");
     } catch {
-      return buildFallbackReviewerLoginRegex(fallbackPatternSource);
+      // Fail closed: a malformed configured identity matches no reviewer.
+      return NEVER_MATCHES;
     }
   }
 
