@@ -538,14 +538,15 @@ export function markTested(sha, cwd) {
   return full;
 }
 
-// Passed gates, keyed by the clean checkout's tree and the gate command: a rebase or sync that reproduces an
-// identical tree needs no second full gate. Failures are not recorded.
+// Passed gates, keyed by the clean checkout's exact HEAD, its repository and the gate command, since a gate may
+// inspect commit metadata or history beyond the tree. Failures are not recorded.
 const gateCacheFile = () => join(stateDir(), 'gate-cache');
 export function gateKey(gate, cwd) {
-  if (!gate || dirty(cwd)) return null; // HEAD^{tree} names a dirty checkout's content only when it is clean
-  return `${git(['rev-parse', 'HEAD^{tree}'], cwd)} ${createHash('sha256').update(gate).digest('hex')}`;
+  if (!gate || dirty(cwd)) return null; // HEAD names a checkout's content only when it is clean
+  const repo = git(['rev-parse', '--path-format=absolute', '--git-common-dir'], cwd);
+  return `${git(['rev-parse', 'HEAD'], cwd)} ${createHash('sha256').update(`${repo}\0${gate}`).digest('hex')}`;
 }
-// The tree SHA when `gate` already passed on this clean checkout, else null.
+// The HEAD SHA when `gate` already passed on this clean checkout, else null.
 export function gatePassed(gate, cwd) {
   const k = gateKey(gate, cwd);
   return k && existsSync(gateCacheFile()) && readFileSync(gateCacheFile(), 'utf8').split('\n').includes(k) ? k.split(' ')[0] : null;
@@ -1296,8 +1297,8 @@ export async function main(argv) {
     if (cmd === 'mark-tested') {
       const cwd = process.cwd(), tested = markTested(opts.sha, cwd), gate = opts.gate ?? process.env.PRLOOP_GATE;
       // The caller ran this gate itself on the current clean tree: record it so `ready` does not rerun it.
-      const gatePassedTree = gate && tested === git(['rev-parse', 'HEAD'], cwd) ? recordGatePass(gate, cwd) : null;
-      return out({ verdict: 'ok', tested, ...(gatePassedTree ? { gatePassedTree } : {}) }, 0);
+      const gatePassedHead = gate && tested === git(['rev-parse', 'HEAD'], cwd) ? recordGatePass(gate, cwd) : null;
+      return out({ verdict: 'ok', tested, ...(gatePassedHead ? { gatePassedHead } : {}) }, 0);
     }
     const cfg = config(opts);
     if (cmd === 'run' && opts.status) return out({ machine: machineLine(cfg), ...runStatus(opts.repo) }, 0);
@@ -1325,7 +1326,7 @@ export async function main(argv) {
     if (cmd === 'ready') {
       let s = classify(fetchPr(repo, prArg), cfg);
       const gate = await readyGate(s, cfg, process.cwd());
-      if (gate?.cached) console.error(`gate already passed for tree ${gate.cached}`);
+      if (gate?.cached) console.error(`gate already passed for head ${gate.cached}`);
       if (gate && !gate.ok) return out({ ready: false, pr: s.pr, head: s.head, gate: 'failed', exitCode: gate.status, tail: gate.tail,
         next: 'rerun the failing tests or step with its focused command, fix until it passes, then run `prloop ready` again' }, EXIT.blocked);
       // Waiting for admission or a slot can outlast a push from elsewhere: judge the PR as it is now, not the gated snapshot.

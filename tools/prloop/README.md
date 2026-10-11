@@ -103,7 +103,7 @@ Fix agents and local reviewers run in the PR's worktree, which may live outside 
 
 ### One full gate per tree
 
-A passing gate is recorded in `${XDG_STATE_HOME:-~/.local/state}/prloop/gate-cache`, keyed by the tree of the clean checkout (`git rev-parse HEAD^{tree}`) and the SHA-256 of the gate command. `ready` skips the gate on a hit, marks the head tested and prints `gate already passed for tree <sha>` on stderr; a rebase or sync that reproduces an identical tree also hits. A dirty checkout never hits, a gate that changed the tree is not recorded, failures are never recorded, and `--force-gate` always runs it. Agents run focused tests while fixing and leave the full gate to `prloop ready`; when the gate command was already run by hand and passed on the current clean tree, `prloop mark-tested --gate "<cmd>"` records it in the same cache instead of rerunning.
+A passing gate is recorded in `${XDG_STATE_HOME:-~/.local/state}/prloop/gate-cache`, keyed by the exact HEAD of the clean checkout and the SHA-256 of its repository (Git common directory) and the gate command, so a rebase, amend or other repository with an identical tree still runs the gate. `ready` skips the gate on a hit, marks the head tested and prints `gate already passed for head <sha>` on stderr; another worktree of the same repository at that head also hits. A dirty checkout never hits, a gate that changed the tree is not recorded, failures are never recorded, and `--force-gate` always runs it. Agents run focused tests while fixing and leave the full gate to `prloop ready`; when the gate command was already run by hand and passed on the current clean head, `prloop mark-tested --gate "<cmd>"` records it in the same cache instead of rerunning.
 
 ## Agent-in-the-loop commands
 
