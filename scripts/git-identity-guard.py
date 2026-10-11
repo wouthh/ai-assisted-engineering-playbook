@@ -229,12 +229,24 @@ def message_email_allowed(email: str, allowed: set[str]) -> bool:
         domain in RESERVED_DOMAINS or domain.endswith(RESERVED_TLDS))
 
 
-def message_addresses(line: str) -> list[str]:
-    """Words that must be treated as addresses (see the comment above)."""
+def message_addresses(text: str) -> list[tuple[int, str]]:
+    """(line number, word) pairs that must be treated as addresses.
+
+    The whole message is tokenized at once so that an address folded around
+    a standalone at-sign, even across lines, is rejoined before checking.
+    """
+    words = [(text.count("\n", 0, match.start()) + 1,
+              match.group().lstrip(LEADING_EDGE).rstrip(TRAILING_EDGE))
+             for match in re.finditer(r"[^\s,;]+", text)]
     found = []
-    for word in re.split(r"[\s,;]+", line):
-        word = word.lstrip(LEADING_EDGE).rstrip(TRAILING_EDGE)
-        if "@" not in word or word == "@":
+    for index, (number, word) in enumerate(words):
+        if word == "@":
+            # "name @ domain" is one folded address; check it as a whole.
+            before = words[index - 1][1] if index > 0 else ""
+            after = words[index + 1][1] if index + 1 < len(words) else ""
+            found.append((number, f"{before}@{after}"))
+            continue
+        if "@" not in word:
             continue
         # Exemptions apply only when the whole word has exactly that shape.
         # Anything else, including a split address such as "name @domain" or
@@ -243,18 +255,17 @@ def message_addresses(line: str) -> list[str]:
             continue  # A mention such as @name or a scope such as @scope/name.
         if PACKAGE_VERSION.fullmatch(word):
             continue  # A package version such as name@1.2.3 or @scope/name@1.2.3.
-        found.append(word)
+        found.append((number, word))
     return found
 
 
 def check_message_text(text: str, allowed: set[str], label: str) -> None:
     # Every line is checked: the hook cannot tell whether Git will strip
     # comment lines (it keeps them for `git commit -m`, for example).
-    for number, line in enumerate(text.splitlines(), start=1):
-        for email in message_addresses(line):
-            if not message_email_allowed(email, allowed):
-                raise Refusal(f"{label} line {number} contains email "
-                              f"{email!r}, which is not on the allowlist")
+    for number, email in message_addresses(text):
+        if not message_email_allowed(email, allowed):
+            raise Refusal(f"{label} line {number} contains email "
+                          f"{email!r}, which is not on the allowlist")
 
 
 def check_message(path: pathlib.Path, allowed: set[str]) -> None:

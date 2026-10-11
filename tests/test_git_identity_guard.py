@@ -187,7 +187,7 @@ class MessageTests(GuardFixture):
                         "https://wrong@synthetic-mail.net/path.invalid",
                         "wrong@127.0.0.1", "ssh://wrong@127.0.0.1", "https://wrong@1.2.3",
                         "wrong @synthetic-mail.net", "wrong@ synthetic-mail.net",
-                        "@synthetic-mail.net"):
+                        "@synthetic-mail.net", "wrong @ synthetic-mail.net"):
             with self.subTest(address=address):
                 path = self.message(f"Add feature\n\nCo-authored-by: Synthetic <{address}>\n")
                 self.assert_refused(self.guard("--commit-msg", path), "line 3")
@@ -204,6 +204,10 @@ class MessageTests(GuardFixture):
         path = self.message("Add feature\n\nCo-authored-by: Synthetic <user@synthetic-mail.net>.\n")
         result = self.guard("--commit-msg", path)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_address_folded_across_lines_is_refused(self) -> None:
+        path = self.message("Add feature\n\nCo-authored-by: Synthetic <wrong\n@\nsynthetic-mail.net>\n")
+        self.assert_refused(self.guard("--commit-msg", path), "line 4")
 
     def test_package_versions_are_not_email(self) -> None:
         path = self.message("Bump zod@4.6.5, react@19.3.0 and pkg@1.2.3-beta.1\n\n"
