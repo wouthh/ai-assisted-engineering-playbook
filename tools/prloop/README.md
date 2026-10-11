@@ -71,7 +71,7 @@ The manual alternative, for an agent that drives one PR itself. Every command pr
 
 | Verdict | Exit | Meaning |
 |---|---|---|
-| `clean` | 0 | 👍 by the bot on the current request or on the PR body, or a bot comment or review on the head matching the clean regex. When the bot reacts more than once, the latest reaction wins. |
+| `clean` | 0 | 👍 by the bot on the current request, or (for an automatic review without a request) on the PR body after a 👀 there on this head, or a bot comment or review on the head matching the clean regex. When the bot reacts more than once, the latest reaction wins. |
 | `findings` | 10 | Unresolved threads (path, line, up to 2000 characters of body) plus any reviewer summary on this head. |
 | `not_requested` | 20 | No trigger comment after the current head commit. Run `prloop ready`, then request a review. |
 | `requested_while_unresolved` | 21 | A request was posted while older threads were still open. |
@@ -137,7 +137,7 @@ export PRLOOP_REVIEWER_LOGIN='^example-review-bot' PRLOOP_TRIGGER='/review' PRLO
 
 ## Limits
 
-- "After the head" uses the later of the head commit's committer date and the last force-push event; GitHub exposes no push time. A fast-forward to a commit dated before an existing request is not detected, which `ready` avoids by requiring a pushed head before each request.
+- GitHub exposes no push time, so "after the head" uses the latest of the head commit's committer date, the last force-push event, and when prloop first saw this head become the PR head (kept per PR in `heads.json` in the state directory). A signal posted before prloop noticed a head change is ignored, which can cost a re-request but never accepts a review of another head.
 - Reads up to 100 review threads, the latest 100 comments and the latest 50 reviews. More threads fail closed; on a longer history a local review is refused because its limits cannot be verified.
 - Transient GitHub errors are retried; three failed polls in a row end `wait` with `error`.
 - Outdated threads are flagged `outdated: true` but still count as unresolved: a moved anchor does not prove the finding is fixed.
