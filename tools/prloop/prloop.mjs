@@ -2,7 +2,7 @@
 // prloop: wait for an external PR reviewer bot and tell the agent what to do next.
 // Single file, no dependencies. Needs Node 20+, git and an authenticated `gh`.
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { appendFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { availableParallelism, freemem, homedir, loadavg, tmpdir, totalmem } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -22,8 +22,11 @@ Recommended: start the supervisor once in the background, check in with --status
 
 Agent-in-the-loop commands:
   prloop status <pr> [--repo owner/name]
-  prloop ready <pr> [--gate "<cmd>"]     runs the gate, marks the head tested, checks the request gate
-  prloop mark-tested [--sha <sha>]       manual escape hatch when there is no gate command
+  prloop ready <pr> [--gate "<cmd>"] [--force-gate]
+                                         runs the gate (skipped when it already passed on this clean tree),
+                                         marks the head tested, checks the request gate
+  prloop mark-tested [--sha <sha>] [--gate "<cmd>"]
+                                         manual escape hatch; with --gate, records that this gate passed on the clean tree
   prloop wait <pr>
   prloop sync <pr> [--union <glob>]...
 
@@ -39,6 +42,7 @@ Options (flag or env):
   --interval <dur>          PRLOOP_INTERVAL        default: 75s between polls
   --max-local-reviews <n>   PRLOOP_MAX_LOCAL_REVIEWS  default: 3 per PR
   --agent claude|codex|none PRLOOP_AGENT           fix agent and local reviewer; --model, --effort
+  --agent-timeout <dur>     PRLOOP_AGENT_TIMEOUT   default: 90m; kills the agent, also its foreground command budget
 
 Self-check: \`run\` and \`ready\` warn when prloop's own checkout is dirty, off its default branch or behind it.
   --require-current         PRLOOP_REQUIRE_CURRENT=1  fail with a usage error instead of warning
@@ -55,7 +59,7 @@ Exit codes: 0 clean/ok/merged, 10 findings, 20 not_requested, 21 requested_while
 
 // ---------- small helpers ----------
 
-const FLAGS = new Set(['help', 'status', 'requireCurrent']);
+const FLAGS = new Set(['help', 'status', 'requireCurrent', 'forceGate']);
 
 // Every option except FLAGS takes a value; a missing one fails instead of becoming `true`.
 export function parseArgs(argv) {
@@ -143,6 +147,8 @@ export function config(opts, env = process.env) {
     model: opts.model ?? env.PRLOOP_MODEL,
     effort: opts.effort ?? env.PRLOOP_EFFORT,
     gate: opts.gate ?? env.PRLOOP_GATE,
+    forceGate: !!opts.forceGate,
+    agentTimeout: parseDuration(opts.agentTimeout ?? env.PRLOOP_AGENT_TIMEOUT ?? '90m', 'agent-timeout'),
     trigger: String(opts.trigger ?? env.PRLOOP_TRIGGER ?? '@codex review'),
     clean: new RegExp(opts.cleanRegex ?? env.PRLOOP_CLEAN_REGEX ?? 'didn.t find any major issues', 'i'),
     timeout: parseDuration(opts.timeout ?? env.PRLOOP_TIMEOUT ?? '40m', 'timeout'),
@@ -532,13 +538,41 @@ export function markTested(sha, cwd) {
   return full;
 }
 
+// Passed gates, keyed by the clean checkout's tree and the gate command: a rebase or sync that reproduces an
+// identical tree needs no second full gate. Failures are not recorded.
+const gateCacheFile = () => join(stateDir(), 'gate-cache');
+export function gateKey(gate, cwd) {
+  if (!gate || dirty(cwd)) return null; // HEAD^{tree} names a dirty checkout's content only when it is clean
+  return `${git(['rev-parse', 'HEAD^{tree}'], cwd)} ${createHash('sha256').update(gate).digest('hex')}`;
+}
+// The tree SHA when `gate` already passed on this clean checkout, else null.
+export function gatePassed(gate, cwd) {
+  const k = gateKey(gate, cwd);
+  return k && existsSync(gateCacheFile()) && readFileSync(gateCacheFile(), 'utf8').split('\n').includes(k) ? k.split(' ')[0] : null;
+}
+export function recordGatePass(gate, cwd, key = gateKey(gate, cwd)) {
+  if (!key) return null;
+  const f = gateCacheFile();
+  const prev = existsSync(f) ? readFileSync(f, 'utf8').split('\n').filter((l) => l && l !== key).slice(-199) : [];
+  mkdirSync(stateDir(), { recursive: true });
+  writeFileSync(f, [...prev, key].join('\n') + '\n');
+  return key.split(' ')[0];
+}
+
 // Runs the project gate for `ready` when one is configured and the clean, pushed PR head is not yet
 // tested; a pass marks the head tested. Returns null when nothing ran. `deps` injects the machine metrics,
 // slot directory, clock and logger (see runGate).
 export async function readyGate(s, cfg, cwd, deps = {}) {
   if (!cfg.gate || isTested(s.head, cwd) || localGate(s, cwd).some((r) => !r.includes('not marked tested'))) return null;
+  const cached = !cfg.forceGate && gatePassed(cfg.gate, cwd);
+  if (cached) { markTested(s.head, cwd); return { ok: true, cached }; }
+  const key = gateKey(cfg.gate, cwd);
   const r = await runGate(cfg.gate, cwd, cfg, deps);
-  if (r.status === 0) { markTested(s.head, cwd); return { ok: true }; }
+  if (r.status === 0) {
+    if (key && gateKey(cfg.gate, cwd) === key) recordGatePass(cfg.gate, cwd, key); // the gate left the tree as it found it
+    markTested(s.head, cwd);
+    return { ok: true };
+  }
   return { ok: false, status: r.status, tail: String(r.stdout || r.stderr).trimEnd().split('\n').slice(-60).join('\n') };
 }
 
@@ -754,15 +788,17 @@ async function runReviewer(cfg, prompt, cwd, keep) {
     if (cfg.agent === 'codex') { // otherwise claude; localReview never gets here with --agent none
       writeFileSync(join(dir, 'schema.json'), JSON.stringify(REVIEW_SCHEMA));
       const r = await spawnAsync('codex', ['exec', '--sandbox', 'read-only', '--output-schema', join(dir, 'schema.json'), '-o', join(dir, 'out.json'),
-        ...(cfg.model ? ['-m', cfg.model] : []), ...(cfg.effort ? ['-c', `model_reasoning_effort=${cfg.effort}`] : []), prompt], cwd, { lock: cfg.lock });
+        ...(cfg.model ? ['-m', cfg.model] : []), ...(cfg.effort ? ['-c', `model_reasoning_effort=${cfg.effort}`] : []), prompt], cwd, agentSpawn(cfg));
       keep({ ...r, final: existsSync(join(dir, 'out.json')) ? readFileSync(join(dir, 'out.json'), 'utf8') : r.stdout });
+      if (r.timedOut) throw new Error('agent timed out');
       if (r.status !== 0) throw new Error(`codex reviewer exited with ${r.status}: ${(r.stderr ?? '').slice(-300)}`);
       return parseReview(readFileSync(join(dir, 'out.json'), 'utf8'));
     }
     const r = await spawnAsync('claude', ['-p', prompt, '--model', cfg.model ?? 'claude-opus-5-5', '--effort', cfg.effort ?? 'medium',
       '--permission-mode', 'dontAsk', '--allowedTools', 'Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git show:*)',
-      '--output-format', 'json', '--json-schema', JSON.stringify(REVIEW_SCHEMA)], cwd, { lock: cfg.lock });
+      '--output-format', 'json', '--json-schema', JSON.stringify(REVIEW_SCHEMA)], cwd, agentSpawn(cfg));
     keep({ ...r, final: r.stdout });
+    if (r.timedOut) throw new Error('agent timed out');
     if (r.status !== 0) throw new Error(`claude reviewer exited with ${r.status}: ${(r.stderr ?? '').slice(-300)}`);
     const out = JSON.parse(r.stdout);
     return parseReview(out.structured_output ?? out.result);
@@ -881,7 +917,8 @@ export function buildPrompt(t) {
     : `Post the review request as a new PR comment, reusing exactly:\n${t.requestBody}`;
   const gate = t.gate
     ? `\`prloop ready ${t.pr} --repo ${t.repo}\` runs the gate (${t.gate}) and marks the head tested`
-    : `run the gate documented in AGENTS.md or README, then \`prloop mark-tested\` and \`prloop ready ${t.pr} --repo ${t.repo}\``;
+    : `\`prloop ready ${t.pr} --repo ${t.repo} --gate "<the full gate documented in AGENTS.md or README>"\` runs it and marks the head tested`;
+  const minutes = Math.ceil((t.agentTimeout ?? 90 * 6e4) / 6e4);
   return `You are fixing PR #${t.pr} in ${t.repo}, branch ${t.branch}, head ${t.head}, worktree ${t.cwd}.
 Trigger: ${t.trigger}. ${t.note ?? ''}
 ${data}${summary}
@@ -889,7 +926,7 @@ ${data}${summary}
 Do these steps in order, in this session:
 1. Read only the referenced files plus every AGENTS.md that applies to them (root and nested).
 2. Fix each valid finding with a regression test. Reply with evidence on invalid findings and leave them unresolved, except a finding proven to misread AGENTS.md, which you resolve after the evidence reply once every AGENTS.md that applies to its path confirms it is invalid. Resolve conflicts.
-3. Run focused tests while fixing. Commit and push with normal commits (run \`prloop sync ${t.pr}\` first if the base moved).
+3. Run focused tests while fixing; never run the full project gate yourself: only \`prloop ready\` runs it, at most once per tree. If you already ran exactly that gate command and it passed on the current clean tree, \`prloop mark-tested --gate "<cmd>"\` records it instead of rerunning. Commit and push with normal commits (run \`prloop sync ${t.pr}\` first if the base moved).
 4. Resolve the threads you fixed; reply on the disputed ones.
 5. Gate: ${gate}. If it reports a gate failure, do not rerun \`prloop ready\` straight away: rerun the failing tests or step with their focused command, fix them (including failures you did not cause when they block the gate), commit and push, and call \`prloop ready\` again only when you are confident the full gate passes. At most 5 \`prloop ready\` calls; stop as blocked only if the same failure persists after 3 consecutive fix attempts, or the failure is environmental (missing tool, no network, permission denied), and report the exact failing step. If \`prloop ready\` fails for another reason, make one repair attempt, then stop as blocked.
 6. ${request}
@@ -897,6 +934,7 @@ Do these steps in order, in this session:
 {"status":"requested|blocked|nothing_to_do","head":"<sha>","fixed":["<thread ids>"],"disputed":["<thread ids>"],"reason":"<short>"}
 Use "blocked" with the reason when disputed findings remain unresolved.
 
+Run \`prloop ready\` and any long test command in the foreground with a timeout of at least ${minutes} minutes. Never background a command; if one is backgrounded anyway, wait for it to finish before ending your turn. Your final message must end with the JSON status line.
 Never wait for or poll reviews, merge, touch other PRs, rewrite history except through \`prloop sync\`, or retry in a loop. A denied action or a missing tool means stop immediately and report "blocked" with the denied command or missing tool named in "reason".`;
 }
 
@@ -959,28 +997,40 @@ export function pruneAgentLogs(now = Date.now()) {
 // child cannot exhaust the heap; callers use only the tail (failure reports, the agent's final JSON line).
 export const OUTPUT_TAIL = 4 << 20;
 const keepTail = (s) => (s.length > 2 * OUTPUT_TAIL ? s.slice(-OUTPUT_TAIL) : s);
-const spawnAsync = (cmd, args, cwd, { env = process.env, lock, onSpawn = lock?.adopt } = {}) => new Promise((done) => {
-  const c = spawn(cmd, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], env: lock?.token ? { ...env, PRLOOP_LOCK_TOKEN: lock.token } : env });
+// With `timeout` the child leads its own process group, and the whole group is killed when the timer fires.
+const spawnAsync = (cmd, args, cwd, { env = process.env, lock, onSpawn = lock?.adopt, timeout } = {}) => new Promise((done) => {
+  const c = spawn(cmd, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], detached: !!timeout, env: lock?.token ? { ...env, PRLOOP_LOCK_TOKEN: lock.token } : env });
   if (c.pid && onSpawn) onSpawn(c.pid);
+  let timedOut = false;
+  const timer = timeout && c.pid && setTimeout(() => {
+    timedOut = true;
+    try { process.kill(-c.pid, 'SIGKILL'); } catch { c.kill('SIGKILL'); }
+  }, timeout);
   let stdout = '', stderr = '';
   c.stdout.on('data', (d) => { stdout = keepTail(stdout + d); });
   c.stderr.on('data', (d) => { stderr = keepTail(stderr + d); });
   const tail = (s) => s.slice(-OUTPUT_TAIL);
-  c.on('error', (e) => done({ status: 1, stdout: tail(stdout), stderr: `${tail(stderr)}${e.message}` }));
-  c.on('close', (code) => done({ status: code ?? 1, stdout: tail(stdout), stderr: tail(stderr) }));
+  c.on('error', (e) => { clearTimeout(timer); done({ status: 1, stdout: tail(stdout), stderr: `${tail(stderr)}${e.message}` }); });
+  c.on('close', (code) => { clearTimeout(timer); done({ status: code ?? 1, stdout: tail(stdout), stderr: tail(stderr), ...(timedOut ? { timedOut } : {}) }); });
 });
+
+// Claude Code moves a Bash command to the background after its default timeout, and a -p session then ends
+// before the command (the gate) finishes: raise both limits to the agent's own budget.
+export const agentEnv = (cfg, env = process.env) => cfg.agent === 'claude'
+  ? { ...env, BASH_DEFAULT_TIMEOUT_MS: String(cfg.agentTimeout), BASH_MAX_TIMEOUT_MS: String(cfg.agentTimeout) } : env;
+const agentSpawn = (cfg) => ({ lock: cfg.lock, timeout: cfg.agentTimeout, env: agentEnv(cfg) });
 
 async function runFixAgent(cfg, prompt, cwd) {
   if (cfg.agent === 'codex') {
     const dir = mkdtempSync(join(tmpdir(), 'prloop-agent-'));
     try {
       const r = await spawnAsync('codex', ['exec', '--sandbox', 'workspace-write', '-c', 'sandbox_workspace_write.network_access=true', '-o', join(dir, 'last.txt'),
-        ...(cfg.model ? ['-m', cfg.model] : []), ...(cfg.effort ? ['-c', `model_reasoning_effort=${cfg.effort}`] : []), prompt], cwd, { lock: cfg.lock });
+        ...(cfg.model ? ['-m', cfg.model] : []), ...(cfg.effort ? ['-c', `model_reasoning_effort=${cfg.effort}`] : []), prompt], cwd, agentSpawn(cfg));
       return { ...r, final: existsSync(join(dir, 'last.txt')) ? readFileSync(join(dir, 'last.txt'), 'utf8') : r.stdout };
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }
   const r = await spawnAsync('claude', ['-p', prompt, '--model', cfg.model ?? 'claude-opus-5-5', '--effort', cfg.effort ?? 'medium',
-    '--permission-mode', 'auto', '--output-format', 'json'], cwd, { lock: cfg.lock });
+    '--permission-mode', 'auto', '--output-format', 'json'], cwd, agentSpawn(cfg));
   return { ...r, final: r.stdout };
 }
 
@@ -1053,7 +1103,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
       const repeated = recordFindings(st.seen, v.findings);
       if (repeated.length) return block(st, 'the same finding came back after two fixes', 'decide whether the finding is valid');
     }
-    const t = { ...v, repo, pr: st.pr, branch: s.branch, head: s.head, cwd, gate: cfg.gate, localReview: cfg.mode === 'local' || !!v.localReview, requestBody: s.rerequestBody };
+    const t = { ...v, repo, pr: st.pr, branch: s.branch, head: s.head, cwd, gate: cfg.gate, agentTimeout: cfg.agentTimeout, localReview: cfg.mode === 'local' || !!v.localReview, requestBody: s.rerequestBody };
     const prompt = buildPrompt(t);
     if (cfg.agent === 'none') return event(st, 'needs_agent', { verdict: v.verdict, prompt, next: 'spawn an agent with this prompt, then rerun prloop run' });
     event(st, 'agent', { verdict: v.verdict });
@@ -1062,6 +1112,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     lock.release(); // the spawn ended; the progress check below only reads
     const agentLog = st.agentLog = saveAgentLog(repo, st.pr, r);
     const fail = (reason) => event(st, 'blocked', { reason, next: `a human decision is needed; the agent output is in ${agentLog}`, agentLog });
+    if (r.timedOut) return fail('agent timed out');
     const result = parseAgentResult(r.final);
     if (DENIED.test(`${r.final}\n${r.stderr}`)) return fail('the agent reported a permission denial');
     if (r.status !== 0) return fail(`the agent exited with status ${r.status}: ${cliWrapper(r.final) ? agentFailure(r.final) : tail(r.stderr)}`);
@@ -1241,7 +1292,12 @@ export async function main(argv) {
       const holder = lockHolder(dir, null);
       return out({ dir, locked: !!holder, holder: holder ? pick(holder, ['pid', 'purpose', 'startedAt']) : null }, holder ? EXIT.blocked : 0);
     }
-    if (cmd === 'mark-tested') return out({ verdict: 'ok', tested: markTested(opts.sha, process.cwd()) }, 0);
+    if (cmd === 'mark-tested') {
+      const cwd = process.cwd(), tested = markTested(opts.sha, cwd), gate = opts.gate ?? process.env.PRLOOP_GATE;
+      // The caller ran this gate itself on the current clean tree: record it so `ready` does not rerun it.
+      const gatePassedTree = gate && tested === git(['rev-parse', 'HEAD'], cwd) ? recordGatePass(gate, cwd) : null;
+      return out({ verdict: 'ok', tested, ...(gatePassedTree ? { gatePassedTree } : {}) }, 0);
+    }
     const cfg = config(opts);
     if (cmd === 'run' && opts.status) return out({ machine: machineLine(cfg), ...runStatus(opts.repo) }, 0);
     if (cmd === 'run' || cmd === 'ready') {
@@ -1268,6 +1324,7 @@ export async function main(argv) {
     if (cmd === 'ready') {
       let s = classify(fetchPr(repo, prArg), cfg);
       const gate = await readyGate(s, cfg, process.cwd());
+      if (gate?.cached) console.error(`gate already passed for tree ${gate.cached}`);
       if (gate && !gate.ok) return out({ ready: false, pr: s.pr, head: s.head, gate: 'failed', exitCode: gate.status, tail: gate.tail,
         next: 'rerun the failing tests or step with its focused command, fix until it passes, then run `prloop ready` again' }, EXIT.blocked);
       // Waiting for admission or a slot can outlast a push from elsewhere: judge the PR as it is now, not the gated snapshot.
