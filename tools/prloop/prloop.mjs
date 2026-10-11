@@ -867,7 +867,7 @@ export async function localReview(repo, s, cfg, cwd, onLog = () => {}) {
   if (baseError) return { verdict: 'blocked', pr: s.pr, head: s.head, reason: `local review: ${baseError}` };
   const prompt = localReviewPrompt(s);
   let findings, agentLog;
-  const keep = (r) => onLog(agentLog = saveAgentLog(repo, s.pr, r));
+  const keep = (r) => onLog(agentLog = saveAgentLog(repo, s.pr, r), r);
   try { findings = await runReviewer(cfg, prompt, cwd, keep); } catch (e) {
     return { verdict: 'blocked', pr: s.pr, head: s.head, reason: `local reviewer failed: ${String(e.message).slice(0, 400)}`, ...(agentLog ? { agentLog } : {}) };
   }
@@ -981,6 +981,25 @@ Never wait for or poll reviews, merge, touch other PRs, rewrite history except t
 
 // Finds the agent's final JSON line, also inside a JSON wrapper such as `claude --output-format json`.
 const cliWrapper = (text) => { try { const w = JSON.parse(String(text ?? '')); return w && typeof w === 'object' ? w : null; } catch { return null; } };
+
+// Turns, cost and tokens from a claude `--output-format json` wrapper; null when the output carries no usage
+// (codex exec prints none in the mode prloop uses). Input tokens include cache creation and cache reads.
+export function agentUsage(text) {
+  const w = cliWrapper(text), u = w?.usage;
+  if (!u || typeof u !== 'object') return null;
+  const n = (v) => (Number.isFinite(v) ? v : 0);
+  return { turns: n(w.num_turns), costUsd: n(w.total_cost_usd), inputTokens: n(u.input_tokens) + n(u.cache_creation_input_tokens) + n(u.cache_read_input_tokens),
+    outputTokens: n(u.output_tokens) };
+}
+
+// Adds one finished agent or local reviewer to the PR's totals; values stay null until some run reports usage.
+export function addUsage(st, stdout) {
+  const t = (st.usage ??= { agentRuns: 0, turns: null, costUsd: null, inputTokens: null, outputTokens: null });
+  t.agentRuns++;
+  const u = agentUsage(stdout);
+  if (u) for (const [k, v] of Object.entries(u)) t[k] = k === 'costUsd' ? Math.round(((t[k] ?? 0) + v) * 1e6) / 1e6 : (t[k] ?? 0) + v;
+  return t;
+}
 
 // The last flat JSON object with a known status anywhere in the agent's final message: on its own line, inline,
 // or pretty-printed inside a ```json fence. With `--output-format json` the CLI wrapper's `result` is searched.
@@ -1151,6 +1170,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     const testedBefore = isTested(s.head, cwd);
     const r = await runFixAgent({ ...cfg, lock }, prompt, cwd);
     lock.release(); // the spawn ended; the progress check below only reads
+    addUsage(st, r.stdout);
     const agentLog = st.agentLog = saveAgentLog(repo, st.pr, r);
     const fail = (reason) => event(st, 'blocked', { reason, next: `a human decision is needed; the agent output is in ${agentLog}`, agentLog });
     if (r.timedOut) return fail('agent timed out');
@@ -1220,7 +1240,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
       st.lockedBy = undefined;
       event(st, 'local_review');
       let r;
-      try { r = await localReview(repo, s, { ...cfg, lock }, cwd, (p) => { st.agentLog = p; }); } finally { lock.release(); }
+      try { r = await localReview(repo, s, { ...cfg, lock }, cwd, (p, out) => { st.agentLog = p; addUsage(st, out.stdout); }); } finally { lock.release(); }
       if (!r) return event(st, 'polling', { verdict: 'local_review_posted', agentLog: st.agentLog });
       if (r.verdict === 'blocked') return r.agentLog ? event(st, 'blocked', { reason: r.reason, next: `a human decision is needed; the reviewer output is in ${r.agentLog}`, agentLog: r.agentLog }) : block(st, r.reason);
       return fix(st, s, cwd, { verdict: 'not_requested', trigger: 'local_review', missing: r.missing, localReview: true });
@@ -1261,7 +1281,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     await Promise.race([sleep(cfg.interval), ...busy.values()]);
   }
   return states.map((st) => ({ pr: st.pr, verdict: st.phase === 'needs_agent' ? st.verdict : st.phase, reason: st.reason, head: st.head,
-    rounds: st.rounds, next: st.next, ...(st.agentLog ? { agentLog: st.agentLog } : {}), ...(st.prompt && st.phase === 'needs_agent' ? { prompt: st.prompt } : {}) }));
+    rounds: st.rounds, next: st.next, ...(st.usage ? { usage: st.usage } : {}), ...(st.agentLog ? { agentLog: st.agentLog } : {}), ...(st.prompt && st.phase === 'needs_agent' ? { prompt: st.prompt } : {}) }));
 }
 
 const pick = (o, keys) => Object.fromEntries(keys.filter((k) => o[k] !== undefined).map((k) => [k, o[k]]));
@@ -1280,7 +1300,7 @@ export function runStatus(repoFilter, last = 5) {
       let events = [];
       for (const f of [st.log, ...logs].filter(Boolean)) if ((events = read(f).filter(mine(f))).length) break;
       return { repo: st.repo, pr: st.pr, phase: st.phase, head: short(st.head), rounds: st.rounds, roundResets: st.roundResets, reason: st.reason, next: st.next,
-        updatedAt: st.updatedAt, carry: st.carry, agentLog: st.agentLog, events: events.slice(-last) };
+        updatedAt: st.updatedAt, carry: st.carry, agentLog: st.agentLog, usage: st.usage, events: events.slice(-last) };
     });
   return { prs };
 }
