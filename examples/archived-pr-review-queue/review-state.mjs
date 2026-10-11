@@ -176,10 +176,10 @@ export function shouldReuseRequestedReviewAt(input) {
 
   const currentHeadOid = trimToNull(options.currentHeadOid);
   const lastReviewCycleHeadOid = trimToNull(options.lastReviewCycleHeadOid);
+  // A known current head needs a saved head binding that matches it exactly.
   if (
     currentHeadOid !== null &&
-    lastReviewCycleHeadOid !== null &&
-    currentHeadOid !== lastReviewCycleHeadOid
+    (lastReviewCycleHeadOid === null || currentHeadOid !== lastReviewCycleHeadOid)
   ) {
     return false;
   }

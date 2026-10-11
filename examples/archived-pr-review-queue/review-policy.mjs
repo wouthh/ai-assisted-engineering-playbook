@@ -1770,6 +1770,17 @@ function assertClearResultFollowsRequest({ result, recordedAt, requestedAt }) {
   }
 }
 
+function assertTerminalResultNotStale({ recordedAt, priorRecordedAt, cycleId }) {
+  if (
+    typeof priorRecordedAt === "string" &&
+    Date.parse(recordedAt) < Date.parse(priorRecordedAt)
+  ) {
+    throw new Error(
+      `stale terminal review evidence for ${cycleId}: ${recordedAt} predates ${priorRecordedAt}`,
+    );
+  }
+}
+
 export function recordReviewCycleTerminalResult(
   policy,
   { cycleId, headSha, result, recordedAt, evidence = null },
@@ -1805,6 +1816,11 @@ export function recordReviewCycleTerminalResult(
     result: normalizedResult,
     recordedAt: normalizedRecordedAt,
     requestedAt: next.current_request.request_timestamp,
+  });
+  assertTerminalResultNotStale({
+    recordedAt: normalizedRecordedAt,
+    priorRecordedAt: next.current_request.terminal_result_at,
+    cycleId: normalizedCycleId,
   });
   const adoptedLegacyRequest =
     next.current_request.status === "legacy_adopted_pending" &&
@@ -1873,6 +1889,11 @@ export function recordExternalReviewGenerationTerminalResult(
     result: normalizedResult,
     recordedAt: normalizedRecordedAt,
     requestedAt: generation.request_timestamp,
+  });
+  assertTerminalResultNotStale({
+    recordedAt: normalizedRecordedAt,
+    priorRecordedAt: generation.terminal_result_at,
+    cycleId: normalizedCycleId,
   });
   generation.status = normalizedResult;
   generation.terminal_result_at = normalizedRecordedAt;
