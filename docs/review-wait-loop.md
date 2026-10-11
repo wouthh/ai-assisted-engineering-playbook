@@ -14,6 +14,8 @@ When GitHub reports the branch behind or conflicting with its base, `prloop sync
 
 The recommended way to run the loop is one background supervisor: `prloop run --repo <owner/name> --pr <N,...> --gate "<cmd>"`. It polls all PRs round-robin without a model, spawns a fresh agent only when there is work, and each agent does one step (fix, gate through `prloop ready`, reply and resolve, request) and exits. A coordinator checks in with `prloop run --status`, which reads local state and an event log instead of GitHub. Agents running `prloop wait` themselves is the manual alternative.
 
+Several supervisors and unrelated work can share one machine safely, because resource awareness is on by default. Gates take one of `--gate-slots` (2) slots shared by all of the user's `prloop` processes, and no agent or gate starts while the 1-minute load average exceeds `--max-load` (0.75 x CPU cores) or available memory is below `--min-free-mem` (the larger of 4 GiB and 10% of RAM). A wait never deadlocks: after `--resource-wait` (30m) it proceeds with one slot only. `--gate-tmpdir <dir>` gives each gate a private, deleted-afterwards `TMPDIR` so a large suite cannot fill a small `/tmp`. `prloop run --status` shows load, free memory and slots in use. See [Sharing one machine](../tools/prloop/README.md#sharing-one-machine).
+
 ## Why
 
 - **Fewer tokens.** Polling, gating and syncing cost no model tokens. Agents start only when there is work, see only the current trigger, and exit after one step; a coordinator reads one compact status object.
