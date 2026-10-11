@@ -885,8 +885,8 @@ Trigger: ${t.trigger}. ${t.note ?? ''}
 ${data}${summary}
 
 Do these steps in order, in this session:
-1. Read only the referenced files plus AGENTS.md.
-2. Fix each valid finding with a regression test. Reply with evidence on invalid findings and leave them unresolved, except a finding proven to misread AGENTS.md, which you resolve after the evidence reply. Resolve conflicts.
+1. Read only the referenced files plus every AGENTS.md that applies to them (root and nested).
+2. Fix each valid finding with a regression test. Reply with evidence on invalid findings and leave them unresolved, except a finding proven to misread AGENTS.md, which you resolve after the evidence reply once every AGENTS.md that applies to its path confirms it is invalid. Resolve conflicts.
 3. Run focused tests while fixing. Commit and push with normal commits (run \`prloop sync ${t.pr}\` first if the base moved).
 4. Resolve the threads you fixed; reply on the disputed ones.
 5. Gate: ${gate}. If it reports a gate failure, do not rerun \`prloop ready\` straight away: rerun the failing tests or step with their focused command, fix them (including failures you did not cause when they block the gate), commit and push, and call \`prloop ready\` again only when you are confident the full gate passes. At most 5 \`prloop ready\` calls; stop as blocked only if the same failure persists after 3 consecutive fix attempts, or the failure is environmental (missing tool, no network, permission denied), and report the exact failing step. If \`prloop ready\` fails for another reason, make one repair attempt, then stop as blocked.
