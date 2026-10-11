@@ -354,12 +354,14 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
   if (baseError) return { verdict: 'error', error: baseError };
   tryGit(['fetch', '--quiet', headRemote, branch], cwd);
   if (git(['rev-parse', 'HEAD'], cwd) !== head) return { verdict: 'error', error: `local HEAD differs from remote PR head ${short(head)}: push or pull first` };
-  if (tryGit(['merge-base', '--is-ancestor', `${remote}/${base}`, 'HEAD'], cwd) !== null) return { verdict: 'up_to_date', head };
+  // Sync to the exact base commit GitHub reports, not to whatever else the remote branch holds.
+  const target = baseOid ?? `${remote}/${base}`;
+  if (tryGit(['merge-base', '--is-ancestor', target, 'HEAD'], cwd) !== null) return { verdict: 'up_to_date', head };
   // ponytail: merge whenever merge or squash merges are allowed; rebase only for rebase-only repos.
   const rebase = !settings.merge && !settings.squash;
   const env = { ...process.env, GIT_EDITOR: 'true' };
   const step = (args) => spawnSync('git', args, { cwd, env, encoding: 'utf8' }).status === 0;
-  let ok = step(rebase ? ['rebase', `${remote}/${base}`] : ['merge', '--no-edit', `${remote}/${base}`]);
+  let ok = step(rebase ? ['rebase', target] : ['merge', '--no-edit', target]);
   for (let i = 0; !ok && i < 200; i++) {
     // During a rebase stage 2 is the base side; during a merge stage 3 is.
     const manual = resolveUnion(cwd, union, rebase ? 2 : 3);
@@ -544,6 +546,7 @@ export function buildPrompt(t) {
   const data = t.trigger === 'conflict' ? `Conflicted files: ${t.conflicts.join(', ')}`
     : t.findings?.length ? `Findings:\n${t.findings.map((f) => `- ${f.id} ${f.path ?? ''}:${f.line ?? ''} ${plain(f.body).slice(0, 600)}`).join('\n')}`
       : `Missing: ${(t.missing ?? []).join('; ') || 'a review request on the current head'}`;
+  const summary = t.summaries?.length ? `\nReviewer summary for this head (may hold findings that are not threads):\n${t.summaries.map(plain).join('\n').slice(0, 1500)}` : '';
   const request = t.localReview
     ? 'Do not post a review request: prloop reviews this PR locally once `prloop ready` passes.'
     : `Post the review request as a new PR comment, reusing exactly:\n${t.requestBody}`;
@@ -552,7 +555,7 @@ export function buildPrompt(t) {
     : `run the gate documented in AGENTS.md or README, then \`prloop mark-tested\` and \`prloop ready ${t.pr} --repo ${t.repo}\``;
   return `You are fixing PR #${t.pr} in ${t.repo}, branch ${t.branch}, head ${t.head}, worktree ${t.cwd}.
 Trigger: ${t.trigger}. ${t.note ?? ''}
-${data}
+${data}${summary}
 
 Do these steps in order, in this session:
 1. Read only the referenced files plus AGENTS.md.
@@ -712,7 +715,7 @@ export async function runAll(opts, cfg) {
     if (!slot()) return;
     const trigger = s.verdict === 'timeout' ? 'timeout' : s.verdict === 'not_requested' ? 'not_requested'
       : s.unresolvedThreads.some((x) => isLocal(x.body)) ? 'local_review' : 'findings';
-    return fix(st, s, cwd, { verdict: s.verdict, trigger, findings: s.unresolvedThreads, missing: [...s.reasons, ...localGate(s, cwd)] });
+    return fix(st, s, cwd, { verdict: s.verdict, trigger, findings: s.unresolvedThreads, summaries: s.verdict === 'findings' ? s.summaries : [], missing: [...s.reasons, ...localGate(s, cwd)] });
   }
 
   for (;;) {
@@ -737,7 +740,7 @@ const pick = (o, keys) => Object.fromEntries(keys.filter((k) => o[k] !== undefin
 export function runStatus(repoFilter) {
   const dir = stateDir();
   const files = existsSync(dir) ? readdirSync(dir) : [];
-  const prs = files.filter((f) => f.endsWith('.json')).map((f) => JSON.parse(readFileSync(join(dir, f), 'utf8')))
+  const prs = files.filter((f) => /__\d+\.json$/.test(f)).map((f) => JSON.parse(readFileSync(join(dir, f), 'utf8')))
     .filter((st) => !repoFilter || st.repo === repoFilter)
     .map((st) => ({ repo: st.repo, pr: st.pr, phase: st.phase, head: short(st.head), rounds: st.rounds, reason: st.reason, next: st.next, updatedAt: st.updatedAt }));
   const latest = files.filter((f) => f.startsWith('run-')).sort().at(-1);
