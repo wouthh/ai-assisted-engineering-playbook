@@ -204,6 +204,8 @@ def check_identity(expected: str) -> None:
 
 def message_email_allowed(email: str, allowed: set[str]) -> bool:
     lower = email.lower()
+    if lower.count("@") != 1:
+        return False  # Never let a trailing allowed address vouch for a prefix.
     return (lower in allowed or lower in GENERIC_ALLOWED
             or lower.endswith(RESERVED_SUFFIXES)
             or GITHUB_USER_NOREPLY.fullmatch(lower) is not None)
@@ -212,13 +214,16 @@ def message_email_allowed(email: str, allowed: set[str]) -> bool:
 def message_addresses(line: str) -> list[str]:
     """Words that must be treated as addresses (see the comment on WORD_EDGE)."""
     found = []
-    for word in line.split():
+    for word in re.split(r"[\s,;]+", line):
         word = word.strip(WORD_EDGE)
-        if "@" not in word or word.startswith("@") or word.endswith("@"):
+        if "@" not in word or word.endswith("@"):
             continue
-        tail = word[word.rindex("@"):]
-        if VERSION_SUFFIX.fullmatch(tail):
-            continue
+        # Exemptions apply only when the whole word has exactly that shape.
+        body = word[1:] if word.startswith("@") else word
+        if "@" not in body:
+            continue  # A mention or decorator such as @name.
+        if body.count("@") == 1 and VERSION_SUFFIX.fullmatch(body[body.index("@"):]):
+            continue  # A package version such as name@1.2.3 or @scope/name@1.2.3.
         found.append(word)
     return found
 

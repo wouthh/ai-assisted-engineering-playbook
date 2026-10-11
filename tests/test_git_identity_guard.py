@@ -168,7 +168,10 @@ class MessageTests(GuardFixture):
     def test_punctuated_and_quoted_local_parts_are_refused(self) -> None:
         for address in ("wrong!@synthetic-mail.net", '"quoted name"@synthetic-mail.net',
                         '"wrong\\!name"@synthetic-mail.net', "wrong@[192.0.2.1]",
-                        "wrong@[foo\\]bar]", "https://user@host.synthetic-mail.net/path"):
+                        "wrong@[foo\\]bar]", "https://user@host.synthetic-mail.net/path",
+                        "wrong@synthetic-mail.net@1.2.3",
+                        "wrong@synthetic-mail.net,docs@example.com",
+                        "wrong@synthetic-mail.net@example.com"):
             with self.subTest(address=address):
                 path = self.message(f"Add feature\n\nCo-authored-by: Synthetic <{address}>\n")
                 self.assert_refused(self.guard("--commit-msg", path), "line 3")
