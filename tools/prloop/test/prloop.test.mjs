@@ -743,6 +743,16 @@ test('a carried clean verdict counts on the synced head only, and a real finding
   assert.equal(classify(pr, cfg, NOW).verdict, 'findings');
 });
 
+test('a new request on the synced head supersedes the carried clean verdict', () => {
+  const pr = fixture(); // keeps the current request on the synced head
+  pr.carry = { from: '0'.repeat(40), to: pr.headRefOid, patchId: 'p' };
+  const s = classify(pr, cfg, NOW);
+  assert.equal(s.verdict, 'pending');
+  assert.equal(s.carry, null);
+  request(pr).reactions.nodes.push({ content: 'THUMBS_UP', createdAt: at('10:20'), user: BOT });
+  assert.equal(classify(pr, cfg, NOW).verdict, 'clean');
+});
+
 for (const settings of [{ merge: true, squash: true }, { merge: false, squash: false }]) {
   const method = settings.merge ? 'merge' : 'rebase';
 
