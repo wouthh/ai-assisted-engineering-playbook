@@ -533,9 +533,27 @@ export function markTested(sha, cwd) {
   const f = markerFile(cwd);
   if (!f) throw new Error('not inside a git checkout');
   const full = git(['rev-parse', sha ?? 'HEAD'], cwd);
-  const prev = existsSync(f) ? readFileSync(f, 'utf8').split('\n').filter(Boolean).slice(-50) : [];
-  writeFileSync(f, [...prev, full].join('\n') + '\n');
+  editLines(f, (lines) => [...lines.slice(-50), full]);
   return full;
+}
+
+// Rewrites the lines of a shared state file under an exclusive <file>.lock, so concurrent `ready` processes
+// cannot lose each other's updates (a failed gate's removal undone by another gate's stale rewrite). A lock
+// whose owner died is removed. The new content is written to a temporary file and renamed into place.
+export function editLines(f, edit, { pid = process.pid } = {}) {
+  const lock = `${f}.lock`, wait = new Int32Array(new SharedArrayBuffer(4));
+  for (;;) {
+    try { writeFileSync(lock, `${pid} ${procStart(pid) ?? ''}`, { flag: 'wx' }); break; } catch (e) { if (e.code !== 'EEXIST') throw e; }
+    let owner;
+    try { owner = readFileSync(lock, 'utf8').split(' '); } catch { continue; }
+    if (owner[0] && !alive(Number(owner[0]), owner[1])) { rmSync(lock, { force: true }); continue; }
+    Atomics.wait(wait, 0, 0, 20);
+  }
+  try {
+    const lines = existsSync(f) ? readFileSync(f, 'utf8').split('\n').filter(Boolean) : [];
+    writeFileSync(`${lock}.tmp`, edit(lines).map((l) => `${l}\n`).join(''));
+    renameSync(`${lock}.tmp`, f);
+  } finally { rmSync(lock, { force: true }); }
 }
 
 // Passed gates, keyed by the clean checkout's exact HEAD, its repository and the gate command, since a gate may
@@ -553,15 +571,12 @@ export function gatePassed(gate, cwd) {
 }
 export function recordGatePass(gate, cwd, key = gateKey(gate, cwd)) {
   if (!key) return null;
-  const f = gateCacheFile();
-  const prev = existsSync(f) ? readFileSync(f, 'utf8').split('\n').filter((l) => l && l !== key).slice(-199) : [];
   mkdirSync(stateDir(), { recursive: true });
-  writeFileSync(f, [...prev, key].join('\n') + '\n');
+  editLines(gateCacheFile(), (lines) => [...lines.filter((l) => l !== key).slice(-199), key]);
   return key.split(' ')[0];
 }
 function forgetGatePass(key) {
-  const f = gateCacheFile();
-  if (key && existsSync(f)) writeFileSync(f, readFileSync(f, 'utf8').split('\n').filter((l) => l && l !== key).map((l) => `${l}\n`).join(''));
+  if (key && existsSync(gateCacheFile())) editLines(gateCacheFile(), (lines) => lines.filter((l) => l !== key));
 }
 
 // Runs the project gate for `ready` when one is configured and the clean, pushed PR head is not yet
@@ -586,7 +601,7 @@ export async function readyGate(s, cfg, cwd, deps = {}) {
 // Drops only `sha`, so syncing one PR keeps the markers of other PR heads in the same repository.
 export function unmarkTested(sha, cwd) {
   const f = markerFile(cwd);
-  if (f && existsSync(f)) writeFileSync(f, readFileSync(f, 'utf8').split('\n').filter((l) => l && l !== sha).map((l) => `${l}\n`).join(''));
+  if (f && existsSync(f)) editLines(f, (lines) => lines.filter((l) => l !== sha));
 }
 
 export function localGate(s, cwd) {
