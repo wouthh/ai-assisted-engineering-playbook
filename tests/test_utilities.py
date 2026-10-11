@@ -1807,5 +1807,11 @@ class GuidanceConsistencyTests(unittest.TestCase):
                 self.assertNotIn("without waiting to be asked", text)
 
 
+    def test_walkthrough_false_finding_example_cites_actual_agents_rule(self) -> None:
+        walkthrough = (ROOT / "examples/fictional-order-service/README.md").read_text(encoding="utf-8")
+        rule = "Examples must be fictional or independently reusable."
+        self.assertIn(f"root `AGENTS.md` states \"{rule}\"", walkthrough)
+        self.assertIn(rule, (ROOT / "AGENTS.md").read_text(encoding="utf-8"))
+
 if __name__ == "__main__":
     unittest.main()
