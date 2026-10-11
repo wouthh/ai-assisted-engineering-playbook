@@ -1253,3 +1253,64 @@ test('run keeps polling when an agent without a result line still made progress'
   const log = readFileSync(join(process.env.XDG_STATE_HOME, 'prloop', readdirSync(join(process.env.XDG_STATE_HOME, 'prloop')).find((f) => f.startsWith('run-'))), 'utf8');
   assert.match(log, /agent made progress without a result line \(the agent session ended at its max-turns limit\)/);
 });
+
+test('run skips a locked worktree before judging its checkout: the holder\'s uncommitted edit does not block', async (t) => {
+  tempState(t);
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  const pr = fixture();
+  Object.assign(pr, { headRefName: 'feat', headRefOid: r.run(r.work, 'rev-parse', 'HEAD'), mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE' });
+  pr.reviewThreads.nodes.push(thread('T1', at('10:20')));
+  fakeGh(t, r.dir, pr);
+  const lock = takeLock(r.work, 'fix agent for PR #7 (another supervisor)');
+  t.after(() => lock.release());
+  writeFileSync(join(r.work, 'app.txt'), 'agent edit in progress\n');
+  const [res] = await runAll({ repo: 'example-org/example-repo', pr: '7', worktree: r.work }, { ...cfg, interval: 1, deadline: 200 }, { metrics: idle().metrics });
+  assert.equal(res.verdict, 'deadline', JSON.stringify(res));
+});
+
+test('ready rereads the PR after its gate: a head pushed meanwhile is not reported ready', (t) => {
+  tempState(t);
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  const pr = fixture();
+  Object.assign(pr, { headRefName: 'feat', headRefOid: head, mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE' });
+  fakeGh(t, r.dir, pr);
+  const moved = 'd'.repeat(40);
+  writeFileSync(join(r.dir, 'moved.json'), readFileSync(join(r.dir, 'pr.json'), 'utf8').replaceAll(head, moved));
+  // The "gate" passes while another worktree pushes a new head.
+  const res = spawnSync(process.execPath, [PRLOOP, 'ready', '7', '--repo', 'example-org/example-repo', '--gate', `cp "${r.dir}/moved.json" "${r.dir}/pr.json"`],
+    { cwd: r.work, encoding: 'utf8', env: { ...process.env, PRLOOP_LOCK_TOKEN: '', PRLOOP_GATE_SLOTS: '1' } });
+  const out = JSON.parse(res.stdout);
+  assert.equal(res.status, 50, res.stdout);
+  assert.deepEqual([out.ready, out.head], [false, moved]);
+  assert.ok(out.missing.some((m) => m.includes(`head ${moved.slice(0, 7)} not marked tested`)), res.stdout);
+  assert.equal(isTested(head, r.work), true); // the gated old head stays marked
+});
+
+test('a standalone sync holds the worktree lock for its whole run unless its token already owns it', (t) => {
+  tempState(t);
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  const pr = fixture();
+  Object.assign(pr, { headRefName: 'feat', headRefOid: r.run(r.work, 'rev-parse', 'HEAD'), baseRefOid: r.run(r.work, 'rev-parse', 'origin/main') });
+  fakeGh(t, r.dir, pr);
+  const lockDir = join(r.run(r.work, 'rev-parse', '--absolute-git-dir'), 'prloop-lock');
+  const gh = join(r.dir, 'bin', 'gh');
+  writeFileSync(gh, readFileSync(gh, 'utf8').replace('#!/bin/sh\n', `#!/bin/sh\ncat "${lockDir}"/* >> "${r.dir}/seen"; echo >> "${r.dir}/seen"\n`));
+  const sync = (env) => spawnSync(process.execPath, [PRLOOP, 'sync', '7', '--repo', 'example-org/example-repo'], { cwd: r.work, encoding: 'utf8', env: { ...process.env, ...env } });
+  sync({ PRLOOP_LOCK_TOKEN: '' });
+  assert.match(readFileSync(join(r.dir, 'seen'), 'utf8'), /"purpose":"sync of PR #7"/); // claimed while it read the PR
+  assert.equal(lockHolder(r.work, null), null); // and released afterwards
+  const lock = takeLock(r.work, 'fix agent for PR #7');
+  t.after(() => lock.release());
+  rmSync(join(r.dir, 'seen'));
+  sync({ PRLOOP_LOCK_TOKEN: lock.token });
+  const seen = readFileSync(join(r.dir, 'seen'), 'utf8');
+  assert.match(seen, /fix agent for PR #7/);
+  assert.doesNotMatch(seen, /sync of PR #7/); // the inherited claim covers it
+});
