@@ -4,7 +4,7 @@ This playbook documents reusable AI-assisted software-engineering workflows for 
 
 > **Maintained**
 >
-> The playbook is designed for reuse. Its examples are fictional, its utilities are read-only by default, and no private repository or workstation context is required.
+> The playbook is designed for reuse. Its examples are fictional (except the clearly labelled, unmaintained snapshots under `examples/archived-*`), its utilities are read-only by default, and no private repository or workstation context is required.
 
 ## What this repository is for
 

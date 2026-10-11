@@ -769,6 +769,25 @@ function scopedContextItems(items, selectedClusterIds, label, valueField) {
     );
 }
 
+// Fail closed on a target that names no validated cluster instead of
+// silently dropping that context from every partition.
+function assertKnownContextTargets(items, knownClusterIds, label) {
+  if (!Array.isArray(items)) {
+    fail("invalid_generation_contract", `${label} must be an array`);
+  }
+  items.forEach((value, index) => {
+    const item = asRecord(value, `${label}[${index}]`);
+    for (const target of targetFingerprints(item, `${label}[${index}]`)) {
+      if (!knownClusterIds.has(target)) {
+        fail(
+          "invalid_generation_contract",
+          `${label}[${index}] targets unknown cluster ${target}`,
+        );
+      }
+    }
+  });
+}
+
 function serializeContextPayload(payload) {
   const serialized = JSON.stringify(payload);
   return { payload, serialized, character_count: serialized.length };
@@ -797,6 +816,11 @@ export function buildBoundedContextPacks({
   const findingById = new Map(
     validated.findings.map((finding) => [finding.id, finding]),
   );
+  const knownClusterIds = new Set(
+    validated.clusters.map((cluster) => cluster.cluster_id),
+  );
+  assertKnownContextTargets(diffPatches, knownClusterIds, "diffPatches");
+  assertKnownContextTargets(siblingContext, knownClusterIds, "siblingContext");
   const common = {
     context_schema_version: 1,
     pr: sanitizePrMetadata(pr),
