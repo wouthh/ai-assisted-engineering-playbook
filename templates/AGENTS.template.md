@@ -54,7 +54,7 @@ State what each command proves and which environment is authoritative.
 
 ## PR review loop
 
-Install [`prloop`](https://github.com/wouthh/ai-assisted-engineering-playbook/tree/main/tools/prloop) on `PATH` (a symlink to `bin/prloop` is enough). It waits for the review bot and prints one JSON verdict; it never posts or fixes anything. Remove this section if the project does not use an automated reviewer.
+Install [`prloop`](https://github.com/wouthh/ai-assisted-engineering-playbook/tree/main/tools/prloop) on `PATH` (a symlink to `bin/prloop` is enough). It waits for the review bot and prints one JSON verdict. It never fixes code or posts review requests; it posts only its own read-only local review when the bot is unavailable. Remove this section if the project does not use an automated reviewer.
 
 1. Implement the change, run the full local gate above, commit and push.
 2. `prloop mark-tested` once the gate passes on the pushed head.
