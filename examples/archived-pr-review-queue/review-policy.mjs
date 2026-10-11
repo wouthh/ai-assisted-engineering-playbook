@@ -898,9 +898,7 @@ const CURRENT_REQUEST_STATUSES = new Set([
   "findings",
 ]);
 
-// A persisted request must be well-formed, bound to the cycle pointer, and a
-// terminal result must match its charged generation (or be an uncharged
-// adopted legacy request).
+// A persisted request must be well-formed and bound to the cycle pointer.
 function assertCurrentRequest(policy) {
   const request = policy.current_request;
   if (request === null || request === undefined) {
@@ -928,20 +926,26 @@ function assertCurrentRequest(policy) {
   if (policy.current_request_cycle_id !== cycleId) {
     throw new Error("state_corruption: current_request does not match current_request_cycle_id");
   }
-  if (request.status === "clear" || request.status === "findings") {
-    const generation = policy.external_review_generations.find(
-      (candidate) => candidate.cycle_id === cycleId,
+  if (request.status === "reserved" || request.status === "legacy_adopted_pending") {
+    return;
+  }
+  // Confirmed, timed-out, and terminal requests must be bound to their charged
+  // generation. Only an uncharged targeted request adopted from before policy
+  // activation may exist without one.
+  const generation = policy.external_review_generations.find(
+    (candidate) => candidate.cycle_id === cycleId,
+  );
+  const terminal = request.status === "clear" || request.status === "findings";
+  const bound = generation
+    ? generation.head_sha === request.head_sha &&
+      (!terminal || generation.status === request.status)
+    : request.budget_charged === false &&
+      request.request_type === REVIEW_REQUEST_TARGETED_CLOSURE &&
+      Date.parse(requestedAt) < Date.parse(policy.policy_activated_at);
+  if (!bound) {
+    throw new Error(
+      `state_corruption: ${request.status} current_request has no matching generation`,
     );
-    // Only an uncharged targeted request adopted from before policy
-    // activation may hold a terminal result without a generation.
-    const bound = generation
-      ? generation.head_sha === request.head_sha && generation.status === request.status
-      : request.budget_charged === false &&
-        request.request_type === REVIEW_REQUEST_TARGETED_CLOSURE &&
-        Date.parse(requestedAt) < Date.parse(policy.policy_activated_at);
-    if (!bound) {
-      throw new Error("state_corruption: terminal current_request has no matching generation");
-    }
   }
 }
 
