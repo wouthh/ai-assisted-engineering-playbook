@@ -30,7 +30,7 @@ Each PR's state lives in `${XDG_STATE_HOME:-~/.local/state}/prloop/<owner>__<nam
 
 ### Fix agents
 
-Each fix agent runs in the PR's worktree (found with `git worktree list` by branch name, or `--worktree <path>`; either must have the PR branch checked out with HEAD at exactly the PR head). Its prompt carries only the current trigger, never the round history: repository, PR, branch, head, worktree, the trigger (`findings`, `conflict`, `not_requested`, `timeout`, `local_review`), its data (compact findings with thread id, path, line and body; the conflicted files; or the previous request body), and the gate command. In one session it must:
+Each fix agent runs in the PR's worktree (found with `git worktree list` by branch name, or `--worktree <path>`; either must have the PR branch checked out with HEAD at exactly the PR head and no uncommitted, untracked or dirty-submodule changes). Its prompt carries only the current trigger, never the round history: repository, PR, branch, head, worktree, the trigger (`findings`, `conflict`, `not_requested`, `timeout`, `local_review`), its data (compact findings with thread id, path, line and body; the conflicted files; or the previous request body), and the gate command. In one session it must:
 
 1. read only the referenced files plus AGENTS.md;
 2. fix each valid finding with a regression test, reply with evidence on invalid ones and leave them unresolved, resolve conflicts;
@@ -71,7 +71,7 @@ The manual alternative, for an agent that drives one PR itself. Every command pr
 
 | Verdict | Exit | Meaning |
 |---|---|---|
-| `clean` | 0 | 👍 by the bot on the current request, or (for an automatic review without a request) on the PR body after a 👀 there on this head, or a bot review on the head, or a bot comment after that request or 👀, matching the clean regex. When the bot reacts more than once, the latest reaction wins. |
+| `clean` | 0 | 👍 by the bot on the current request, or (for an automatic review without a request) on the PR body after a 👀 there on this head, or a bot review on the head, or a bot comment matching the clean regex posted after the bot's 👀 on the current request or on the PR body after this head (issue comments carry no commit, so a request alone does not bind a comment to this head). When the bot reacts more than once, the latest reaction wins. |
 | `findings` | 10 | Unresolved threads (path, line, up to 2000 characters of body) plus any reviewer summary on this head. |
 | `not_requested` | 20 | No trigger comment after the current head commit. Run `prloop ready`, then request a review. |
 | `requested_while_unresolved` | 21 | A request was posted while older threads were still open. |

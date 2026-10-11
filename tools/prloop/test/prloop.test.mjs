@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import {
-  buildPrompt, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, syncBranch, unionLines, waitFor,
+  buildPrompt, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, syncBranch, unionLines, waitFor,
 } from '../prloop.mjs';
 
 const fixture = () => JSON.parse(readFileSync(new URL('./pr-fixture.json', import.meta.url), 'utf8'));
@@ -54,9 +54,19 @@ test('not_requested names the configured trigger text', async () => {
 
 test('clean via a reviewer comment matching the clean regex', () => {
   const pr = fixture();
+  request(pr).reactions.nodes.push({ content: 'EYES', createdAt: at('10:06'), user: BOT });
   pr.comments.nodes.push({ id: 'IC_bot', databaseId: 102, body: "Codex Review: Didn't find any major issues. Nice work.",
     createdAt: '2026-01-01T10:20:00Z', author: BOT, reactions: { nodes: [] } });
   assert.equal(classify(pr, cfg, NOW).verdict, 'clean');
+});
+
+test('a delayed clean comment after a new request but before its acknowledgement does not count', () => {
+  const pr = fixture();
+  pr.comments.nodes.push({ id: 'IC_bot', databaseId: 102, body: "Codex Review: Didn't find any major issues. Nice work.",
+    createdAt: at('10:07'), author: BOT, reactions: { nodes: [] } }); // the previous head's review finishing late
+  assert.equal(classify(pr, cfg, NOW).verdict, 'pending');
+  request(pr).reactions.nodes.push({ content: 'EYES', createdAt: at('10:08'), user: BOT });
+  assert.equal(classify(pr, cfg, NOW).verdict, 'pending'); // the acknowledgement came after that comment
 });
 
 test('a clean bot comment without a request or eyes on this head does not count', () => {
@@ -567,6 +577,22 @@ test('worktree check: branch and PR head commit must match', (t) => {
   assert.match(checkWorktree(r.work, { branch: 'feat', head: 'f'.repeat(40) }), /HEAD is not PR head/);
   r.commit('local only', { 'app.txt': 'two\n' }); // PR head still present, but HEAD is ahead of it
   assert.match(checkWorktree(r.work, { branch: 'feat', head }), /HEAD is not PR head/);
+  const now = r.run(r.work, 'rev-parse', 'HEAD');
+  writeFileSync(join(r.work, 'stray.txt'), 'local\n'); // untracked work a fix agent must not commit
+  assert.match(checkWorktree(r.work, { branch: 'feat', head: now }), /uncommitted changes/);
+});
+
+test('run blocks after three GitHub read failures on fresh state', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'prloop-run-'));
+  const old = { XDG_STATE_HOME: process.env.XDG_STATE_HOME, PATH: process.env.PATH };
+  t.after(() => { rmSync(dir, { recursive: true, force: true }); for (const [k, v] of Object.entries(old)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } });
+  mkdirSync(join(dir, 'bin'));
+  writeFileSync(join(dir, 'bin', 'gh'), '#!/bin/sh\necho "{}"\n', { mode: 0o755 }); // malformed reply, no retry backoff
+  process.env.XDG_STATE_HOME = dir;
+  process.env.PATH = `${join(dir, 'bin')}:${old.PATH}`;
+  const [r] = await runAll({ repo: 'example-org/example-repo', pr: '7', deadline: '20s' }, { ...cfg, interval: 1 });
+  assert.equal(r.verdict, 'blocked');
+  assert.match(r.reason, /GitHub read failed/);
 });
 
 test('value options need a value; only --help and --status are flags', () => {
