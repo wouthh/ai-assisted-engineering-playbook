@@ -796,7 +796,7 @@ esac
   return () => readFileSync(join(dir, 'calls.log'), 'utf8').trim().split('\n');
 }
 
-test('run merges a behind but mergeable, reviewed-clean head directly, without a sync or a new request', async (t) => {
+test('run syncs a behind but mergeable clean head and gates the combined state before merging', async (t) => {
   const state = tempState(t);
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
@@ -804,17 +804,23 @@ test('run merges a behind but mergeable, reviewed-clean head directly, without a
   r.run(r.work, 'push', '-q', 'origin', 'feat');
   divergeOnMain(r, { 'other.txt': 'base\n' });
   const head = r.run(r.work, 'rev-parse', 'HEAD');
-  markTested(head, r.work);
+  markTested(head, r.work); // the gate ran on the branch head only, not on the newer base
   writeFileSync(join(state, 'heads.json'), JSON.stringify({ 'example-org/example-repo#7': { sha: head, at: at('09:00') } }));
   const pr = fixture();
   Object.assign(pr, { headRefName: 'feat', headRefOid: head, mergeStateStatus: 'BEHIND', mergeable: 'MERGEABLE' });
   request(pr).reactions.nodes.push({ content: 'THUMBS_UP', createdAt: at('10:20'), user: BOT });
   const calls = fakeGh(t, r.dir, pr);
-  const [res] = await runAll({ repo: 'example-org/example-repo', pr: '7', worktree: r.work, merge: 'squash' }, { ...cfg, interval: 1 });
-  assert.equal(res.verdict, 'merged', JSON.stringify(res));
-  assert.equal(r.run(r.work, 'rev-parse', 'HEAD'), head); // no sync
-  assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head); // nothing pushed
-  assert.deepEqual(calls().filter((c) => !c.startsWith('api graphql')), [`pr merge 7 --repo example-org/example-repo --squash --match-head-commit ${head}`]);
+  const runP = runAll({ repo: 'example-org/example-repo', pr: '7', worktree: r.work, merge: 'squash', deadline: '1h' }, { ...cfg, agent: 'none', interval: 1 });
+  for (let i = 0; i < 200 && r.run(r.work, 'rev-parse', 'HEAD') === head; i++) await new Promise((d) => setTimeout(d, 5));
+  const synced = r.run(r.work, 'rev-parse', 'HEAD');
+  const after = { ...fixture(), headRefName: 'feat', headRefOid: synced, mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE' };
+  after.comments.nodes.pop();
+  writeFileSync(join(r.dir, 'pr.json'), JSON.stringify({ data: { viewer: { login: 'example-dev' }, repository: { mergeCommitAllowed: true, squashMergeAllowed: true, rebaseMergeAllowed: true, pullRequest: after } } }));
+  const [res] = await runP;
+  assert.notEqual(synced, head);
+  assert.equal(res.verdict, 'not_tested', JSON.stringify(res)); // the synced head needs the gate first
+  assert.equal(res.head, synced);
+  assert.ok(calls().every((c) => c.startsWith('api graphql')), 'no merge of the ungated head and no review request');
 });
 
 test('run carries a clean verdict across a sync that leaves the PR unchanged', async (t) => {

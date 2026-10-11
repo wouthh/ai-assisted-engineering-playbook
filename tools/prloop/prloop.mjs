@@ -793,10 +793,9 @@ export async function runAll(opts, cfg) {
     const wrong = cwd && checkWorktree(cwd, s);
     if (wrong) return block(st, wrong);
     const slot = () => busy.size < maxAgents;
-    // Behind but mergeable and reviewed clean: GitHub's own merge or rebase replays it, so syncing would only
-    // cost a new review. A failed direct merge falls back to a sync.
-    const mergeBehind = s.mergeState === 'BEHIND' && s.mergeable === 'MERGEABLE' && s.verdict === 'clean' && st.directMergeFailed !== s.head;
-    if (!mergeBehind && (s.mergeState === 'BEHIND' || s.mergeState === 'DIRTY' || s.mergeable === 'CONFLICTING')) {
+    // A behind head is always synced, even when mergeable, so the gate runs on the combined base-plus-branch
+    // state before a merge; an unchanged patch carries the clean review, so this costs no new review.
+    if (s.mergeState === 'BEHIND' || s.mergeState === 'DIRTY' || s.mergeable === 'CONFLICTING') {
       if (!cwd) return block(st, `PR is ${s.mergeState} and no worktree has ${s.branch}; pass --worktree`);
       const v = syncBranch({ cwd, branch: s.branch, base: s.base, baseOid: raw.baseRefOid, head: s.head, settings: raw.repoSettings, union: opts.union });
       if (v.verdict === 'error') return block(st, `sync failed: ${v.error}`);
@@ -828,11 +827,7 @@ export async function runAll(opts, cfg) {
       if (missing.length) return slot() && fix(st, s, cwd, { verdict: 'not_tested', trigger: 'not_requested', missing,
         note: 'The head is already reviewed clean and only needs the gate: run `prloop ready`, which runs the gate and marks the head tested, then reports that the head is already reviewed clean. That report is expected: skip the review request and report status nothing_to_do.' });
       if (s.mergeable !== 'MERGEABLE') return s.mergeable === 'UNKNOWN' ? undefined : block(st, `GitHub reports mergeable=${s.mergeable}`);
-      try { sh('gh', ['pr', 'merge', String(st.pr), '--repo', repo, `--${opts.merge}`, '--match-head-commit', s.head]); } catch (e) {
-        if (!mergeBehind) throw e;
-        st.directMergeFailed = s.head;
-        return event(st, 'polling', { verdict: 'direct_merge_failed', reason: String(e.stderr || e.message).slice(0, 200) });
-      }
+      sh('gh', ['pr', 'merge', String(st.pr), '--repo', repo, `--${opts.merge}`, '--match-head-commit', s.head]);
       const after = classify(fetchPr(repo, st.pr), cfg);
       // A merge queue or auto-merge accepts the command without merging yet: report the real state.
       return after.state === 'MERGED' ? event(st, 'merged', { mergeCommit: after.mergeCommit })
