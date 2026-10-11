@@ -210,8 +210,10 @@ export function classify(pr, cfg, nowMs = Date.now()) {
   // Local review output counts only from the authenticated user who posts it; anyone can type the prefix.
   const trusted = (n) => isLocal(n.body) && !!pr.viewer?.login && login(n) === pr.viewer.login;
   const isBot = (n) => cfg.reviewer.test(login(n)) || trusted(n);
-  // Inline comments of a dismissed review stay as unresolved threads; the review was withdrawn, so they are dropped too.
-  const threads = pr.reviewThreads.nodes.filter((t) => !t.isResolved && t.comments.nodes[0]?.pullRequestReview?.state !== 'DISMISSED').map((t) => {
+  // Inline comments of a dismissed bot review stay as unresolved threads; that review was withdrawn, so they are
+  // dropped too. A dismissed human review's threads still hold unresolved human feedback and stay.
+  const dismissedBot = (c) => c?.pullRequestReview?.state === 'DISMISSED' && isBot(c);
+  const threads = pr.reviewThreads.nodes.filter((t) => !t.isResolved && !dismissedBot(t.comments.nodes[0])).map((t) => {
     const c = t.comments.nodes[0] ?? {};
     return { id: t.id, path: t.path, line: t.line, outdated: !!t.isOutdated, author: login(c), fromReviewer: isBot(c), createdAt: c.createdAt, body: (c.body ?? '').slice(0, 2000) };
   });

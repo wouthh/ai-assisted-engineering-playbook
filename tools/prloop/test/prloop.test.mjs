@@ -729,6 +729,17 @@ test('threads from a dismissed bot review are not findings', () => {
   assert.equal(classify(pr, cfg, NOW).verdict, 'findings');
 });
 
+test('threads from a dismissed human review stay unresolved and block a clean verdict', () => {
+  const pr = fixture();
+  const t = thread('T1', at('10:20'), 'Please rename this', { login: 'example-dev' });
+  t.comments.nodes[0].pullRequestReview = { state: 'DISMISSED' };
+  pr.reviewThreads.nodes.push(t);
+  request(pr).reactions.nodes.push({ content: 'THUMBS_UP', createdAt: at('10:30'), user: BOT });
+  const s = classify(pr, cfg, NOW);
+  assert.equal(s.unresolvedThreads.length, 1);
+  assert.equal(s.verdict, 'findings');
+});
+
 // ---------- saving cloud reviews ----------
 
 test('a carried clean verdict counts on the synced head only, and a real finding overrides it', () => {
