@@ -48,10 +48,12 @@ $XDG_CONFIG_HOME/git-identity-guard/config.json, or
 
 GIT = "git"
 # Avoid lock files, lazy fetches, and replacement objects while inspecting,
-# and drop inherited trace destinations so inspection never writes files.
+# and disable trace destinations so inspection never writes files.
 ENV = {name: value for name, value in os.environ.items()
        if not name.startswith("GIT_TRACE")}
-ENV.update(GIT_OPTIONAL_LOCKS="0", GIT_NO_LAZY_FETCH="1", GIT_NO_REPLACE_OBJECTS="1")
+ENV.update(GIT_OPTIONAL_LOCKS="0", GIT_NO_LAZY_FETCH="1", GIT_NO_REPLACE_OBJECTS="1",
+           # "0" also overrides trace2.*Target settings in Git configuration.
+           GIT_TRACE2="0", GIT_TRACE2_EVENT="0", GIT_TRACE2_PERF="0")
 ZERO_OID = re.compile(r"0+")
 # Message checks fail closed: every whitespace-separated word containing "@"
 # is treated as an address unless it starts with "@" (a mention or scoped

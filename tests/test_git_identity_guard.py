@@ -135,6 +135,17 @@ class IdentityTests(GuardFixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(trace.exists())
 
+    def test_configured_trace2_targets_are_not_written(self) -> None:
+        trace = self.base / "configured-trace"
+        global_config = self.base / "global.gitconfig"
+        lines = "".join(f"\t{key} = {trace}-{key}\n"
+                        for key in ("eventTarget", "normalTarget", "perfTarget"))
+        global_config.write_text("[trace2]\n" + lines, encoding="utf-8")
+        env = {**self.env, "GIT_CONFIG_GLOBAL": str(global_config)}
+        result = self.guard(env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(list(self.base.glob("configured-trace*")), [])
+
     def test_cherry_pick_source_author_is_checked(self) -> None:
         env = {**self.env, "GIT_AUTHOR_EMAIL": OTHER}
         self.git("commit", "--quiet", "--allow-empty", "-m", "synthetic", env=env)
