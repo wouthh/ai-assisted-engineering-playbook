@@ -561,10 +561,10 @@ export function recordGatePass(gate, cwd, key = gateKey(gate, cwd)) {
 }
 
 // Runs the project gate for `ready` when one is configured and the clean, pushed PR head is not yet
-// tested; a pass marks the head tested. Returns null when nothing ran. `deps` injects the machine metrics,
-// slot directory, clock and logger (see runGate).
+// tested (or always with --force-gate); a pass marks the head tested and a failure unmarks it. Returns null
+// when nothing ran. `deps` injects the machine metrics, slot directory, clock and logger (see runGate).
 export async function readyGate(s, cfg, cwd, deps = {}) {
-  if (!cfg.gate || isTested(s.head, cwd) || localGate(s, cwd).some((r) => !r.includes('not marked tested'))) return null;
+  if (!cfg.gate || (isTested(s.head, cwd) && !cfg.forceGate) || localGate(s, cwd).some((r) => !r.includes('not marked tested'))) return null;
   const cached = !cfg.forceGate && gatePassed(cfg.gate, cwd);
   if (cached) { markTested(s.head, cwd); return { ok: true, cached }; }
   const key = gateKey(cfg.gate, cwd);
@@ -574,6 +574,7 @@ export async function readyGate(s, cfg, cwd, deps = {}) {
     markTested(s.head, cwd);
     return { ok: true };
   }
+  unmarkTested(s.head, cwd); // a forced rerun that fails withdraws the earlier validation
   return { ok: false, status: r.status, tail: String(r.stdout || r.stderr).trimEnd().split('\n').slice(-60).join('\n') };
 }
 

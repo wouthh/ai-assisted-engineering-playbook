@@ -931,9 +931,11 @@ test('a passed gate is cached by exact clean head, repository and command: no se
   unmarkTested(head, r.work);
   await readyGate({ branch: 'feat', head }, { ...cfg, gate: `${gate}; true` }, r.work, deps); // another command misses
   assert.equal(count(), 2);
-  unmarkTested(head, r.work);
-  await readyGate({ branch: 'feat', head }, { ...cfg, gate, forceGate: true }, r.work, deps);
+  assert.equal(isTested(head, r.work), true);
+  await readyGate({ branch: 'feat', head }, { ...cfg, gate, forceGate: true }, r.work, deps); // runs on a tested head too
   assert.equal(count(), 3);
+  assert.equal((await readyGate({ branch: 'feat', head }, { ...cfg, gate: 'false', forceGate: true }, r.work, deps)).ok, false);
+  assert.equal(isTested(head, r.work), false); // a failed forced rerun withdraws the mark
   writeFileSync(join(r.work, 'scratch.txt'), 'x\n');
   assert.equal(gatePassed(gate, r.work), null); // a dirty tree never hits
   rmSync(join(r.work, 'scratch.txt'));
