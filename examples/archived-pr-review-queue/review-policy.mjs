@@ -915,6 +915,16 @@ function assertCurrentRequest(policy) {
   }
   const cycleId = requireMarkerToken(request.cycle_id, "current_request.cycle_id");
   requireMarkerToken(request.head_sha, "current_request.head_sha");
+  if (
+    request.request_type !== REVIEW_REQUEST_INITIAL_FULL &&
+    request.request_type !== REVIEW_REQUEST_TARGETED_CLOSURE
+  ) {
+    throw new Error("state_corruption: current_request type is unsupported");
+  }
+  const requestedAt = requireIsoTimestamp(
+    request.request_timestamp,
+    "current_request.request_timestamp",
+  );
   if (policy.current_request_cycle_id !== cycleId) {
     throw new Error("state_corruption: current_request does not match current_request_cycle_id");
   }
@@ -922,9 +932,13 @@ function assertCurrentRequest(policy) {
     const generation = policy.external_review_generations.find(
       (candidate) => candidate.cycle_id === cycleId,
     );
+    // Only an uncharged targeted request adopted from before policy
+    // activation may hold a terminal result without a generation.
     const bound = generation
       ? generation.head_sha === request.head_sha && generation.status === request.status
-      : request.budget_charged === false;
+      : request.budget_charged === false &&
+        request.request_type === REVIEW_REQUEST_TARGETED_CLOSURE &&
+        Date.parse(requestedAt) < Date.parse(policy.policy_activated_at);
     if (!bound) {
       throw new Error("state_corruption: terminal current_request has no matching generation");
     }
