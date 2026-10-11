@@ -702,7 +702,7 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
 // `cfg.timeout`; transient GitHub errors are retried until three fail in a row.
 export async function waitFor(repo, prNum, cfg, { interval, fetch = fetchPr, now = Date.now, pause = sleep, cwd = process.cwd(), runLocal = localReview, metrics = machineMetrics, log = logStderr }) {
   const resources = {}; // one resource wait across polls, as in `run`
-  let agentLog; // the saved output of a local review that posted, kept for the final result
+  let reviewed; // { head, agentLog } of a local review that posted; reported only while that head is current
   for (let failures = 0; ; await pause(interval)) {
     let s;
     try { s = classify(fetch(repo, prNum), cfg, now()); failures = 0; } catch (e) {
@@ -716,11 +716,12 @@ export async function waitFor(repo, prNum, cfg, { interval, fetch = fetchPr, now
       // The head may have moved while waiting for resources: review the current snapshot, or poll again.
       try { s = classify(fetch(repo, prNum), cfg, now()); } catch { continue; }
       if (!reviewPlan(s, cfg).local) continue;
-      const r = await runLocal(repo, s, cfg, cwd, (p) => { agentLog = p; });
+      const head = s.head;
+      const r = await runLocal(repo, s, cfg, cwd, (p) => { reviewed = { head, agentLog: p }; });
       if (r) return r; // gate missing or reviewer failed; otherwise the posted result is classified next poll
       continue;
     }
-    if (s.verdict !== 'pending') return { ...finish(s), ...(agentLog ? { agentLog } : {}) };
+    if (s.verdict !== 'pending') return { ...finish(s), ...(reviewed?.head === s.head ? { agentLog: reviewed.agentLog } : {}) };
   }
 }
 
