@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import {
-  classify, config, globToRegex, localCleanBody, localReviewPayload, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, syncBranch, unionLines, waitFor,
+  classify, config, globToRegex, localCleanBody, localGate, markTested, localReviewPayload, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, syncBranch, unionLines, waitFor,
 } from '../prloop.mjs';
 
 const fixture = () => JSON.parse(readFileSync(new URL('./pr-fixture.json', import.meta.url), 'utf8'));
@@ -253,6 +253,11 @@ test('posted local results classify like cloud results on that head', () => {
   assert.deepEqual(s.local, { total: 1, onHead: true });
   pr.comments.nodes.at(-1).body = localCleanBody('2222222222222222222222222222222222222222');
   assert.notEqual(classify(pr, cfg, NOW).verdict, 'clean');
+  pr.comments.nodes.at(-1).body = localCleanBody(pr.headRefOid);
+  pr.comments.nodes.at(-1).author = { login: 'someone-else' }; // anyone can type the prefix
+  s = classify(pr, cfg, NOW);
+  assert.notEqual(s.verdict, 'clean');
+  assert.deepEqual(s.local, { total: 0, onHead: false });
 
   const withThread = fixture();
   withThread.reviewThreads.nodes.push(thread('T9', at('10:30'), '[local review] [P1] Null check missing', me));
@@ -360,3 +365,18 @@ for (const settings of [{ merge: true, squash: true }, { merge: false, squash: f
     assert.equal(r.run(r.work, 'branch', '--show-current'), 'feat');
   });
 }
+
+test('the local gate requires the PR checkout, a clean tree and a tested pushed head', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  const s = { branch: 'feat', head };
+  assert.match(localGate(s, r.work).join(), /not marked tested/);
+  markTested(head, r.work);
+  assert.deepEqual(localGate(s, r.work), []);
+  writeFileSync(join(r.work, 'app.txt'), 'dirty\n');
+  assert.match(localGate(s, r.work).join(), /not clean/);
+  r.run(r.work, 'checkout', '--', 'app.txt');
+  r.run(r.work, 'switch', '-q', 'main');
+  assert.match(localGate(s, r.work).join(), /not in a checkout of feat/); // the marker is shared across worktrees
+});

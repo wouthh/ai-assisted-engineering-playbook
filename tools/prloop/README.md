@@ -22,7 +22,7 @@ Every command prints one JSON object on stdout. `--repo owner/name` defaults to 
 | Command | Purpose | Exit codes |
 |---|---|---|
 | `prloop status <pr>` | Head SHA, unresolved threads (id, path, line, first 300 characters), latest trigger comment and whether it is newer than the head commit, reviewer state on the head (`none`, `reviewing`, `clean`, `findings`), and `readyToRequest` with reasons. | 0, 40 |
-| `prloop ready <pr>` | Gate before posting a review request. Passes only with no unresolved threads, no request already pending on the head, a tested head and, inside a checkout of the PR branch, a clean tree whose `HEAD` equals the remote PR head. Lists exactly what is missing. | 0 ready, 50 not ready |
+| `prloop ready <pr>` | Gate before posting a review request, run inside the PR checkout. Passes only with no unresolved threads, no request already pending on the head, a tested head, and a clean tree on the PR branch whose `HEAD` equals the remote PR head. Lists exactly what is missing. | 0 ready, 50 not ready |
 | `prloop mark-tested [--sha <sha>]` | Records that your gate passed for `HEAD` (or `--sha`). Stored as `prloop-tested` in the Git common directory; never pushed. | 0, 40 |
 | `prloop wait <pr>` | Polls every `--interval` (75s) until a verdict. A 👀 reaction means the bot is still reviewing. Posts nothing except a [local review](#local-reviewer-fallback) when one is needed. | see below |
 | `prloop sync <pr> [--union <glob>]...` | Brings the PR branch up to date with its base, inside the PR checkout. See [Syncing with the base](#syncing-with-the-base). | 0, 40, 41 |
@@ -74,7 +74,7 @@ A successful sync changes the head, so it clears the tested marker: run your gat
 prloop run --repo owner/name --pr 42,43 --agent claude --max-rounds 8 --merge rebase
 ```
 
-For each PR, sequentially: sync if GitHub reports the branch behind or conflicting, wait, and on `findings`, `timeout`, `not_requested`, `requested_while_unresolved` or a manual `conflict` spawn one fresh agent in the PR's worktree (found with `git worktree list` by branch name, or `--worktree <path>`). The prompt contains the PR number, the verdict, compact findings and the rules: fix, test, `prloop mark-tested`, reply and resolve, `prloop ready`, then post the request.
+For each PR, sequentially: sync if GitHub reports the branch behind or conflicting, wait, and on `findings`, `timeout`, `not_requested`, `requested_while_unresolved` or a manual `conflict` spawn one fresh agent in the PR's worktree (found with `git worktree list` by branch name, or `--worktree <path>`, which must have the PR branch checked out). The prompt contains the PR number, the verdict, compact findings and the rules: fix, test, `prloop mark-tested`, reply and resolve, `prloop ready`, then post the request.
 
 | Option | Default | |
 |---|---|---|
@@ -100,7 +100,7 @@ State (rounds, seen findings, last verdict) lives in `${XDG_STATE_HOME:-~/.local
 | `local` | Never asks the bot. `wait` runs a local review of the current head itself. |
 | `auto` (default) | Uses the bot, and runs a local review when the bot replies that it cannot review (default regex matches "reached your ... usage limits", "couldn't complete this request", "unable to review", "quota"; set `--unavailable-regex`) or when two requests on the same head time out. |
 
-The local review is a separate, read-only agent run (`--agent claude` by default with `--permission-mode dontAsk` and only read and `git diff/log/show` tools; `--agent codex` uses `codex exec --sandbox read-only`), never the run that wrote the fix. It needs the same gate as a request: no unresolved threads, a tested head, and `wait` running inside a clean, pushed checkout of the PR branch. It returns structured findings (path, line, severity P0-P3, body), which prloop posts with `gh` under your account as a normal PR review with inline comments, each prefixed `[local review]`; findings outside the diff go in the review body. A clean result posts `[local review] No issues found on <sha>.` The next poll classifies these exactly like bot results.
+The local review is a separate, read-only agent run (`--agent claude` by default with `--permission-mode dontAsk` and only read and `git diff/log/show` tools; `--agent codex` uses `codex exec --sandbox read-only`), never the run that wrote the fix. It needs the same gate as a request: no unresolved threads, a tested head, and `wait` running inside a clean, pushed checkout of the PR branch. It returns structured findings (path, line, severity P0-P3, body), which prloop posts with `gh` under your account (only results posted by the authenticated `gh` user count, so a copied prefix from someone else is ignored) as a normal PR review with inline comments, each prefixed `[local review]`; findings outside the diff go in the review body. A clean result posts `[local review] No issues found on <sha>.` The next poll classifies these exactly like bot results.
 
 Failsafes: one local review per head, at most `--max-local-reviews` (3) per PR, and any reviewer failure, malformed output, change to the checkout or posting error ends in `blocked` with the reason instead of a retry.
 

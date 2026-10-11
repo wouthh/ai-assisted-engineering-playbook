@@ -97,7 +97,7 @@ export function config(opts, env = process.env) {
 
 // ---------- GitHub reads ----------
 
-const PR_QUERY = `query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){
+const PR_QUERY = `query($owner:String!,$name:String!,$pr:Int!){viewer{login} repository(owner:$owner,name:$name){
   mergeCommitAllowed squashMergeAllowed rebaseMergeAllowed
   pullRequest(number:$pr){number url state headRefName reactions(last:50){nodes{content createdAt user{login}}} baseRefName headRefOid mergeable mergeStateStatus mergeCommit{oid}
     timelineItems(last:1,itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT]){nodes{... on HeadRefForcePushedEvent{createdAt}}}
@@ -124,9 +124,9 @@ function ghRetry(args) {
 export function fetchPr(repo, pr) {
   const [owner, name] = repo.split('/');
   const out = ghRetry( ['api', 'graphql', '-f', `query=${PR_QUERY}`, '-F', `owner=${owner}`, '-F', `name=${name}`, '-F', `pr=${pr}`]);
-  const r = JSON.parse(out).data.repository;
+  const { viewer, repository: r } = JSON.parse(out).data;
   if (!r?.pullRequest) throw new Error(`PR ${repo}#${pr} not found`);
-  return { ...r.pullRequest, repoSettings: { merge: r.mergeCommitAllowed, squash: r.squashMergeAllowed, rebase: r.rebaseMergeAllowed } };
+  return { ...r.pullRequest, viewer, repoSettings: { merge: r.mergeCommitAllowed, squash: r.squashMergeAllowed, rebase: r.rebaseMergeAllowed } };
 }
 
 // ---------- pure classification (tested with fixtures) ----------
@@ -159,7 +159,9 @@ export function classify(pr, cfg, nowMs = Date.now()) {
   const headTime = [pr.commits.nodes[0]?.commit.committedDate, pr.timelineItems?.nodes[0]?.createdAt]
     .filter(Boolean).sort().at(-1) ?? '1970-01-01T00:00:00Z';
   if (pr.reviewThreads.pageInfo?.hasNextPage) throw new Error('more than 100 review threads: prloop cannot see them all, so it fails closed');
-  const isBot = (n) => cfg.reviewer.test(login(n)) || isLocal(n.body);
+  // Local review output counts only from the authenticated user who posts it; anyone can type the prefix.
+  const trusted = (n) => isLocal(n.body) && !!pr.viewer?.login && login(n) === pr.viewer.login;
+  const isBot = (n) => cfg.reviewer.test(login(n)) || trusted(n);
   const threads = pr.reviewThreads.nodes.filter((t) => !t.isResolved).map((t) => {
     const c = t.comments.nodes[0] ?? {};
     return { id: t.id, path: t.path, line: t.line, outdated: !!t.isOutdated, author: login(c), fromReviewer: isBot(c), createdAt: c.createdAt, body: (c.body ?? '').slice(0, 2000) };
@@ -174,16 +176,16 @@ export function classify(pr, cfg, nowMs = Date.now()) {
     .map((r) => ({ at: r.createdAt, state: r.content === 'EYES' ? 'reviewing' : 'clean' }));
   const botReviews = pr.reviews.nodes.filter((r) => isBot(r) && r.commit?.oid === head && r.submittedAt >= since);
   const botComments = pr.comments.nodes.filter((c) => isBot(c) && c.createdAt >= since);
-  const summaries = [...botReviews.map((r) => ({ at: r.submittedAt, body: r.body })), ...botComments.map((c) => ({ at: c.createdAt, body: c.body }))]
+  const summaries = [...botReviews.map((r) => ({ at: r.submittedAt, body: r.body, local: trusted(r) })), ...botComments.map((c) => ({ at: c.createdAt, body: c.body, local: trusted(c) }))]
     .filter((s) => s.body);
   for (const s of summaries) {
-    if (cfg.clean.test(s.body) || (isLocal(s.body) && s.body.includes(localCleanBody(head)))) signals.push({ at: s.at, state: 'clean' });
-    else if (!isLocal(s.body) && cfg.unavailable.test(s.body)) signals.push({ at: s.at, state: 'unavailable' });
+    if (s.local ? s.body.includes(localCleanBody(head)) : cfg.clean.test(s.body)) signals.push({ at: s.at, state: 'clean' });
+    else if (!s.local && cfg.unavailable.test(s.body)) signals.push({ at: s.at, state: 'unavailable' });
   }
   const newFindings = threads.filter((t) => t.fromReviewer && t.createdAt >= since);
   // A local review whose findings could not be anchored inline carries them in its body.
-  const localFindingReview = botReviews.some((r) => isLocal(r.body) && !r.comments?.totalCount);
-  const localArtifacts = [...pr.reviews.nodes, ...pr.comments.nodes].filter((n) => isLocal(n.body));
+  const localFindingReview = botReviews.some((r) => trusted(r) && !r.comments?.totalCount);
+  const localArtifacts = [...pr.reviews.nodes, ...pr.comments.nodes].filter(trusted);
   const local = { total: localArtifacts.length, onHead: localArtifacts.some((n) => n.commit?.oid === head || n.body.includes(head)) };
   const requestsOnHead = pr.comments.nodes.filter((c) => !isBot(c) && c.createdAt >= headTime
     && c.body.toLowerCase().includes(cfg.trigger.toLowerCase())).length;
@@ -251,7 +253,9 @@ const clearTested = (cwd) => { const f = markerFile(cwd); if (f) rmSync(f, { for
 
 export function localGate(s, cwd) {
   const reasons = [];
-  if (tryGit(['branch', '--show-current'], cwd) === s.branch) {
+  const branch = tryGit(['branch', '--show-current'], cwd);
+  if (branch !== s.branch) reasons.push(`not in a checkout of ${s.branch} (current: ${branch || 'none'}): run this inside the PR checkout`);
+  else {
     if (git(['status', '--porcelain'], cwd)) reasons.push('working tree is not clean: commit or remove local changes');
     const local = git(['rev-parse', 'HEAD'], cwd);
     if (local !== s.head) reasons.push(`local HEAD ${short(local)} differs from remote PR head ${short(s.head)}: push or pull first`);
@@ -427,8 +431,7 @@ function runReviewer(cfg, prompt, cwd) {
 // or null when the result was posted and the next poll should classify it.
 export function localReview(repo, s, cfg, cwd) {
   const missing = s.unresolvedThreads.length ? [`${s.unresolvedThreads.length} unresolved threads`] : [];
-  if (tryGit(['branch', '--show-current'], cwd) !== s.branch) missing.push(`run wait inside a checkout of ${s.branch} for a local review`);
-  else missing.push(...localGate(s, cwd));
+  missing.push(...localGate(s, cwd));
   if (missing.length) return { verdict: 'not_requested', pr: s.pr, head: s.head, missing, next: `a local review needs: ${missing.join('; ')}` };
   tryGit(['fetch', '--quiet', 'origin', s.base], cwd);
   const prompt = `Review pull request #${s.pr}: the changes in \`git diff origin/${s.base}...HEAD\` at head ${s.head}.
@@ -525,6 +528,8 @@ async function supervise(repo, prNum, cfg, opts, deadline) {
     if (Date.now() > deadline) return blocked('overall deadline reached');
     let raw = fetchPr(repo, prNum), s = classify(raw, cfg);
     const cwd = opts.worktree ? resolve(opts.worktree) : findWorktree(s.branch, process.cwd());
+    // A wrong --worktree would let a write-enabled agent commit to another branch.
+    if (cwd && tryGit(['branch', '--show-current'], cwd) !== s.branch) return blocked(`worktree ${cwd} does not have ${s.branch} checked out`);
     const needsSync = () => s.mergeState === 'BEHIND' || s.mergeState === 'DIRTY' || s.mergeable === 'CONFLICTING';
     let v = null;
     if (needsSync()) {
