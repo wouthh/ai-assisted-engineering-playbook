@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import {
-  EXIT, main, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, syncBranch, unionLines, waitFor,
+  EXIT, main, slotDir, agentFailure, saveAgentLog, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, syncBranch, unionLines, waitFor,
 } from '../prloop.mjs';
 
 const pick = (o, keys) => Object.fromEntries(keys.map((k) => [k, o[k]]));
@@ -541,12 +541,49 @@ test('gate slots: exclusive up to N, released, and a dead owner\'s slot is recla
   assert.ok(c);
   b(); c();
   assert.equal(slotsInUse(dir), 0);
-  writeFileSync(join(dir, 'slot-0'), `${deadPid()}\n`); // a prloop that was killed while holding the slot
+  assert.deepEqual(readdirSync(dir), []);
+  const dead = `slot-0.${deadPid()}.0`;
+  writeFileSync(join(dir, dead), ''); // a prloop that was killed while holding the slot
   assert.equal(slotsInUse(dir), 0);
   const d = acquireSlot(dir, 1);
   assert.ok(d);
-  assert.equal(readFileSync(join(dir, 'slot-0'), 'utf8'), `${process.pid}\n`);
+  assert.deepEqual(readdirSync(dir).map((f) => f.split('.').slice(0, 2).join('.')), [`slot-0.${process.pid}`]); // the dead claim is gone
+  // A racing claim that appeared first wins: this process backs off instead of sharing the slot.
   d();
+  writeFileSync(join(dir, `slot-0.${process.ppid}.0`), '');
+  assert.equal(acquireSlot(dir, 1), null);
+});
+
+test('the slot directory is per user without XDG_RUNTIME_DIR and must not be writable by others', (t) => {
+  const old = process.env.XDG_RUNTIME_DIR;
+  t.after(() => { if (old === undefined) delete process.env.XDG_RUNTIME_DIR; else process.env.XDG_RUNTIME_DIR = old; });
+  delete process.env.XDG_RUNTIME_DIR;
+  assert.equal(slotDir(), `/tmp/prloop-slots-${process.getuid()}`);
+  process.env.XDG_RUNTIME_DIR = '/run/user/example';
+  assert.equal(slotDir(), '/run/user/example/prloop-slots');
+  const dir = mkdtempSync(join(tmpdir(), 'prloop-slots-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  execFileSync('chmod', ['0777', dir]);
+  assert.throws(() => acquireSlot(dir, 1), /writable only by you/);
+});
+
+test('a gate that waited for a slot rechecks resources before it starts', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'prloop-slots-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const busy = join(dir, `slot-0.${process.pid}.900`);
+  writeFileSync(busy, '');
+  const x = idle();
+  const c = { ...cfg, interval: 1000, resourceWait: 60 * 60e3, gateSlots: 1 };
+  const pause = async (ms) => {
+    x.clock.t += ms;
+    if (x.clock.t === 5000) { rmSync(busy); x.m.load = 7; } // the slot frees up just as the machine gets busy
+    if (x.clock.t >= 20e3) x.m.load = 1;
+  };
+  const r = await runGate('echo ran', dir, c, { ...x, pause, dir, log: (e) => { x.events.push(e); } });
+  const ranAt = x.clock.t;
+  assert.equal(r.stdout.trim(), 'ran');
+  assert.ok(ranAt >= 20e3, `started at ${ranAt}`);
+  assert.deepEqual(x.events.map((e) => e.event), ['waiting_for_gate_slot', 'waiting_for_resources']);
 });
 
 test('admission waits while load or memory is short, logs once, then proceeds', async () => {
@@ -566,17 +603,17 @@ test('admission never deadlocks: after --resource-wait the gate runs with one sl
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const x = idle({ freeMem: GiB });
   const c = { ...cfg, interval: 60e3, resourceWait: 30 * 60e3, gateSlots: 2 };
-  writeFileSync(join(dir, 'slot-1'), `${process.pid}\n`); // slot 1 busy: the starved gate still takes slot 0
+  writeFileSync(join(dir, `slot-1.${process.pid}.901`), ''); // slot 1 busy: the starved gate still takes slot 0
   const r = await runGate('echo ran', dir, c, { ...x, dir });
   assert.equal(r.stdout.trim(), 'ran');
   assert.equal(x.clock.t, 30 * 60e3);
   assert.deepEqual(x.events.map((e) => e.event), ['waiting_for_resources', 'resource_wait_expired']);
-  assert.ok(!existsSync(join(dir, 'slot-0')));
+  assert.deepEqual(readdirSync(dir), [`slot-1.${process.pid}.901`]); // slot 0 was released
   // With slot 0 taken as well, the starved gate waits for it instead of using slot 1.
-  writeFileSync(join(dir, 'slot-0'), `${process.pid}\n`);
-  rmSync(join(dir, 'slot-1'));
+  writeFileSync(join(dir, `slot-0.${process.pid}.902`), '');
+  rmSync(join(dir, `slot-1.${process.pid}.901`));
   const y = idle({ freeMem: GiB });
-  const pause = async (ms) => { y.clock.t += ms; if (y.clock.t > c.resourceWait + 10e3) rmSync(join(dir, 'slot-0'), { force: true }); };
+  const pause = async (ms) => { y.clock.t += ms; if (y.clock.t > c.resourceWait + 10e3) rmSync(join(dir, `slot-0.${process.pid}.902`), { force: true }); };
   await runGate('true', dir, c, { ...y, pause, dir });
   assert.deepEqual(y.events.map((e) => e.event), ['waiting_for_resources', 'resource_wait_expired', 'waiting_for_gate_slot']);
 });
@@ -606,8 +643,8 @@ test('machine options: defaults, validation, and the status line', (t) => {
   }
   const dir = mkdtempSync(join(tmpdir(), 'prloop-slots-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
-  writeFileSync(join(dir, 'slot-0'), `${process.pid}\n`);
-  writeFileSync(join(dir, 'slot-1'), `${deadPid()}\n`);
+  writeFileSync(join(dir, `slot-0.${process.pid}.0`), '');
+  writeFileSync(join(dir, `slot-1.${deadPid()}.0`), '');
   assert.equal(machineLine(d, { metrics: idle({ load: 2.5 }).metrics, dir }),
     'load 2.50 (max 6.00, 8 cores), free memory 16.0 GiB (min 4.0 GiB), gate slots 1/2 in use');
 });
@@ -626,7 +663,7 @@ test('self-check warns about a dirty, off-branch or behind prloop checkout, and 
   writeFileSync(join(other, 'app.txt'), 'two\n');
   r.run(other, 'commit', '-qam', 'newer');
   r.run(other, 'push', '-q', 'origin', 'main');
-  assert.match(selfCheck(r.work).warning, /is 1 commit\(s\) behind origin\/main/);
+  assert.match(selfCheck(r.work).warning, /is behind origin\/main/);
   r.run(r.work, 'pull', '-q', '--ff-only');
   assert.equal(selfCheck(r.work), null);
   rmSync(join(r.dir, 'remote.git'), { recursive: true, force: true }); // fetch fails: note, no warning
@@ -642,6 +679,35 @@ test('agent result: the last JSON line, also inside a JSON wrapper', () => {
   assert.deepEqual(parseAgentResult(JSON.stringify({ type: 'result', result: `Summary.\n${line}` })).fixed, ['T1']);
   assert.equal(parseAgentResult('{"status":"maybe"}'), null);
   assert.equal(parseAgentResult(''), null);
+});
+
+test('agent result: inside a json fence, pretty-printed or inline, and in the CLI wrapper result', () => {
+  const fenced = 'Done.\n\n```json\n{\n  "status": "requested",\n  "head": "abc",\n  "fixed": ["T1"],\n  "disputed": []\n}\n```\nThanks.';
+  assert.deepEqual(parseAgentResult(fenced).fixed, ['T1']);
+  assert.equal(parseAgentResult(JSON.stringify({ type: 'result', subtype: 'success', result: fenced })).status, 'requested');
+  assert.equal(parseAgentResult('Result: {"status":"nothing_to_do","head":"abc"} as asked.').status, 'nothing_to_do');
+});
+
+test('agent failure: the CLI wrapper names why the session ended without a result', () => {
+  const w = (o) => JSON.stringify({ type: 'result', result: '', ...o });
+  assert.equal(agentFailure(w({ subtype: 'error_max_turns', is_error: true })), 'the agent session ended at its max-turns limit');
+  assert.equal(agentFailure(w({ subtype: 'error_during_execution', is_error: true })), 'the agent session ended with error_during_execution');
+  assert.match(agentFailure(w({ subtype: 'success', permission_denials: [{ tool_name: 'Bash' }] })), /1 permission denial/);
+  assert.match(agentFailure(w({ subtype: 'success', is_error: true, result: 'API error' })), /ended on an error: API error/);
+  assert.equal(agentFailure(w({ subtype: 'success', result: 'no line' })), null);
+  assert.equal(agentFailure('plain text'), null);
+});
+
+test('agent logs keep raw output owner-only and prune logs older than 14 days', (t) => {
+  const dir = tempState(t);
+  const now = Date.parse('2026-02-01T00:00:00Z');
+  const old = saveAgentLog('example-org/example-repo', 7, { status: 0, stdout: 'old', stderr: '', final: 'old' }, now - 15 * 864e5);
+  execFileSync('touch', ['-d', '2026-01-10', old]);
+  const f = saveAgentLog('example-org/example-repo', 7, { status: 1, stdout: 'out', stderr: 'err', final: 'last' }, now);
+  assert.equal(f, join(dir, 'agents', 'example-org__example-repo__7__2026-02-01T00-00-00-000Z.log'));
+  assert.equal(readFileSync(f, 'utf8'), '# exit status 1\n## stdout\nout\n## stderr\nerr\n## final message\nlast\n');
+  assert.equal(statSync(f).mode & 0o777, 0o600);
+  assert.ok(!existsSync(old));
 });
 
 test('the fix prompt carries only the trigger data and the contract', () => {
@@ -998,4 +1064,45 @@ test('run carries a clean verdict across a sync that leaves the PR unchanged', a
   const st = JSON.parse(readFileSync(join(state, 'example-org__example-repo__7.json'), 'utf8'));
   assert.deepEqual([st.carry.from, st.carry.to], [head, synced]);
   assert.ok(calls().every((c) => c.startsWith('api graphql')), 'no review request or other write');
+});
+
+// A PR with one unresolved finding and a fake `claude` whose JSON wrapper reports error_max_turns and no result line.
+// With `resolves`, the agent resolves the thread (real progress) before its session ends.
+async function runNoResultAgent(t, resolves) {
+  const state = tempState(t);
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  writeFileSync(join(state, 'heads.json'), JSON.stringify({ 'example-org/example-repo#7': { sha: head, at: at('09:00') } }));
+  const pr = fixture();
+  Object.assign(pr, { headRefName: 'feat', headRefOid: head, mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE' });
+  pr.reviewThreads.nodes.push(thread('T1', at('10:20')));
+  fakeGh(t, r.dir, pr);
+  const done = { ...pr, reviewThreads: { ...pr.reviewThreads, nodes: [{ ...thread('T1', at('10:20')), isResolved: true }] } };
+  request(done).reactions.nodes.push({ content: 'THUMBS_UP', createdAt: at('10:30'), user: BOT });
+  const reply = JSON.stringify({ data: { viewer: { login: 'example-dev' }, repository: { mergeCommitAllowed: true, squashMergeAllowed: true, rebaseMergeAllowed: true, pullRequest: done } } });
+  writeFileSync(join(r.dir, 'done.json'), reply);
+  writeFileSync(join(r.dir, 'bin', 'claude'), `#!/bin/sh
+${resolves ? `cp "${r.dir}/done.json" "${r.dir}/pr.json"` : ''}
+echo '{"type":"result","subtype":"error_max_turns","is_error":true,"result":"Ran out of turns."}'
+`, { mode: 0o755 });
+  const [res] = await runAll({ repo: 'example-org/example-repo', pr: '7', worktree: r.work, deadline: '1h' }, { ...cfg, interval: 1 }, { metrics: idle().metrics });
+  return { res };
+}
+
+test('run blocks with the session error and keeps the agent log when an agent ends without a result line', async (t) => {
+  const { res } = await runNoResultAgent(t, false);
+  assert.equal(res.verdict, 'blocked', JSON.stringify(res));
+  assert.equal(res.reason, 'the agent session ended at its max-turns limit');
+  assert.match(readFileSync(res.agentLog, 'utf8'), /error_max_turns/);
+  assert.ok(res.next.includes(res.agentLog));
+});
+
+test('run keeps polling when an agent without a result line still made progress', async (t) => {
+  const { res } = await runNoResultAgent(t, true);
+  assert.equal(res.verdict, 'clean', JSON.stringify(res));
+  assert.ok(existsSync(res.agentLog));
+  const events = runStatus('example-org/example-repo').prs[0].events.map((e) => e.phase);
+  assert.ok(events.includes('agent_no_result'), events.join(','));
 });

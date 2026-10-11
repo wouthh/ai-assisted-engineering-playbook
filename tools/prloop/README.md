@@ -15,7 +15,7 @@ prloop --help
 
 `bin/prloop` is a symlink to `tools/prloop/prloop.mjs`. Run the tests with `node --test` from the repository root; they use fixture JSON and temporary Git repositories and never contact the network.
 
-The installed copy should be a checkout that tracks the published `main`; changes go through PRs, not local edits. On startup `run` and `ready` check prloop's own checkout (the directory of the resolved script, when it is a Git repository): it must be clean, on the default branch (`origin/HEAD`, else `main`) and not behind `origin` after a quick `git fetch` of that branch (10s timeout; a failed fetch skips this part with a note). Otherwise they print one `self_check` warning on stderr naming the fix, `git -C <dir> pull --ff-only`. With `--require-current` (or `PRLOOP_REQUIRE_CURRENT=1`) the warning becomes a usage error (exit 40). A copy outside Git is not checked.
+The installed copy should be a checkout that tracks the published `main`; changes go through PRs, not local edits. On startup `run` and `ready` check prloop's own checkout (the directory of the resolved script, when it is a Git repository): it must be clean, on the default branch (`origin/HEAD`, else `main`) and not behind `origin`, read with `git ls-remote` so nothing in the checkout is written (10s timeout; a failed read skips this part with a note). Otherwise they print one `self_check` warning on stderr naming the fix, `git -C <dir> pull --ff-only`. With `--require-current` (or `PRLOOP_REQUIRE_CURRENT=1`) the warning becomes a usage error (exit 40). A copy outside Git is not checked.
 
 ## Sharing one machine
 
@@ -23,7 +23,7 @@ Several `prloop` processes, their agents and gates, and unrelated work often sha
 
 | Option | Environment | Default | |
 |---|---|---|---|
-| `--gate-slots <n>` | `PRLOOP_GATE_SLOTS` | 2 | Gates running at once, across every `prloop` process of the user. Each gate takes a slot file in `${XDG_RUNTIME_DIR:-/tmp}/prloop-slots/`, created exclusively and holding the owner's PID; a slot whose process died is reclaimed. A waiting gate polls quietly and logs one `waiting_for_gate_slot` event. |
+| `--gate-slots <n>` | `PRLOOP_GATE_SLOTS` | 2 | Gates running at once, across every `prloop` process of the user. Each gate claims a slot in `$XDG_RUNTIME_DIR/prloop-slots/` (`/tmp/prloop-slots-<uid>/` without it; the directory must be yours and not writable by others) with a file named after the slot and its PID, and keeps it only when no other live claim exists, so racing claims never share a slot. Claims of dead processes are removed. A waiting gate polls quietly, rechecks the load and memory limits on every poll, and logs one `waiting_for_gate_slot` event. |
 | `--max-load <x>` | `PRLOOP_MAX_LOAD` | 0.75 x CPU cores | No agent, local review or gate starts while the 1-minute load average is higher. |
 | `--min-free-mem <size>` | `PRLOOP_MIN_FREE_MEM` | larger of 4G and 10% of RAM | ...or while available memory (`MemAvailable` on Linux, free memory elsewhere) is lower. Sizes take K, M, G or T (binary). |
 | `--resource-wait <dur>` | `PRLOOP_RESOURCE_WAIT` | 30m | The wait never deadlocks: after this long it proceeds with one slot only (one agent at a time in `run`, only the first gate slot in `ready`) and logs `resource_wait_expired`. |
@@ -63,6 +63,8 @@ Each fix agent runs in the PR's worktree (found with `git worktree list` by bran
 6. post the review request, reusing the previous request body (skipped with `--reviewer local`);
 7. exit with one JSON line: `{"status":"requested|blocked|nothing_to_do","head":"…","fixed":[…],"disputed":[…],"reason":"…"}`.
 
+prloop finds that line anywhere in the agent's final message, also pretty-printed inside a ```` ```json ```` fence, and with `--output-format json` searches the CLI's `result` field. Each agent's raw stdout and stderr are kept, owner-only, in `${XDG_STATE_HOME:-~/.local/state}/prloop/agents/<owner>__<name>__<pr>__<time>.log` (pruned after 14 days); the path is in the blocked event, the state (`agentLog`) and the final summary. When an agent ends without a result line, the reason names what the CLI reported (an error, the max-turns limit or a permission denial) where it can; if the agent made progress anyway (a new head, a resolved thread, a review request or a tested head), prloop logs `agent_no_result` and keeps polling instead of blocking.
+
 Fix agents never wait for or poll reviews, merge, touch other PRs, rewrite history except through `prloop sync`, or retry in a loop.
 
 | Option | Default | |
@@ -78,7 +80,7 @@ Fix agents never wait for or poll reviews, merge, touch other PRs, rewrite histo
 | `--merge rebase\|squash\|merge` | off | Merges only a head whose fresh snapshot is clean with no unresolved threads, marked tested in the PR worktree with a clean pushed tree, and reported mergeable, using `gh pr merge --match-head-commit <sha>`. A clean but untested head goes to an agent for the gate only. The result is `merged`, or `merge_pending` (exit 50) when a merge queue or auto-merge accepted it without merging yet. |
 | `--union <glob>` | | Passed to sync. Reviewer and timing options apply as for `wait`. |
 
-Failsafes end a PR in `blocked` (or `needs_human` for disputed findings) with a reason, never in a loop: maximum rounds per PR (`--max-rounds 6`), an agent that exits non-zero, prints no parseable result line, reports `blocked` or a permission denial, or makes no progress (no new commit, resolved thread, request or tested head), the same finding (path plus normalized first line) returning after two fixes, the overall deadline, and every local-review failsafe.
+Failsafes end a PR in `blocked` (or `needs_human` for disputed findings) with a reason, never in a loop: maximum rounds per PR (`--max-rounds 6`), an agent that exits non-zero, prints no parseable result line without making progress, reports `blocked` or a permission denial, or makes no progress (no new commit, resolved thread, request or tested head), the same finding (path plus normalized first line) returning after two fixes, the overall deadline, and every local-review failsafe.
 
 Every count (`--max-rounds`, `--max-agents`) must be a positive integer and every duration (`--deadline`, `--interval`, `--timeout`, `--ack-timeout`) a positive `90s`/`40m`/`6h` value; anything else, such as `NaN`, `Infinity` or `0`, is a usage error (exit 40) instead of an unbounded loop. `--max-local-reviews` is a nonnegative integer: 0 disables local reviews.
 
