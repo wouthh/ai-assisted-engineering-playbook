@@ -71,6 +71,48 @@ test('a delayed clean comment after a new request but before its acknowledgement
   assert.equal(classify(pr, cfg, NOW).verdict, 'pending'); // the acknowledgement came after that comment
 });
 
+// A current request answered with a clean summary comment and a 👍 on the PR body, with no 👀 anywhere.
+function cleanWithoutAck(named) {
+  const pr = fixture();
+  pr.headRefOid = pr.commits.nodes[0].commit.oid = '2603924'.padEnd(40, 'a');
+  pr.commits.nodes[0].commit.committedDate = '2026-01-01T21:50:00Z';
+  Object.assign(request(pr), { createdAt: '2026-01-01T22:03:48Z' });
+  pr.comments.nodes.push({ id: 'IC_bot', databaseId: 102, author: BOT, reactions: { nodes: [] }, createdAt: '2026-01-01T22:06:06Z',
+    body: `### Codex Review\n\nDidn't find any major issues. Keep it up!\n\nReviewed commit: \`${named}\`` });
+  return pr;
+}
+const AFTER = Date.parse('2026-01-01T22:07:00Z');
+
+test('a current request answered by a PR-body thumbs-up and a clean comment naming the head is clean without eyes', () => {
+  const both = cleanWithoutAck('2603924');
+  both.reactions.nodes.push({ content: 'THUMBS_UP', createdAt: '2026-01-01T22:06:11Z', user: BOT });
+  assert.deepEqual([classify(both, cfg, AFTER).reviewerState.state, classify(both, cfg, AFTER).verdict], ['clean', 'clean']);
+  const thumbOnly = cleanWithoutAck('2603924');
+  thumbOnly.comments.nodes.pop();
+  thumbOnly.reactions.nodes.push({ content: 'THUMBS_UP', createdAt: '2026-01-01T22:06:11Z', user: BOT });
+  assert.equal(classify(thumbOnly, cfg, AFTER).verdict, 'clean'); // (a) a 👍 on the PR body after the request
+  assert.equal(classify(cleanWithoutAck('2603924'), cfg, AFTER).verdict, 'clean'); // (b) the comment names this head
+});
+
+test('an unacknowledged clean comment naming an older commit does not clear the head', () => {
+  const pr = cleanWithoutAck('1111111');
+  assert.equal(classify(pr, cfg, AFTER).reviewerState.state, 'none'); // no clean signal: after the ack timeout it times out
+  request(pr).reactions.nodes.push({ content: 'EYES', createdAt: '2026-01-01T22:04:00Z', user: BOT });
+  assert.equal(classify(pr, cfg, AFTER).verdict, 'pending'); // even after an acknowledgement
+  const before = cleanWithoutAck('2603924');
+  before.reactions.nodes.push({ content: 'THUMBS_UP', createdAt: '2026-01-01T22:03:00Z', user: BOT }); // before the request
+  before.comments.nodes.pop();
+  assert.equal(classify(before, cfg, AFTER).reviewerState.state, 'none');
+});
+
+test('an unacknowledged clean comment naming no commit counts only without an earlier review cycle', () => {
+  const pr = fixture();
+  pr.comments.nodes.push({ id: 'IC_bot', databaseId: 102, body: "Codex Review: Didn't find any major issues.", createdAt: at('10:07'), author: BOT, reactions: { nodes: [] } });
+  assert.equal(classify(pr, cfg, NOW).verdict, 'pending'); // the older request IC_old could still finish late
+  pr.comments.nodes.shift();
+  assert.equal(classify(pr, cfg, NOW).verdict, 'clean');
+});
+
 test('a clean bot comment without a request or eyes on this head does not count', () => {
   const pr = fixture();
   pr.comments.nodes.pop(); // automatic review: no request after the head

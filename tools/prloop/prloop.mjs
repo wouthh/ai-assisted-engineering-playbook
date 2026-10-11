@@ -266,10 +266,10 @@ export function classify(pr, cfg, nowMs = Date.now()) {
   }
   const since = current ? triggerNode.createdAt : headTime;
 
-  // A requested review reacts on the request. Without one, PR-body reactions count only once the bot has
-  // started (👀) after this head, so a late 👍 from a review of the previous head cannot clear this one.
+  // A requested review reacts on the request, or on the PR body after the request. Without a request, PR-body reactions
+  // count only once the bot has started (👀) after this head, so a late 👍 from a review of the previous head cannot clear this one.
   const bodyReactions = (pr.reactions?.nodes ?? []).filter((r) => isBot(r) && r.createdAt >= headTime);
-  const reactions = current ? triggerNode.reactions.nodes : bodyReactions.some((r) => r.content === 'EYES') ? bodyReactions : [];
+  const reactions = current ? [...triggerNode.reactions.nodes, ...bodyReactions] : bodyReactions.some((r) => r.content === 'EYES') ? bodyReactions : [];
   const signals = reactions
     .filter((r) => isBot(r) && r.createdAt >= since && (r.content === 'EYES' || r.content === 'THUMBS_UP'))
     .map((r) => ({ at: r.createdAt, state: r.content === 'EYES' ? 'reviewing' : 'clean' }));
@@ -284,10 +284,18 @@ export function classify(pr, cfg, nowMs = Date.now()) {
     .filter((r) => isBot(r) && r.content === 'EYES').map((r) => r.createdAt).sort()[0];
   const botComments = pr.comments.nodes.filter((c) => isBot(c) && c.createdAt >= since && (started || trusted(c)));
   const summaries = [...botReviews.map((r) => ({ at: r.submittedAt, body: r.body, local: trusted(r), acked: true })),
-    ...botComments.map((c) => ({ at: c.createdAt, body: c.body, local: trusted(c), acked: !!ackAt && c.createdAt >= ackAt }))]
+    ...botComments.map((c) => ({ at: c.createdAt, body: c.body, local: trusted(c), acked: !!ackAt && c.createdAt >= ackAt,
+      named: /Reviewed commit:\W*([0-9a-f]{7,40})/i.exec(c.body)?.[1] }))]
     .filter((s) => s.body);
+  // Without an acknowledgement, a clean comment after the current request counts when it names this head, or names no
+  // commit while no earlier review cycle exists (no older request, no earlier bot reaction on the PR body, full history seen)
+  // that could finish late. A comment naming another commit never clears this head.
+  const earlierCycle = !current || pr.comments.pageInfo?.hasPreviousPage
+    || pr.comments.nodes.some((c) => !isBot(c) && c.createdAt < triggerNode.createdAt && c.body.toLowerCase().includes(cfg.trigger.toLowerCase()))
+    || (pr.reactions?.nodes ?? []).some((r) => isBot(r) && r.createdAt < headTime);
+  const cleanOk = (s) => (s.named ? head.startsWith(s.named.toLowerCase()) && (s.acked || current) : s.acked || !earlierCycle);
   for (const s of summaries) {
-    if (s.local ? s.body.includes(localCleanBody(head)) : s.acked && cfg.clean.test(s.body)) signals.push({ at: s.at, state: 'clean' });
+    if (s.local ? s.body.includes(localCleanBody(head)) : cleanOk(s) && cfg.clean.test(s.body)) signals.push({ at: s.at, state: 'clean' });
     else if (!s.local && s.acked && cfg.unavailable.test(s.body)) signals.push({ at: s.at, state: 'unavailable' });
   }
   const newFindings = threads.filter((t) => t.fromReviewer && t.createdAt >= since);
