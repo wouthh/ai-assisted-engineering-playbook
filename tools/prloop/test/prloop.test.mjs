@@ -2,14 +2,16 @@ import assert from 'node:assert/strict';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import {
-  EXIT, OUTPUT_TAIL, main, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, recordGatePass, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, syncBranch, unionLines, waitFor,
+  EXIT, OUTPUT_TAIL, main, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, gateProvenance, treeRss, recordGatePass, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, syncBranch, unionLines, waitFor,
 } from '../prloop.mjs';
 
 const pick = (o, keys) => Object.fromEntries(keys.map((k) => [k, o[k]]));
+// A readyGate result without its run details (timing, log path).
+const gr = (g) => ({ ok: g.ok, ...(g.cached ? { cached: g.cached } : {}) });
 const fixture = () => JSON.parse(readFileSync(new URL('./pr-fixture.json', import.meta.url), 'utf8'));
 const cfg = config({}, {});
 const NOW = Date.parse('2026-01-01T10:06:00Z'); // one minute after the current request
@@ -770,9 +772,9 @@ test('ready runs the gate: a failure returns the tail, a pass marks the head tes
   assert.deepEqual([failed.ok, failed.status], [false, 3]);
   assert.match(failed.tail, /FAIL tests\/a\.test\.js$/);
   assert.equal(isTested(head, r.work), false);
-  assert.deepEqual(await readyGate(s, { ...cfg, gate: 'true' }, r.work, deps), { ok: true });
+  assert.deepEqual(gr(await readyGate(s, { ...cfg, gate: 'true' }, r.work, deps)), { ok: true });
   assert.equal(isTested(head, r.work), true);
-  assert.deepEqual(await readyGate(s, { ...cfg, gate: 'true' }, r.work, deps), { ok: true, cached: head }); // the same gate does not rerun
+  assert.deepEqual(gr(await readyGate(s, { ...cfg, gate: 'true' }, r.work, deps)), { ok: true, cached: head }); // the same gate does not rerun
   assert.deepEqual(readdirSync(deps.dir), []); // the gate slot was released
 });
 
@@ -1057,10 +1059,10 @@ test('a passed gate is cached by exact clean head, repository and command: no se
   const gate = `echo a >> "${runs}"`;
   const deps = { ...idle(), dir: join(r.dir, 'slots') };
   let head = r.run(r.work, 'rev-parse', 'HEAD');
-  assert.deepEqual(await readyGate({ branch: 'feat', head }, { ...cfg, gate }, r.work, deps), { ok: true });
+  assert.deepEqual(gr(await readyGate({ branch: 'feat', head }, { ...cfg, gate }, r.work, deps)), { ok: true });
   assert.equal(count(), 1);
   unmarkTested(head, r.work);
-  assert.deepEqual(await readyGate({ branch: 'feat', head }, { ...cfg, gate }, r.work, deps), { ok: true, cached: head }); // hit
+  assert.deepEqual(gr(await readyGate({ branch: 'feat', head }, { ...cfg, gate }, r.work, deps)), { ok: true, cached: head }); // hit
   assert.equal(count(), 1);
   assert.equal(isTested(head, r.work), true);
   unmarkTested(head, r.work);
@@ -1109,10 +1111,10 @@ test('a head tested by gate A is not tested for gate B: ready --gate B runs B', 
   const s = { branch: 'feat', head: r.run(r.work, 'rev-parse', 'HEAD') };
   const deps = { ...idle(), dir: join(r.dir, 'slots') };
   const a = `echo A >> "${runs}"`, b = `echo B >> "${runs}"`;
-  assert.deepEqual(await readyGate(s, { ...cfg, gate: a }, r.work, deps), { ok: true });
+  assert.deepEqual(gr(await readyGate(s, { ...cfg, gate: a }, r.work, deps)), { ok: true });
   assert.deepEqual(localGate(s, r.work, a), []);
   assert.match(localGate(s, r.work, b).join(), /not marked tested.*then `prloop mark-tested --gate "<cmd>"`/); // A's marker is no evidence for B
-  assert.deepEqual(await readyGate(s, { ...cfg, gate: b }, r.work, deps), { ok: true });
+  assert.deepEqual(gr(await readyGate(s, { ...cfg, gate: b }, r.work, deps)), { ok: true });
   assert.equal(readFileSync(runs, 'utf8'), 'A\nB\n');
   assert.deepEqual(localGate(s, r.work, b), []);
   assert.equal((await readyGate(s, { ...cfg, gate: 'false' }, r.work, deps)).ok, false); // a failing gate C is never skipped
@@ -1128,7 +1130,7 @@ test('concurrent ready runs for the same head and gate run the gate once', async
   const c = { ...cfg, gate: `echo run >> "${runs}"` };
   const results = await Promise.all([readyGate(s, c, r.work, deps), readyGate(s, c, r.work, deps), readyGate(s, c, r.work, deps)]);
   assert.equal(readFileSync(runs, 'utf8'), 'run\n');
-  assert.deepEqual(results, [{ ok: true }, { ok: true, cached: s.head }, { ok: true, cached: s.head }]);
+  assert.deepEqual(results.map(gr), [{ ok: true }, { ok: true, cached: s.head }, { ok: true, cached: s.head }]);
   assert.deepEqual(readdirSync(join(state, 'gate-locks')), []); // the per-key lock is removed when free
 });
 
@@ -1139,7 +1141,7 @@ test('the per-key gate lock records the gate shell, so it outlives a killed read
   const out = join(r.dir, 'claim');
   const s = { branch: 'feat', head: r.run(r.work, 'rev-parse', 'HEAD') };
   const c = { ...cfg, gate: `sleep 0.3; cat "${state}"/gate-locks/*/* > "${out}"; { echo; echo $$; } >> "${out}"` };
-  assert.deepEqual(await readyGate(s, c, r.work, { ...idle(), dir: join(r.dir, 'slots') }), { ok: true });
+  assert.deepEqual(gr(await readyGate(s, c, r.work, { ...idle(), dir: join(r.dir, 'slots') })), { ok: true });
   const lines = readFileSync(out, 'utf8').trim().split('\n');
   assert.equal(lines.at(-2).split(' ')[0], lines.at(-1)); // the claim lists the gate shell's pid
 });
@@ -1881,7 +1883,7 @@ test('run counts a configured gate pass as progress when the head already had an
 node -e 'import(process.argv[1]).then((m) => m.recordGatePass("true", process.cwd()))' "${mod}"
 echo '{"status":"nothing_to_do","head":"${head}"}'
 `, { mode: 0o755 });
-  const [res] = await runAll({ repo: 'example-org/example-repo', pr: '7', worktree: r.work, merge: 'rebase', deadline: '1h' }, { ...cfg, gate: 'true', interval: 1 }, { metrics: idle().metrics });
+  const [res] = await runAll({ repo: 'example-org/example-repo', pr: '7', worktree: r.work, merge: 'rebase', deadline: '1h' }, { ...cfg, gate: 'true', gateCost: 0, interval: 1 }, { metrics: idle().metrics });
   assert.equal(res.verdict, 'merged', JSON.stringify(res));
 });
 
@@ -2258,19 +2260,54 @@ test('sync fails closed when regenerate leaves uncommitted changes inside a subm
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
 });
 
-test('sync refuses to run a regenerate command the synced .prloop.json replaced', (t) => {
+test('sync regenerates with the command the synced .prloop.json declares, never the branch\'s stale one', (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   r.commit('feature', { 'gen.txt': 'feature\n' });
   r.run(r.work, 'push', '-q', 'origin', 'feat');
-  divergeOnMain(r, { 'gen.txt': 'base\n', '.prloop.json': '{"regenerate":"make gen"}\n' });
+  divergeOnMain(r, { 'gen.txt': 'base\n', '.prloop.json': '{"generated":["gen.txt"],"regenerate":"echo synced > gen.txt"}\n' });
   const head = r.run(r.work, 'rev-parse', 'HEAD');
   const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true }, generated: ['gen.txt'], regenerate: 'echo stale > ran.txt' });
-  assert.equal(v.verdict, 'error', JSON.stringify(v));
-  assert.match(v.error, /changed regenerate/);
+  assert.equal(v.verdict, 'synced', JSON.stringify(v));
   assert.ok(!existsSync(join(r.work, 'ran.txt')));
+  assert.equal(r.run(r.work, 'cat-file', '-p', 'HEAD:gen.txt'), 'synced');
+  assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), v.head);
+});
+
+test('sync classifies generated conflicts with the generated list the base changed', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.run(r.work, 'switch', '-q', 'main');
+  r.commit('config', { '.prloop.json': '{"generated":["other.txt"],"regenerate":"cp app.txt gen.txt"}\n' });
+  r.run(r.work, 'push', '-q', 'origin', 'main');
+  r.run(r.work, 'switch', '-q', 'feat');
+  r.run(r.work, 'merge', '-q', '--ff-only', 'main');
+  r.commit('feature', { 'gen.txt': 'feature\n' });
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  divergeOnMain(r, { 'gen.txt': 'base\n', '.prloop.json': '{"generated":["gen.txt"],"regenerate":"cp app.txt gen.txt"}\n' });
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  // The caller loaded the branch's configuration, which does not list gen.txt.
+  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true }, generated: ['other.txt'], regenerate: 'cp app.txt gen.txt' });
+  assert.equal(v.verdict, 'synced', JSON.stringify(v));
+  assert.deepEqual(v.regenerated, ['gen.txt']);
+  assert.equal(r.run(r.work, 'cat-file', '-p', 'HEAD:gen.txt'), 'one');
+});
+
+test('a rejected regeneration commit rolls back like any other failed regeneration', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.commit('feature', { 'gen.txt': 'feature\n' });
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  divergeOnMain(r, { 'gen.txt': 'base\n' });
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  writeFileSync(join(r.work, '.git', 'hooks', 'commit-msg'), '#!/bin/sh\n! grep -q "^Regenerate" "$1"\n', { mode: 0o755 }); // rejects only that commit
+  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true }, generated: ['gen.txt'], regenerate: 'echo new > gen.txt; echo x > made.txt' });
+  assert.equal(v.verdict, 'error', JSON.stringify(v));
+  assert.match(v.error, /committing the regenerated files failed/);
   assert.equal(r.run(r.work, 'rev-parse', 'HEAD'), head);
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
+  assert.equal(r.run(r.work, 'status', '--porcelain'), ''); // no merge, staged output or new file left behind
+  assert.equal(spawnSync('git', ['rev-parse', '-q', '--verify', 'MERGE_HEAD'], { cwd: r.work }).status, 1);
 });
 
 test('a failing regenerate command restores the old head and reports no output', (t) => {
@@ -2334,4 +2371,103 @@ test('the conflict prompt sends the agent through prloop sync --continue, never 
   const p = buildPrompt({ trigger: 'conflict', conflicts: ['app.txt'], pr: 7, repo: 'o/r', gate: 'make test' });
   assert.match(p, /never with a raw `git rebase`/);
   assert.match(p, /`prloop sync 7 --continue`/);
+});
+
+test('a gate run writes its whole output to an owner-only gate log and records timing in the cache, state and event log', async (t) => {
+  const state = tempState(t);
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  const deps = { ...idle(), dir: join(r.dir, 'slots'), repo: 'example-org/example-repo' };
+  const gate = 'echo first line; seq 1 3; echo err >&2';
+  const g = await readyGate({ branch: 'feat', head, pr: 7 }, { ...cfg, gate }, r.work, deps);
+  assert.equal(g.ok, true);
+  const { run } = g;
+  assert.equal(dirname(run.log), join(state, 'gates'));
+  assert.match(basename(run.log), new RegExp(`^example-org__example-repo__7__${head}__\\d{4}-\\d\\d-\\d\\dT[\\d-]+Z\\.log$`));
+  assert.equal(statSync(run.log).mode & 0o777, 0o600);
+  assert.match(readFileSync(run.log, 'utf8'), /^first line\n1\n2\n3\nerr\n\n# prloop: exit status 0, \d+ ms/);
+  assert.deepEqual(pick(run, ['head', 'source', 'status', 'peakLoad']), { head, source: 'prloop', status: 0, peakLoad: 1 });
+  assert.ok(run.durationMs >= 0 && Date.parse(run.end) >= Date.parse(run.start));
+  assert.deepEqual(pick(gateProvenance(gate, r.work), ['head', 'source', 'ok', 'log', 'durationMs']), { head, source: 'prloop', ok: true, log: run.log, durationMs: run.durationMs });
+  const [st] = runStatus('example-org/example-repo').prs;
+  assert.deepEqual(pick(st.lastGate, ['head', 'status', 'log', 'durationMs']), { head: head.slice(0, 7), status: 0, log: run.log, durationMs: run.durationMs });
+  assert.deepEqual(pick(st.events.at(-1), ['phase', 'status', 'durationMs', 'log']), { phase: 'gate_run', status: 0, durationMs: run.durationMs, log: run.log });
+  const failed = await readyGate({ branch: 'feat', head, pr: 7 }, { ...cfg, gate: 'echo boom; exit 4', forceGate: true }, r.work, deps);
+  assert.deepEqual([failed.ok, failed.run.status], [false, 4]);
+  assert.match(readFileSync(failed.run.log, 'utf8'), /boom\n\n# prloop: exit status 4/);
+  assert.equal(runStatus('example-org/example-repo').prs[0].lastGate.status, 4);
+  // A cached hit reports the pass it reused, with its provenance.
+  const hit = await readyGate({ branch: 'feat', head, pr: 7 }, { ...cfg, gate }, r.work, deps);
+  assert.deepEqual(pick(hit.run, ['cached', 'source', 'log']), { cached: true, source: 'prloop', log: run.log });
+  // Gate logs are pruned after 14 days like agent logs.
+  execFileSync('touch', ['-d', '2000-01-01', run.log]);
+  pruneAgentLogs();
+  assert.ok(!existsSync(run.log));
+  assert.ok(existsSync(failed.run.log));
+});
+
+test('treeRss sums the resident memory of a process and its children', async () => {
+  const c = spawn('sh', ['-c', 'sleep 5 & sleep 5; wait'], { stdio: 'ignore' });
+  await new Promise((d) => setTimeout(d, 100));
+  const rss = treeRss(c.pid);
+  c.kill('SIGKILL');
+  if (!existsSync('/proc/self/stat')) return assert.equal(rss, null);
+  assert.ok(rss > 0);
+  assert.equal(treeRss(deadPid()), null);
+});
+
+test('gate provenance: a self-reported pass counts for a merge only after gate-irrelevant changes from a prloop-run pass', async (t) => {
+  tempState(t);
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  const gate = 'true', deps = { ...idle(), dir: join(r.dir, 'slots') };
+  const irrelevant = ['docs/**', '*.md'];
+  assert.equal(gateProvenance(gate, r.work, irrelevant), null); // no pass at all
+  recordGatePass(gate, r.work); // mark-tested --gate without a prloop run
+  assert.deepEqual(pick(gateProvenance(gate, r.work, irrelevant), ['source', 'ok']), { source: 'self', ok: false });
+  await readyGate({ branch: 'feat', head: r.run(r.work, 'rev-parse', 'HEAD') }, { ...cfg, gate, forceGate: true }, r.work, deps);
+  const ran = r.run(r.work, 'rev-parse', 'HEAD');
+  mkdirSync(join(r.work, 'docs'));
+  r.commit('docs only', { 'README.md': 'x\n', 'docs/a.txt': 'y\n' });
+  recordGatePass(gate, r.work);
+  assert.deepEqual(pick(gateProvenance(gate, r.work, irrelevant), ['source', 'ok', 'coveredBy']), { source: 'self', ok: true, coveredBy: ran });
+  assert.equal(gateProvenance(gate, r.work).ok, false); // without gateIrrelevant every path counts
+  r.commit('code', { 'app.txt': 'changed\n' });
+  recordGatePass(gate, r.work);
+  assert.equal(gateProvenance(gate, r.work, irrelevant).ok, false);
+  // A cache line written by an older prloop carries no provenance and is never merge evidence.
+  const file = join(process.env.XDG_STATE_HOME, 'prloop', 'gate-cache');
+  writeFileSync(file, readFileSync(file, 'utf8').split('\n').filter(Boolean).map((l) => l.split('\t')[0]).join('\n') + '\n');
+  assert.equal(gatePassed(gate, r.work), r.run(r.work, 'rev-parse', 'HEAD'));
+  assert.equal(gateProvenance(gate, r.work, irrelevant).ok, false);
+});
+
+test('run --merge reruns a self-reported gate pass itself before merging', async (t) => {
+  const state = tempState(t);
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  writeFileSync(join(state, 'heads.json'), JSON.stringify({ 'example-org/example-repo#7': { sha: head, at: at('09:00') } }));
+  const runs = join(r.dir, 'runs'), gate = `echo run >> "${runs}"`;
+  recordGatePass(gate, r.work); // self-reported
+  markTested(head, r.work);
+  const pr = fixture();
+  Object.assign(pr, { headRefName: 'feat', headRefOid: head, mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE' });
+  request(pr).reactions.nodes.push({ content: 'THUMBS_UP', createdAt: at('10:20'), user: BOT });
+  const calls = fakeGh(t, r.dir, pr);
+  const [res] = await runAll({ repo: 'example-org/example-repo', pr: '7', worktree: r.work, merge: 'squash', deadline: '1h' },
+    { ...cfg, agent: 'none', interval: 1, gate, gateCost: 0 }, { metrics: idle().metrics });
+  assert.equal(res.verdict, 'merged', JSON.stringify(res));
+  assert.equal(readFileSync(runs, 'utf8'), 'run\n'); // prloop ran the gate once, then merged
+  assert.equal(gateProvenance(gate, r.work).source, 'prloop');
+  assert.ok(calls().some((c) => c.startsWith('pr merge 7')));
+  const events = runStatus('example-org/example-repo', 20).prs[0].events.map((e) => e.phase);
+  assert.ok(events.includes('gate_unverified') && events.includes('gate_run'), events.join());
+});
+
+test('the fix prompt allows mark-tested --gate only right after that exact gate on that exact head', () => {
+  const p = buildPrompt({ repo: 'o/n', pr: 1, trigger: 'findings', findings: [], gate: 'npm test' });
+  assert.match(p, /`prloop mark-tested --gate "<cmd>"` only immediately after that exact gate command passed on this exact head and clean tree, never for a later commit/);
 });

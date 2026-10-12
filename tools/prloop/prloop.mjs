@@ -3,7 +3,7 @@
 // Single file, no dependencies. Needs Node 20+, git and an authenticated `gh`.
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, closeSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { availableParallelism, freemem, homedir, loadavg, tmpdir, totalmem } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -26,7 +26,8 @@ Agent-in-the-loop commands:
                                          runs the gate (skipped when it already passed on this clean tree),
                                          marks the head tested, checks the request gate
   prloop mark-tested [--sha <sha>] [--gate "<cmd>"]
-                                         manual escape hatch; with --gate, records that this gate passed on the clean tree
+                                         manual escape hatch; with --gate, records a self-reported pass of this gate on
+                                         the clean tree (only right after running exactly that gate on exactly this head)
   prloop wait <pr>
   prloop sync <pr> [--union <glob>]... [--continue]
                                          --continue: start or finish a sync whose manual conflicts stay in the
@@ -50,8 +51,12 @@ Options (flag or env):
                                                    default: true for a declared heavy gate
 
 Per repository: .prloop.json in the repository root may set gate, gateWeight, union, merge (the method
-for --merge repo), reviewBeforeGate, generated (globs) and regenerate (a command or a list, which lets sync
-resolve conflicts limited to generated files itself); flags and environment override it.
+for --merge repo), reviewBeforeGate, generated (globs), regenerate (a command or a list, which lets sync
+resolve conflicts limited to generated files itself) and gateIrrelevant (globs of paths whose changes need no
+new gate run before --merge); flags and environment override it.
+
+Gate logs: every gate run writes its output to <state dir>/gates/<repo>__<pr>__<head>__<time>.log (pruned after
+14 days); status, ready and run --status show the last gate's duration, exit status and log path.
 
 Self-check: \`run\` and \`ready\` warn when prloop's own checkout is dirty, off its default branch or behind it.
   --require-current         PRLOOP_REQUIRE_CURRENT=1  fail with a usage error instead of warning
@@ -139,7 +144,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const short = (sha) => (sha ?? '').slice(0, 7);
 
 // Values that one key of a config file may hold; anything else is a usage error, not a silent default.
-const REPO_KEYS = { gate: 'string', gateWeight: 'string|number', union: 'array', merge: 'string', reviewBeforeGate: 'boolean', regenerate: 'string|array', generated: 'array' };
+const REPO_KEYS = { gate: 'string', gateWeight: 'string|number', union: 'array', merge: 'string', reviewBeforeGate: 'boolean', regenerate: 'string|array', generated: 'array', gateIrrelevant: 'array' };
 const MACHINE_KEYS = { gateSlots: 'number|string', maxLoad: 'number|string', minFreeMem: 'number|string', resourceWait: 'string', gateTmpdir: 'string' };
 function readConfigFile(file, keys) {
   if (!file || !existsSync(file)) return {};
@@ -577,9 +582,11 @@ export const slotsInUse = (dir) => {
 // and memory allow, so a short gate never queues behind long ones), optionally with a private TMPDIR that is removed
 // afterwards (a full test suite can fill a small tmpfs /tmp). Admission is rechecked on every slot poll, so a
 // gate never starts on a machine that became busy while it waited. The slot claim adopts the gate shell, so the
-// slot stays taken while a gate whose prloop was killed still runs. Returns { status, stdout, stderr }.
+// slot stays taken while a gate whose prloop was killed still runs. With `deps.logFile` the whole output also goes to that
+// owner-only file. Returns { status, stdout, stderr, start, end, durationMs, peakLoad, peakRssMiB }; the peaks are
+// sampled every few seconds while the gate runs (peakRssMiB: the gate's whole process tree, null without /proc).
 export async function runGate(gate, cwd, cfg, deps = {}) {
-  const { dir = slotDir(), pause = sleep, log = logStderr } = deps;
+  const { dir = slotDir(), pause = sleep, log = logStderr, metrics = machineMetrics } = deps;
   const w = {};
   let release, logged = false;
   const cost = cfg.gateCost ?? 1;
@@ -593,16 +600,49 @@ export async function runGate(gate, cwd, cfg, deps = {}) {
     await pause(SLOT_POLL);
   }
   deps.admitted?.();
-  let tmp;
+  let tmp, out, sampler;
   try {
     const env = { ...process.env };
     if (cfg.gateTmpdir) { mkdirSync(cfg.gateTmpdir, { recursive: true }); env.TMPDIR = tmp = mkdtempSync(join(cfg.gateTmpdir, 'prloop-gate-')); }
-    const onSpawn = (pid) => { release.adopt(pid); deps.adopt?.(pid); };
-    return await spawnAsync('sh', ['-c', `(${gate}) 2>&1`], cwd, { env, onSpawn });
+    if (deps.logFile) out = openSync(deps.logFile, 'w', 0o600);
+    let gatePid, peakLoad = 0, peakRss = null;
+    const sample = () => {
+      peakLoad = Math.max(peakLoad, metrics().load);
+      const rss = gatePid ? treeRss(gatePid) : null;
+      if (rss !== null) peakRss = Math.max(peakRss ?? 0, rss);
+    };
+    const onSpawn = (pid) => { gatePid = pid; release.adopt(pid); deps.adopt?.(pid); sample(); };
+    sampler = setInterval(sample, 2e3);
+    sampler.unref();
+    const start = new Date();
+    const r = await spawnAsync('sh', ['-c', `(${gate}) 2>&1`], cwd, { env, onSpawn, out });
+    const end = new Date();
+    sample();
+    const run = { start: start.toISOString(), end: end.toISOString(), durationMs: end - start, peakLoad: Number(peakLoad.toFixed(2)),
+      peakRssMiB: peakRss === null ? null : Math.round(peakRss / 2 ** 20) };
+    if (out !== undefined) writeSync(out, `\n# prloop: exit status ${r.status}, ${run.durationMs} ms, ${run.start} to ${run.end}\n`);
+    return { ...r, ...run };
   } finally {
+    clearInterval(sampler);
+    if (out !== undefined) closeSync(out);
     if (tmp) rmSync(tmp, { recursive: true, force: true });
     release();
   }
+}
+
+// Resident memory of `pid` and all its descendants in bytes, from /proc; null where /proc is unavailable.
+// ponytail: assumes 4 KiB pages and rescans /proc per sample; fine for a sample every few seconds.
+export function treeRss(pid) {
+  let procs;
+  try {
+    procs = readdirSync('/proc').filter((f) => /^\d+$/.test(f)).flatMap((p) => {
+      try { const f = readFileSync(`/proc/${p}/stat`, 'utf8').split(') ').at(-1).split(' '); return [[Number(p), Number(f[1]), Number(f[21])]]; } catch { return []; }
+    });
+  } catch { return null; }
+  const tree = new Set([pid]);
+  for (let grew = true; grew;) { grew = false; for (const [p, pp] of procs) if (tree.has(pp) && !tree.has(p)) { tree.add(p); grew = true; } }
+  const mine = procs.filter(([p]) => tree.has(p));
+  return mine.length ? mine.reduce((n, [, , rss]) => n + rss * 4096, 0) : null;
 }
 
 export function machineLine(cfg, { metrics = machineMetrics, dir = slotDir() } = {}) {
@@ -647,31 +687,56 @@ export function editLines(f, edit, { pid = process.pid } = {}) {
 }
 
 // Passed gates, keyed by the clean checkout's exact HEAD, its repository and the gate command, since a gate may
-// inspect commit metadata or history beyond the tree. Failures are not recorded.
+// inspect commit metadata or history beyond the tree. Failures are not recorded. Each line is `<key>\t<json>`: the
+// pass's provenance, `source` prloop (prloop ran it: start, end, durationMs, status, log) or self (`mark-tested --gate`).
+// A line without metadata (an older prloop) counts as a pass of unknown provenance, which `run --merge` reruns.
 const gateCacheFile = () => join(stateDir(), 'gate-cache');
+const cacheLines = () => (existsSync(gateCacheFile()) ? readFileSync(gateCacheFile(), 'utf8').split('\n').filter(Boolean) : []);
+const parseCacheLine = (l) => { const [key, meta] = l.split('\t'); try { return { key, meta: JSON.parse(meta ?? '{}') }; } catch { return { key, meta: {} }; } };
 export function gateKey(gate, cwd) {
   if (!gate || dirty(cwd)) return null; // HEAD names a checkout's content only when it is clean
   const repo = git(['rev-parse', '--path-format=absolute', '--git-common-dir'], cwd);
   return `${git(['rev-parse', 'HEAD'], cwd)} ${createHash('sha256').update(`${repo}\0${gate}`).digest('hex')}`;
 }
-// The HEAD SHA when `gate` already passed on this clean checkout, else null.
-export function gatePassed(gate, cwd) {
-  const k = gateKey(gate, cwd);
-  return k && existsSync(gateCacheFile()) && readFileSync(gateCacheFile(), 'utf8').split('\n').includes(k) ? k.split(' ')[0] : null;
+// The cache entry { head, ...provenance } when `gate` already passed on this clean checkout, else null.
+export function gateEntry(gate, cwd, key = gateKey(gate, cwd)) {
+  const hit = key && cacheLines().map(parseCacheLine).find((e) => e.key === key);
+  return hit ? { head: key.split(' ')[0], ...hit.meta } : null;
 }
-export function recordGatePass(gate, cwd, key = gateKey(gate, cwd)) {
+// The HEAD SHA when `gate` already passed on this clean checkout, else null.
+export const gatePassed = (gate, cwd) => gateEntry(gate, cwd)?.head ?? null;
+export function recordGatePass(gate, cwd, key = gateKey(gate, cwd), meta = { source: 'self', at: new Date().toISOString() }) {
   if (!key) return null;
   mkdirSync(stateDir(), { recursive: true });
-  editLines(gateCacheFile(), (lines) => [...lines.filter((l) => l !== key).slice(-199), key]);
+  editLines(gateCacheFile(), (lines) => [...lines.filter((l) => parseCacheLine(l).key !== key).slice(-199), `${key}\t${JSON.stringify(meta)}`]);
   return key.split(' ')[0];
 }
 function forgetGatePass(key) {
-  if (key && existsSync(gateCacheFile())) editLines(gateCacheFile(), (lines) => lines.filter((l) => l !== key));
+  if (key && existsSync(gateCacheFile())) editLines(gateCacheFile(), (lines) => lines.filter((l) => parseCacheLine(l).key !== key));
+}
+
+// Whether the pass of `gate` on this clean head is good enough for `run --merge`: run by prloop itself, or self-reported
+// on a head whose diff from a prloop-run pass of the same gate in this repository touches only `irrelevant` globs
+// (the repository's gateIrrelevant). Returns null without a pass, else the entry with ok (and coveredBy).
+export function gateProvenance(gate, cwd, irrelevant = []) {
+  const key = gateKey(gate, cwd), e = gateEntry(gate, cwd, key);
+  if (!e) return null;
+  if (e.source === 'prloop') return { ...e, ok: true };
+  const res = irrelevant.map(globToRegex), hash = key.split(' ')[1];
+  for (const { key: k, meta } of cacheLines().map(parseCacheLine).reverse()) {
+    const [sha, h] = k.split(' ');
+    if (h !== hash || meta.source !== 'prloop') continue;
+    const files = tryGit(['diff', '--name-only', '--no-renames', sha, e.head], cwd); // null when that commit is gone
+    if (files !== null && files.split('\n').filter(Boolean).every((f) => res.some((r) => r.test(f)))) return { ...e, ok: true, coveredBy: sha };
+  }
+  return { ...e, ok: false };
 }
 
 // Runs the project gate for `ready` when one is configured and the clean, pushed PR head is not yet
 // tested (or always with --force-gate); a pass marks the head tested and a failure unmarks it. Returns null
-// when nothing ran. `deps` injects the machine metrics, slot directory, clock and logger (see runGate).
+// when nothing ran; otherwise `run` holds the gate run (or the cached pass) with its timing, log and provenance.
+// `deps` injects the machine metrics, slot directory, clock and logger (see runGate) and `repo` for the gate log name;
+// with `repo` and `s.pr` a gate that ran is also recorded as the PR's last gate (state file and event log).
 export async function readyGate(s, cfg, cwd, deps = {}) {
   if (!cfg.gate || localGate(s, cwd).some((r) => !r.includes('not marked tested'))) return null;
   // Pipelined review: a head that still needs a review request is requested first; the gate runs once the request
@@ -683,17 +748,22 @@ export async function readyGate(s, cfg, cwd, deps = {}) {
   let release = () => {};
   try {
     if (key) release = await gateKeyLock(key, deps.pause ?? sleep);
-    const cached = !cfg.forceGate && gatePassed(cfg.gate, cwd);
-    if (cached) { markTested(s.head, cwd); return { ok: true, cached }; }
-    const r = await runGate(cfg.gate, cwd, cfg, { ...deps, adopt: release.adopt, admitted: () => markQueued(false) }); // the gate shell keeps the key lock if ready dies
+    const cached = !cfg.forceGate && gateEntry(cfg.gate, cwd, key);
+    if (cached) { markTested(s.head, cwd); return { ok: true, cached: cached.head, run: { cached: true, ...cached } }; }
+    const dir = join(stateDir(), 'gates');
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const logFile = join(dir, `${(deps.repo ?? 'local').replace('/', '__')}__${s.pr ?? 'local'}__${s.head}__${new Date().toISOString().replace(/[:.]/g, '-')}.log`);
+    const r = await runGate(cfg.gate, cwd, cfg, { ...deps, logFile, adopt: release.adopt, admitted: () => markQueued(false) }); // the gate shell keeps the key lock if ready dies
+    const run = { head: s.head, source: 'prloop', status: r.status, ...pick(r, ['start', 'end', 'durationMs', 'peakLoad', 'peakRssMiB']), log: logFile };
+    if (deps.repo && s.pr) recordGateRun(deps.repo, s.pr, run);
     if (r.status === 0) {
-      if (key && gateKey(cfg.gate, cwd) === key) recordGatePass(cfg.gate, cwd, key); // the gate left the tree as it found it
+      if (key && gateKey(cfg.gate, cwd) === key) recordGatePass(cfg.gate, cwd, key, (({ head, ...meta }) => meta)(run)); // the gate left the tree as it found it
       markTested(s.head, cwd);
-      return { ok: true };
+      return { ok: true, run };
     }
     unmarkTested(s.head, cwd); // a forced rerun that fails withdraws the earlier validation, cached pass included
     forgetGatePass(key);
-    return { ok: false, status: r.status, tail: String(r.stdout || r.stderr).trimEnd().split('\n').slice(-60).join('\n') };
+    return { ok: false, status: r.status, run, tail: String(r.stdout || r.stderr).trimEnd().split('\n').slice(-60).join('\n') };
   } finally { markQueued(false); release(); }
 }
 
@@ -871,11 +941,19 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
       git(['add', '--', f], cwd);
     } else git(['rm', '-q', '--', f], cwd); // the base deleted it
   };
+  // The base may change .prloop.json: generated files are classified, and regenerated, with the configuration as synced,
+  // read from the working tree. Without that file (or while it is itself conflicted) the caller's configuration applies.
+  const file = join(cwd, '.prloop.json');
+  const synced = () => {
+    if (!existsSync(file) || unmerged(cwd).includes('.prloop.json')) return { generated, regenerate };
+    try { return readConfigFile(file, REPO_KEYS); } catch (e) { return { generated, regenerate, invalid: e.message }; }
+  };
   const unioned = new Set(), regenerated = new Set();
   for (let i = 0; !ok && i < 200; i++) {
     const conflicted = unmerged(cwd);
     if (!conflicted.length) break; // the step failed for another reason
-    const gen = regenerate ? generatedFiles(cwd, conflicted.filter((f) => !unionRes.some((r) => r.test(f))), [target, head], generated) : [];
+    const now = synced();
+    const gen = now.regenerate ? generatedFiles(cwd, conflicted.filter((f) => !unionRes.some((r) => r.test(f))), [target, head], now.generated ?? []) : [];
     gen.forEach((f) => { takeBase(f); regenerated.add(f); });
     const manual = unmerged(cwd).length ? resolveUnion(cwd, union, baseStage) : [];
     conflicted.filter((f) => !gen.includes(f) && !manual.includes(f)).forEach((f) => unioned.add(f));
@@ -883,9 +961,9 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
       if (resume) return { verdict: 'conflict', conflicts: manual, generated: gen, method, inProgress: true,
         next: `resolve these conflicts in the working tree${gen.length ? ' (the generated files already take the base side and are regenerated at the end)' : ''}, then run \`prloop sync <pr> --continue\`` };
       step([rebase ? 'rebase' : 'merge', '--abort']);
-      const named = regenerate ? gen : generatedFiles(cwd, manual, [target, head], generated);
+      const named = now.regenerate ? gen : generatedFiles(cwd, manual, [target, head], now.generated ?? []);
       return { verdict: 'conflict', conflicts: manual, generated: named, method,
-        next: regenerate
+        next: now.regenerate
           ? `run \`prloop sync <pr> --continue\`, resolve these conflicts in the working tree it leaves, then run it again to finish${gen.length ? ` (it regenerates ${gen.join(', ')} itself)` : ''}`
           : `resolve these conflicts by hand${named.length ? ` (regenerate ${named.join(', ')} from their sources instead of merging them)` : ''}, then run your gate and push` };
     }
@@ -918,7 +996,9 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
     }
   }
   // Once at the end, after every generated conflict took the base side (and always when finishing a resumed sync).
-  if (regenerate && (regenerated.size || resumed)) {
+  // The commands come from the synced .prloop.json, so a base that changed them never runs the branch's stale ones.
+  const final = synced();
+  if ((regenerate || final.regenerate) && (regenerated.size || resumed)) {
     // Ignored files too: generators often write ignored build output, which a failed run must not leave behind.
     // Nested submodules too, which a top-level reset or listing does not descend into.
     const repos = ['', ...git(['submodule', 'foreach', '--quiet', '--recursive', 'echo "$displaypath"'], cwd).split('\n').filter(Boolean)];
@@ -932,10 +1012,9 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
       for (const f of untracked()) if (!before.has(f)) rmSync(join(cwd, f), { force: true });
       return { verdict: 'error', error: why };
     };
-    // The command was loaded before syncing: if the synced .prloop.json changed it, the stale one must not run.
-    const regenOf = (rev) => { const t = tryGit(['show', `${rev}:.prloop.json`], cwd) ?? ''; try { return JSON.stringify(JSON.parse(t).regenerate ?? null); } catch { return t; } };
-    if (regenOf(head) !== regenOf('HEAD')) return fail('the sync changed regenerate in .prloop.json; rerun `prloop sync` so it uses the synced configuration');
-    for (const cmd of [regenerate].flat()) {
+    if (final.invalid) return fail(`the synced .prloop.json is invalid (${final.invalid}): fix it on ${base}, then rerun \`prloop sync\``);
+    if (!final.regenerate) return fail(`the synced .prloop.json no longer declares regenerate: merge ${base} by hand and regenerate ${[...regenerated].join(', ') || 'the generated files'} from their sources`);
+    for (const cmd of [final.regenerate].flat()) {
       // Output is not reported: like gate output it may hold a secret, and the result reaches agents.
       const r = spawnSync('sh', ['-c', cmd], { cwd, stdio: 'ignore' });
       if (r.status !== 0) return fail(`regenerate command failed (${cmd}, exit ${r.status}); run it in the checkout to see why`);
@@ -944,7 +1023,10 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
     // `add -A` cannot stage uncommitted changes inside a submodule: pushing would omit that output.
     const nested = git(['diff', '--name-only', '--ignore-submodules=none'], cwd).split('\n').filter(Boolean);
     if (nested.length) return fail(`regenerate left uncommitted changes in submodule ${nested.join(', ')}; commit them there or regenerate outside submodules`);
-    if (tryGit(['diff', '--cached', '--quiet'], cwd) === null) git(['commit', '--quiet', '-m', `Regenerate generated files after syncing with ${base}`], cwd);
+    // A rejected commit (a pre-commit hook) must not leave a local merge with staged output behind.
+    if (tryGit(['diff', '--cached', '--quiet'], cwd) === null && !step(['commit', '--quiet', '-m', `Regenerate generated files after syncing with ${base}`])) {
+      return fail('committing the regenerated files failed (a commit hook?); run the commit in the checkout to see why');
+    }
   }
   const push = rebase ? ['push', `--force-with-lease=${branch}:${head}`, headRemote, `HEAD:${branch}`] : ['push', headRemote, `HEAD:${branch}`];
   if (!step(push)) return { verdict: 'error', error: 'push failed; the branch is updated locally only' };
@@ -1120,10 +1202,12 @@ const statePath = (repo, pr) => join(stateDir(), `${repo.replace('/', '__')}__${
 const loadState = (repo, pr) => {
   try { return JSON.parse(readFileSync(statePath(repo, pr), 'utf8')); } catch { return { rounds: 0, seen: {} }; }
 };
-// `prloop sync` may record a carry-over while a run holds this PR's state in memory: the newer carry wins.
+// `prloop sync` may record a carry-over, and an agent's `prloop ready` a gate run, while a run holds this PR's state in
+// memory: the newer carry and the newer gate run win.
 const saveState = (st) => {
-  const disk = loadState(st.repo, st.pr).carry;
-  if (disk && !(st.carry?.at >= disk.at)) st.carry = disk;
+  const disk = loadState(st.repo, st.pr);
+  if (disk.carry && !(st.carry?.at >= disk.carry.at)) st.carry = disk.carry;
+  if (disk.lastGate && !(st.lastGate?.end >= disk.lastGate.end)) st.lastGate = disk.lastGate;
   mkdirSync(stateDir(), { recursive: true });
   // Owner-only, like the logs it points to.
   writeFileSync(statePath(st.repo, st.pr), JSON.stringify(st, null, 2), { mode: 0o600 });
@@ -1144,6 +1228,14 @@ export function recordCarry(repo, prNum, from, v) {
   logEvent(st, { phase: 'carried', from: short(from), to: short(v.head), patchId: v.patchId });
   saveState(st); // after logging, so a new log path is kept
   return st.carry;
+}
+
+// Records a gate run as the PR's last gate, in the state file and the event log.
+export function recordGateRun(repo, prNum, run) {
+  const st = { rounds: 0, seen: {}, ...loadState(repo, prNum), repo, pr: Number(prNum) };
+  st.lastGate = run;
+  logEvent(st, { phase: 'gate_run', gateHead: short(run.head), ...pick(run, ['status', 'start', 'end', 'durationMs', 'peakLoad', 'peakRssMiB', 'log']) });
+  saveState(st);
 }
 
 // The coordinator's one explicit reset of the round cap for a PR; a second one is refused.
@@ -1201,7 +1293,7 @@ ${data}${failure}${summary}
 Do these steps in order, in this session:
 1. Read only the referenced files plus every AGENTS.md that applies to them (root and nested).
 2. Fix each valid finding with a regression test. Reply with evidence on invalid findings and leave them unresolved, except a finding proven to misread AGENTS.md, which you resolve after the evidence reply once every AGENTS.md that applies to its path confirms it is invalid. Resolve conflicts.
-3. Run focused tests while fixing; never run the full project gate yourself: only \`prloop ready\` runs it, at most once per tree. If you already ran exactly that gate command and it passed on the current clean tree, \`prloop mark-tested --gate "<cmd>"\` records it instead of rerunning. Commit and push with normal commits (run \`prloop sync ${t.pr}\` first if the base moved).
+3. Run focused tests while fixing; never run the full project gate yourself: only \`prloop ready\` runs it, at most once per tree. Use \`prloop mark-tested --gate "<cmd>"\` only immediately after that exact gate command passed on this exact head and clean tree, never for a later commit or another command: it records a self-reported pass, which a merge does not accept unless only gate-irrelevant files changed since a pass prloop ran. Commit and push with normal commits (run \`prloop sync ${t.pr}\` first if the base moved).
 4. Resolve the threads you fixed; reply on the disputed ones.
 5. Gate: ${gate}. If it reports a gate failure, do not rerun \`prloop ready\` straight away: rerun the failing tests or step with their focused command, fix them (including failures you did not cause when they block the gate), commit and push, and call \`prloop ready\` again only when you are confident the full gate passes. At most 5 \`prloop ready\` calls; stop as blocked only if the same failure persists after 3 consecutive fix attempts, or the failure is environmental (missing tool, no network, permission denied), and report the exact failing step. If \`prloop ready\` fails for another reason, make one repair attempt, then stop as blocked.
 6. ${request}
@@ -1278,16 +1370,12 @@ export function saveAgentLog(repo, pr, r, now = Date.now()) {
   return file;
 }
 
-// Saves a failed gate's output tail owner-only next to the agent logs; fix prompts get only the path.
-export function saveGateLog(repo, pr, tail, now = Date.now()) {
-  return saveAgentLog(repo, pr, { status: 'gate failed', stdout: tail, stderr: '', final: tail }, now);
-}
-
-// Run on startup of `run` and `wait`: deletes agent logs older than 14 days.
+// Run on startup of `run`, `ready` and `wait`: deletes agent and gate logs older than 14 days.
 export function pruneAgentLogs(now = Date.now()) {
-  const dir = join(stateDir(), 'agents');
-  for (const f of existsSync(dir) ? readdirSync(dir) : []) {
-    try { if (now - statSync(join(dir, f)).mtimeMs > 14 * 864e5) rmSync(join(dir, f)); } catch { /* gone */ }
+  for (const dir of ['agents', 'gates'].map((d) => join(stateDir(), d))) {
+    for (const f of existsSync(dir) ? readdirSync(dir) : []) {
+      try { if (now - statSync(join(dir, f)).mtimeMs > 14 * 864e5) rmSync(join(dir, f)); } catch { /* gone */ }
+    }
   }
 }
 
@@ -1298,7 +1386,8 @@ export const OUTPUT_TAIL = 4 << 20;
 const keepTail = (s) => (s.length > 2 * OUTPUT_TAIL ? s.slice(-OUTPUT_TAIL) : s);
 // With `timeout` the child leads its own process group, and the whole group is killed once it has used up that
 // budget. Time during which `paused()` is true (the agent's gate is queued) does not count.
-const spawnAsync = (cmd, args, cwd, { env = process.env, lock, onSpawn = lock?.adopt, timeout, paused = () => false } = {}) => new Promise((done) => {
+// `out` (a file descriptor) also receives every byte of stdout and stderr, untrimmed.
+const spawnAsync = (cmd, args, cwd, { env = process.env, lock, onSpawn = lock?.adopt, timeout, paused = () => false, out } = {}) => new Promise((done) => {
   const c = spawn(cmd, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], detached: !!timeout, env: lock?.token ? { ...env, PRLOOP_LOCK_TOKEN: lock.token } : env });
   if (c.pid && onSpawn) onSpawn(c.pid);
   let timedOut = false, timer, left = timeout, last = Date.now();
@@ -1313,8 +1402,8 @@ const spawnAsync = (cmd, args, cwd, { env = process.env, lock, onSpawn = lock?.a
   };
   if (timeout && c.pid) timer = setTimeout(tick, Math.min(timeout, 1000));
   let stdout = '', stderr = '';
-  c.stdout.on('data', (d) => { stdout = keepTail(stdout + d); });
-  c.stderr.on('data', (d) => { stderr = keepTail(stderr + d); });
+  c.stdout.on('data', (d) => { if (out !== undefined) writeSync(out, d); stdout = keepTail(stdout + d); });
+  c.stderr.on('data', (d) => { if (out !== undefined) writeSync(out, d); stderr = keepTail(stderr + d); });
   const tail = (s) => s.slice(-OUTPUT_TAIL);
   c.on('error', (e) => { clearTimeout(timer); done({ status: 1, stdout: tail(stdout), stderr: `${tail(stderr)}${e.message}` }); });
   c.on('close', (code) => { clearTimeout(timer); done({ status: code ?? 1, stdout: tail(stdout), stderr: tail(stderr), ...(timedOut ? { timedOut } : {}) }); });
@@ -1469,6 +1558,20 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     event(st, 'polling', { status: result.status });
   }
 
+  // prloop runs the gate itself (pipelined review, or a merge that needs a prloop-run pass). A failure is kept with its
+  // full log for a fix agent, which gets neither the output nor the log path.
+  async function gateNow(st, s, cwd, forceGate = false) {
+    const lock = takeLock(cwd, `gate of PR #${st.pr}`);
+    if (lock.holder) return lockedOut(st, cwd, lock.holder);
+    st.lockedBy = undefined;
+    event(st, 'gate');
+    let g;
+    try { g = await readyGate(s, { ...cfg, forceGate }, cwd, { metrics, now, repo, log: ({ event: phase, ...e }) => logEvent(st, { phase, ...e }) }); } finally { lock.release(); }
+    if (g?.ok) return event(st, 'polling', { verdict: 'gate_passed' });
+    st.gateFailure = { head: s.head, log: g?.run?.log };
+    return event(st, 'polling', { verdict: 'gate_failed', reason: g ? `gate exited with ${g.status}` : 'the worktree no longer matches the PR head' });
+  }
+
   // Locked like a standalone sync, so two supervisors never fetch, merge or push in one checkout at once.
   // Returns the sync result only when the branch was already up to date; otherwise it handled the outcome.
   function syncPr(st, s, raw, cwd, slot, rebase = opts.merge === 'rebase') {
@@ -1518,17 +1621,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     // Pipelined review: once the head is requested (or already reviewed clean), prloop runs the gate itself, in parallel
     // with the review. A failure goes to a fix agent with the gate's tail; a merge needs both on the same head.
     const gated = (sha) => gatePassed(cfg.gate, cwd) === sha;
-    if (cfg.reviewBeforeGate && cfg.gate && cwd && ['pending', 'clean'].includes(s.verdict) && !gated(s.head) && st.gateFailure?.head !== s.head) {
-      const lock = takeLock(cwd, `gate of PR #${st.pr}`);
-      if (lock.holder) return lockedOut(st, cwd, lock.holder);
-      st.lockedBy = undefined;
-      event(st, 'gate');
-      let g;
-      try { g = await readyGate(s, cfg, cwd, { metrics, now, log: ({ event: phase, ...e }) => logEvent(st, { phase, ...e }) }); } finally { lock.release(); }
-      if (g?.ok) return event(st, 'polling', { verdict: 'gate_passed' });
-      st.gateFailure = { head: s.head, log: saveGateLog(st.repo, st.pr, g?.tail ?? 'the worktree no longer matches the PR head') };
-      return event(st, 'polling', { verdict: 'gate_failed', reason: `gate exited with ${g?.status}` });
-    }
+    if (cfg.reviewBeforeGate && cfg.gate && cwd && ['pending', 'clean'].includes(s.verdict) && !gated(s.head) && st.gateFailure?.head !== s.head) return gateNow(st, s, cwd);
     // A later pass of the same gate on this head (an agent's `prloop ready` after a flaky failure) supersedes the failure.
     if (st.gateFailure?.head === s.head && gated(s.head)) st.gateFailure = undefined;
     const gateFailure = cfg.reviewBeforeGate && st.gateFailure?.head === s.head ? st.gateFailure : undefined;
@@ -1562,6 +1655,12 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
       if (!cwd) return block(st, missing[0]);
       if (missing.length) return slot() && fix(st, s, cwd, { verdict: 'not_tested', trigger: 'not_requested', missing,
         note: 'The head is already reviewed clean and only needs the gate: run `prloop ready`, which runs the gate and marks the head tested, then reports that the head is already reviewed clean. That report is expected: skip the review request and report status nothing_to_do.' });
+      // A self-reported pass (`mark-tested --gate`) is not merge evidence unless only gate-irrelevant paths changed since a
+      // prloop-run pass: prloop reruns the gate itself, once per head (a failure goes to a fix agent).
+      if (cfg.gate && !gateProvenance(cfg.gate, cwd, opts.gateIrrelevant)?.ok) {
+        logEvent(st, { phase: 'gate_unverified', reason: `the gate pass on ${short(s.head)} was not run by prloop; rerunning it before merging` });
+        return gateNow(st, s, cwd, true);
+      }
       if (s.mergeable !== 'MERGEABLE') return s.mergeable === 'UNKNOWN' ? undefined : block(st, `GitHub reports mergeable=${s.mergeable}`);
       const merge = () => sh('gh', ['pr', 'merge', String(st.pr), '--repo', repo, `--${opts.merge}`, '--match-head-commit', s.head]);
       try { merge(); } catch (e) {
@@ -1604,6 +1703,9 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     rounds: st.rounds, next: st.next, ...(st.usage ? { usage: st.usage } : {}), ...(st.agentLog ? { agentLog: st.agentLog } : {}), ...(st.prompt && st.phase === 'needs_agent' ? { prompt: st.prompt } : {}) }));
 }
 
+// What status views show of the last gate run: head, exit status, timing, provenance and log path.
+const lastGateSummary = (g) => g && { ...pick(g, ['source', 'cached', 'status', 'start', 'end', 'durationMs', 'peakLoad', 'peakRssMiB', 'log']), head: short(g.head) };
+
 const pick = (o, keys) => Object.fromEntries(keys.filter((k) => o[k] !== undefined).map((k) => [k, o[k]]));
 
 // Cheap check-in for a coordinator: state files plus each PR's last few events, no GitHub calls.
@@ -1620,7 +1722,7 @@ export function runStatus(repoFilter, last = 5) {
       let events = [];
       for (const f of [st.log, ...logs].filter(Boolean)) if ((events = read(f).filter(mine(f))).length) break;
       return { repo: st.repo, pr: st.pr, phase: st.phase, head: short(st.head), rounds: st.rounds, roundResets: st.roundResets, reason: st.reason, next: st.next,
-        updatedAt: st.updatedAt, carry: st.carry, agentLog: st.agentLog, usage: st.usage, events: events.slice(-last) };
+        updatedAt: st.updatedAt, carry: st.carry, agentLog: st.agentLog, usage: st.usage, lastGate: lastGateSummary(st.lastGate), events: events.slice(-last) };
     });
   return { prs };
 }
@@ -1676,14 +1778,14 @@ export async function main(argv) {
     if (cmd === 'mark-tested') {
       // The repository's own gate counts too, so a gate declared only in .prloop.json reaches the gate cache.
       const cwd = process.cwd(), gate = opts.gate ?? process.env.PRLOOP_GATE ?? repoConfig(cwd).gate, tested = markTested(opts.sha, cwd);
-      // The caller ran this gate itself on the current clean tree: record it so `ready` does not rerun it.
+      // The caller ran this gate itself on the current clean tree: record it, as self-reported, so `ready` does not rerun it.
       const gatePassedHead = gate && tested === git(['rev-parse', 'HEAD'], cwd) ? recordGatePass(gate, cwd) : null;
-      return out({ verdict: 'ok', tested, ...(gatePassedHead ? { gatePassedHead } : {}) }, 0);
+      return out({ verdict: 'ok', tested, ...(gatePassedHead ? { gatePassedHead, source: 'self' } : {}) }, 0);
     }
     const repoFile = repoConfig(opts.worktree ? resolve(opts.worktree) : process.cwd());
     const cfg = config(opts, process.env, { machine: machineConfig(), repo: repoFile });
     if (!opts.union.length && repoFile.union) opts.union = repoFile.union;
-    Object.assign(opts, { generated: repoFile.generated ?? [], regenerate: repoFile.regenerate });
+    Object.assign(opts, { generated: repoFile.generated ?? [], regenerate: repoFile.regenerate, gateIrrelevant: repoFile.gateIrrelevant ?? [] });
     // The repository file names the method; merging itself still needs an explicit --merge.
     if (opts.merge === 'repo') opts.merge = repoFile.merge ?? (() => { throw new Error('--merge repo needs "merge" in .prloop.json'); })();
     if (cmd === 'run' && opts.status) return out({ machine: machineLine(cfg), ...runStatus(opts.repo) }, 0);
@@ -1706,14 +1808,18 @@ export async function main(argv) {
       const checkout = !!tryGit(['rev-parse', '--git-dir']);
       const local = checkout ? localGate(s, process.cwd(), cfg.gate) : [];
       const unresolvedThreads = s.unresolvedThreads.map((t) => ({ ...t, body: t.body.slice(0, 300) }));
+      const pass = checkout && cfg.gate ? gateProvenance(cfg.gate, process.cwd(), opts.gateIrrelevant) : null;
       return out({ ...s, unresolvedThreads, reasons: [...s.reasons, ...local], readyToRequest: s.readyToRequest && !local.length,
-        tested: !checkout ? false : cfg.gate ? gatePassed(cfg.gate, process.cwd()) === s.head : isTested(s.head, process.cwd()) }, 0);
+        tested: !checkout ? false : cfg.gate ? pass?.head === s.head : isTested(s.head, process.cwd()),
+        ...(pass ? { gatePass: pick(pass, ['head', 'source', 'ok', 'coveredBy', 'durationMs', 'log']) } : {}), lastGate: lastGateSummary(loadState(repo, prArg).lastGate) }, 0);
     }
     if (cmd === 'ready') {
+      pruneAgentLogs();
       let s = classify(fetchPr(repo, prArg), cfg);
-      const gate = await readyGate(s, cfg, process.cwd());
-      if (gate?.cached) console.error(`gate already passed for head ${gate.cached}`);
-      if (gate && !gate.ok) return out({ ready: false, pr: s.pr, head: s.head, gate: 'failed', exitCode: gate.status, tail: gate.tail,
+      const gate = await readyGate(s, cfg, process.cwd(), { repo });
+      if (gate?.cached) console.error(`gate already passed for head ${gate.cached} (${gate.run.source ?? 'unknown'} pass)`);
+      const lastGate = lastGateSummary(gate?.run ?? loadState(repo, prArg).lastGate);
+      if (gate && !gate.ok) return out({ ready: false, pr: s.pr, head: s.head, gate: 'failed', exitCode: gate.status, tail: gate.tail, lastGate,
         next: 'rerun the failing tests or step with its focused command, fix until it passes, then run `prloop ready` again' }, EXIT.blocked);
       // Waiting for admission or a slot can outlast a push from elsewhere: judge the PR as it is now, not the gated snapshot.
       if (gate && !gate.deferred) s = classify(fetchPr(repo, prArg), cfg);
@@ -1721,7 +1827,7 @@ export async function main(argv) {
       const missing = [...s.reasons, ...localGate(s, process.cwd(), cfg.gate)].filter((r) => !(gate?.deferred && r.includes('not marked tested')));
       const pipelined = gate?.deferred ? { gate: 'deferred', next: 'post the review request; the full gate runs next, in parallel (`prloop run` runs it, or call `prloop ready` again after the request)' }
         : gate && cfg.reviewBeforeGate ? { gate: 'passed' } : {};
-      return out({ ready: !missing.length, pr: s.pr, head: s.head, missing, trigger: cfg.trigger, ...pipelined }, missing.length ? EXIT.blocked : 0);
+      return out({ ready: !missing.length, pr: s.pr, head: s.head, missing, trigger: cfg.trigger, ...pipelined, ...(lastGate ? { lastGate } : {}) }, missing.length ? EXIT.blocked : 0);
     }
     if (cmd === 'wait') {
       pruneAgentLogs();
