@@ -726,8 +726,13 @@ export function gateProvenance(gate, cwd, irrelevant = []) {
   for (const { key: k, meta } of cacheLines().map(parseCacheLine).reverse()) {
     const [sha, h] = k.split(' ');
     if (h !== hash || meta.source !== 'prloop') continue;
-    const files = tryGit(['diff', '--name-only', '--no-renames', sha, e.head], cwd); // null when that commit is gone
-    if (files !== null && files.split('\n').filter(Boolean).every((f) => res.some((r) => r.test(f)))) return { ...e, ok: true, coveredBy: sha };
+    const raw = tryGit(['diff', '--raw', '-z', '--no-renames', sha, e.head], cwd); // null when that commit is gone
+    if (raw === null) continue;
+    // `:<old mode> <new mode> ...` then the path. A gitlink (mode 160000) hides its nested changes behind the
+    // top-level path, so a changed submodule is never irrelevant.
+    const parts = raw.split('\0').filter(Boolean), changes = [];
+    for (let i = 0; i + 1 < parts.length; i += 2) changes.push({ modes: parts[i].slice(1).split(' ', 2), path: parts[i + 1] });
+    if (changes.every((c) => !c.modes.includes('160000') && res.some((r) => r.test(c.path)))) return { ...e, ok: true, coveredBy: sha };
   }
   return { ...e, ok: false };
 }
@@ -944,8 +949,11 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
   // The base may change .prloop.json: generated files are classified, and regenerated, with the configuration as synced,
   // read from the working tree. Without that file (or while it is itself conflicted) the caller's configuration applies.
   const file = join(cwd, '.prloop.json');
+  // A base that deleted the file removed its regenerate command too: only a repository that never had one keeps the caller's.
+  const hadFile = [target, head].some((rev) => tryGit(['cat-file', '-e', `${rev}:.prloop.json`], cwd) !== null);
   const synced = () => {
-    if (!existsSync(file) || unmerged(cwd).includes('.prloop.json')) return { generated, regenerate };
+    if (unmerged(cwd).includes('.prloop.json')) return { generated, regenerate };
+    if (!existsSync(file)) return hadFile ? {} : { generated, regenerate };
     try { return readConfigFile(file, REPO_KEYS); } catch (e) { return { generated, regenerate, invalid: e.message }; }
   };
   const unioned = new Set(), regenerated = new Set();

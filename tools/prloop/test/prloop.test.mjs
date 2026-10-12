@@ -2274,6 +2274,29 @@ test('sync regenerates with the command the synced .prloop.json declares, never 
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), v.head);
 });
 
+test('sync never regenerates with the branch\'s command once the base deleted .prloop.json', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.run(r.work, 'switch', '-q', 'main');
+  r.commit('config', { '.prloop.json': '{"generated":["gen.txt"],"regenerate":"echo stale > ran.txt"}\n' });
+  r.run(r.work, 'push', '-q', 'origin', 'main');
+  r.run(r.work, 'switch', '-q', 'feat');
+  r.run(r.work, 'merge', '-q', '--ff-only', 'main');
+  r.commit('feature', { 'gen.txt': 'feature\n' });
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  r.run(r.work, 'switch', '-q', 'main');
+  r.run(r.work, 'rm', '-q', '.prloop.json');
+  r.commit('drop config', { 'gen.txt': 'base\n' });
+  r.run(r.work, 'push', '-q', 'origin', 'main');
+  r.run(r.work, 'switch', '-q', 'feat');
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true }, generated: ['gen.txt'], regenerate: 'echo stale > ran.txt' });
+  assert.equal(v.verdict, 'conflict', JSON.stringify(v));
+  assert.deepEqual(v.conflicts, ['gen.txt']);
+  assert.ok(!existsSync(join(r.work, 'ran.txt')));
+  assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
+});
+
 test('sync classifies generated conflicts with the generated list the base changed', (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
@@ -2434,6 +2457,13 @@ test('gate provenance: a self-reported pass counts for a merge only after gate-i
   assert.deepEqual(pick(gateProvenance(gate, r.work, irrelevant), ['source', 'ok', 'coveredBy']), { source: 'self', ok: true, coveredBy: ran });
   assert.equal(gateProvenance(gate, r.work).ok, false); // without gateIrrelevant every path counts
   r.commit('code', { 'app.txt': 'changed\n' });
+  recordGatePass(gate, r.work);
+  assert.equal(gateProvenance(gate, r.work, irrelevant).ok, false);
+  // A submodule under an irrelevant glob shows only its gitlink: its nested changes are never irrelevant.
+  await readyGate({ branch: 'feat', head: r.run(r.work, 'rev-parse', 'HEAD') }, { ...cfg, gate, forceGate: true }, r.work, deps);
+  r.run(r.work, 'update-index', '--add', '--cacheinfo', `160000,${r.run(r.work, 'rev-parse', 'HEAD')},docs/sub`);
+  r.run(r.work, 'commit', '-qm', 'submodule');
+  mkdirSync(join(r.work, 'docs', 'sub')); // an unpopulated submodule keeps the checkout clean
   recordGatePass(gate, r.work);
   assert.equal(gateProvenance(gate, r.work, irrelevant).ok, false);
   // A cache line written by an older prloop carries no provenance and is never merge evidence.
