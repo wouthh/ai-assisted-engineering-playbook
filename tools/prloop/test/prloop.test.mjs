@@ -2159,7 +2159,7 @@ for (const settings of [{ merge: true, squash: true }, { merge: false, squash: f
   test(`sync (${method}) still aborts and reports when a generated conflict comes with a manual one`, (t) => {
     const r = gitRepo();
     t.after(() => rmSync(r.dir, { recursive: true, force: true }));
-    r.commit('feature', { 'gen.txt': 'feature\n', 'app.txt': 'feature\n' });
+    r.commit('feature', { '.gitattributes': 'gen.txt linguist-generated\n', 'gen.txt': 'feature\n', 'app.txt': 'feature\n' });
     r.run(r.work, 'push', '-q', 'origin', 'feat');
     divergeOnMain(r, { '.gitattributes': 'gen.txt linguist-generated\n', 'gen.txt': 'base\n', 'app.txt': 'base\n' });
     const head = r.run(r.work, 'rev-parse', 'HEAD');
@@ -2286,6 +2286,26 @@ test('sync never runs a regenerate command the base introduced; it runs once the
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), v.head);
 });
 
+test('sync never treats a source conflict as generated because the base broadened generated', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  const config = (globs) => `{"generated":${JSON.stringify(globs)},"regenerate":"echo regen > gen.txt"}\n`;
+  r.run(r.work, 'switch', '-q', 'main');
+  r.commit('config', { '.prloop.json': config(['gen.txt']) });
+  r.run(r.work, 'push', '-q', 'origin', 'main');
+  r.run(r.work, 'switch', '-q', 'feat');
+  r.run(r.work, 'merge', '-q', '--ff-only', 'main');
+  r.commit('feature', { 'gen.txt': 'feature\n', 'src.txt': 'feature\n' });
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  divergeOnMain(r, { 'gen.txt': 'base\n', 'src.txt': 'base\n', '.prloop.json': config(['gen.txt', 'src*']) });
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true } });
+  assert.equal(v.verdict, 'conflict', JSON.stringify(v));
+  assert.deepEqual([v.conflicts, v.generated], [['src.txt'], ['gen.txt']]);
+  assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
+  assert.equal(r.run(r.work, 'status', '--porcelain'), '');
+});
+
 test('sync never pushes an invalid synced .prloop.json, even without regenerate', (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
@@ -2324,7 +2344,7 @@ test('sync never regenerates with the branch\'s command once the base deleted .p
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
 });
 
-test('sync classifies generated conflicts with the generated list the base changed', (t) => {
+test('sync never classifies a conflict as generated with a generated list only the base changed', (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   r.run(r.work, 'switch', '-q', 'main');
@@ -2336,11 +2356,11 @@ test('sync classifies generated conflicts with the generated list the base chang
   r.run(r.work, 'push', '-q', 'origin', 'feat');
   divergeOnMain(r, { 'gen.txt': 'base\n', '.prloop.json': '{"generated":["gen.txt"],"regenerate":"cp app.txt gen.txt"}\n' });
   const head = r.run(r.work, 'rev-parse', 'HEAD');
-  // The caller loaded the branch's configuration, which does not list gen.txt.
+  // The branch's approved configuration does not list gen.txt: it stays a manual conflict instead of taking the base side.
   const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true }, generated: ['other.txt'], regenerate: 'cp app.txt gen.txt' });
-  assert.equal(v.verdict, 'synced', JSON.stringify(v));
-  assert.deepEqual(v.regenerated, ['gen.txt']);
-  assert.equal(r.run(r.work, 'cat-file', '-p', 'HEAD:gen.txt'), 'one');
+  assert.equal(v.verdict, 'conflict', JSON.stringify(v));
+  assert.deepEqual([v.conflicts, v.generated], [['gen.txt'], []]);
+  assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
 });
 
 test('a rejected regeneration commit rolls back like any other failed regeneration', (t) => {
