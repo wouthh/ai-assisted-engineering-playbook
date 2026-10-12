@@ -41,7 +41,7 @@ Packaging or build gate: <command or not applicable>
 
 State what each command proves and which environment is authoritative.
 
-Code that talks to a real external system (database, cache, queue, API) at startup or readiness is tested in the local gate against a real instance using production's restricted credentials and permissions, not only mocks or an all-powerful test login. Turn any production failure the gate could not see into such a regression test before its fix merges.
+Code that talks to a real external system (database, cache, queue, API) at startup or readiness is tested in the local gate against an isolated real instance, using a non-production principal whose grants mirror production's restricted permissions, not only mocks or an all-powerful test login. Turn any production failure the gate could not see into such a regression test before its fix merges; checks with actual production credentials stay behind separate approval.
 
 ## Delivery
 
