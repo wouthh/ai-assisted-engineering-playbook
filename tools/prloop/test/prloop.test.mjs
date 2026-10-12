@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -1130,6 +1130,24 @@ test('sync refuses to linearize when a merge commit adds lines to a union file t
   divergeOnMain(r, { 'app.txt': 'two\n' });
   r.run(r.work, 'merge', '-q', '--no-commit', 'main');
   writeFileSync(join(r.work, 'log.csv'), 'id\na\nfeature\nmergeonly\n'); // a line that exists only in the merge commit
+  r.run(r.work, 'add', '.');
+  r.run(r.work, 'commit', '-qm', 'merge main');
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  divergeOnMain(r, { 'log.csv': 'id\na\nbase\n' });
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: false, squash: false }, union: ['*.csv'] });
+  assert.equal(v.verdict, 'error', JSON.stringify(v));
+  assert.match(v.error, /drop changes made in merge commits/);
+  assert.deepEqual([r.run(r.work, 'rev-parse', 'HEAD'), r.run(r.work, 'rev-parse', 'origin/feat')], [head, head]);
+});
+
+test('sync refuses to linearize when a merge commit changes the mode of a union file that later conflicts', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.commit('feature', { 'log.csv': 'id\na\nfeature\n' });
+  divergeOnMain(r, { 'app.txt': 'two\n' });
+  r.run(r.work, 'merge', '-q', '--no-commit', 'main');
+  chmodSync(join(r.work, 'log.csv'), 0o755); // a mode change that exists only in the merge commit
   r.run(r.work, 'add', '.');
   r.run(r.work, 'commit', '-qm', 'merge main');
   r.run(r.work, 'push', '-q', 'origin', 'feat');
