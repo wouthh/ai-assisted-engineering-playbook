@@ -2258,6 +2258,21 @@ test('sync fails closed when regenerate leaves uncommitted changes inside a subm
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
 });
 
+test('sync refuses to run a regenerate command the synced .prloop.json replaced', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.commit('feature', { 'gen.txt': 'feature\n' });
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  divergeOnMain(r, { 'gen.txt': 'base\n', '.prloop.json': '{"regenerate":"make gen"}\n' });
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true }, generated: ['gen.txt'], regenerate: 'echo stale > ran.txt' });
+  assert.equal(v.verdict, 'error', JSON.stringify(v));
+  assert.match(v.error, /changed regenerate/);
+  assert.ok(!existsSync(join(r.work, 'ran.txt')));
+  assert.equal(r.run(r.work, 'rev-parse', 'HEAD'), head);
+  assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
+});
+
 test('a failing regenerate command restores the old head and reports no output', (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
