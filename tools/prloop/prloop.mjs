@@ -763,8 +763,10 @@ export function gateProvenance(gate, cwd, irrelevant = (() => { try { return rep
 export async function readyGate(s, cfg, cwd, deps = {}) {
   if (!cfg.gate || localGate(s, cwd).some((r) => !r.includes('not marked tested'))) return null;
   // Pipelined review: a head that still needs a review request is requested first; the gate runs once the request
-  // is posted (or the head is already reviewed), in parallel with the review.
-  if (cfg.reviewBeforeGate && s.readyToRequest && !cfg.forceGate && gatePassed(cfg.gate, cwd) !== s.head) return { ok: true, deferred: true };
+  // is posted or the bot has answered this head (reviewing, a result, an unavailable reply), in parallel with the review.
+  // A timed-out or unavailable head is ready to request again, but its request already exists: deferring again would never gate it.
+  const answered = s.trigger?.afterHead || (s.reviewerState?.state ?? 'none') !== 'none';
+  if (cfg.reviewBeforeGate && s.readyToRequest && !answered && !cfg.forceGate && gatePassed(cfg.gate, cwd) !== s.head) return { ok: true, deferred: true };
   // Only an exact cached pass of this command on this head skips the gate: a marker left by another gate never does.
   const key = gateKey(cfg.gate, cwd);
   markQueued(true);
