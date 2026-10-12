@@ -833,8 +833,9 @@ export function unionLines(baseSide, branchSide) {
 export function unionResult(mergeBase, baseSide, branchSide) {
   const lines = (s) => (s ? s.replace(/\n$/, '').split('\n') : []);
   const mb = new Set(lines(mergeBase)), base = new Set(lines(baseSide)), head = new Set(lines(branchSide));
-  const out = [...lines(baseSide).filter((l) => !mb.has(l) || head.has(l)), ...lines(branchSide).filter((l) => !mb.has(l) && !base.has(l))];
-  return out.length ? `${out.join('\n')}\n` : '';
+  // Kept and added lines go through unionLines, which keeps identical lines once and drops empty ones.
+  const kept = lines(baseSide).filter((l) => !mb.has(l) || head.has(l)), added = lines(branchSide).filter((l) => !mb.has(l) && !base.has(l));
+  return kept.length || added.length ? unionLines(kept.join('\n'), added.join('\n')) : '';
 }
 
 const unmerged = (cwd) => git(['diff', '--name-only', '--diff-filter=U'], cwd).split('\n').filter(Boolean);
@@ -904,9 +905,10 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
   const resumed = resume && (inRebase || inMerge);
   // Union files resolved before a pause for manual conflicts: a resumed sync must still correct them from the end states.
   const unionState = resolve(cwd, git(['rev-parse', '--git-path', 'prloop-sync-unioned'], cwd));
-  const key = { head, onto: tryGit(['rev-parse', target], cwd) };
+  // Read when used: the first (non-resumed) sync fetches the base after this point, which can move the ref.
+  const key = () => ({ head, onto: tryGit(['rev-parse', target], cwd) });
   let saved = [];
-  if (resumed) try { const s = JSON.parse(readFileSync(unionState, 'utf8')); if (s.head === key.head && s.onto === key.onto) saved = s.files; } catch { /* none saved */ }
+  if (resumed) try { const s = JSON.parse(readFileSync(unionState, 'utf8')); const k = key(); if (s.head === k.head && s.onto === k.onto) saved = s.files; } catch { /* none saved */ }
   else rmSync(unionState, { force: true });
   let rebase, merges, upToDate = false, ok;
   if (resumed) {
@@ -1002,7 +1004,7 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
     conflicted.filter((f) => !gen.includes(f) && !manual.includes(f)).forEach((f) => unioned.add(f));
     if (manual.length) {
       if (resume) {
-        writeFileSync(unionState, JSON.stringify({ ...key, files: [...unioned] }));
+        writeFileSync(unionState, JSON.stringify({ ...key(), files: [...unioned] }));
         return { verdict: 'conflict', conflicts: manual, generated: gen, method, inProgress: true,
           next: `resolve these conflicts in the working tree${gen.length ? ' (the generated files already take the base side and are regenerated at the end)' : ''}, then run \`prloop sync <pr> --continue\`` };
       }
