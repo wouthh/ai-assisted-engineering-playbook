@@ -18,6 +18,8 @@ Typical layers are:
 8. hosted checks and review;
 9. deployment smoke and rollback verification.
 
+Code that talks to a real external system (database, cache, queue, API) at startup or readiness is tested in the local gate against an isolated real instance, using a non-production principal whose grants mirror production's restricted permissions, not only mocks or an all-powerful test login. Turn any production failure the gate could not see into such a regression test before its fix merges; checks with actual production credentials stay behind separate approval.
+
 Not every task needs every layer. A documentation-only change does not need application execution, but it still needs Markdown structure, link, rendering, privacy, and diff checks.
 
 ## Tie evidence to an exact state
