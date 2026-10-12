@@ -1057,6 +1057,8 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
     };
     for (const f of unioned) {
       const branchSide = show(head, f), baseSide = show(target, f);
+      // A rebase replays commits: a later one may have renamed or deleted the path, which the end states cannot pair up.
+      if (rebase && (branchSide === null) !== (baseSide === null)) return fail(`union file ${f} was renamed or deleted on one side; merge ${base} by hand`);
       if (branchSide === null || baseSide === null || show('HEAD', f) === null) continue; // resolved by deleting it
       // A later commit (or a manual resolution) may have made the path a symlink: never write through it.
       if (![head, target, 'HEAD'].every((rev) => regular(rev, f)) || lstatSync(join(cwd, f), { throwIfNoEntry: false })?.isFile() !== true) {
