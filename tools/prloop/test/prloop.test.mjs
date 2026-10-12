@@ -6,7 +6,7 @@ import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import {
-  EXIT, OUTPUT_TAIL, main, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, gateProvenance, treeRss, recordGatePass, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, syncBranch, unionLines, waitFor,
+  EXIT, OUTPUT_TAIL, main, approvedFor, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, gateProvenance, treeRss, recordGatePass, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, syncBranch, unionLines, waitFor,
 } from '../prloop.mjs';
 
 const pick = (o, keys) => Object.fromEntries(keys.map((k) => [k, o[k]]));
@@ -1786,6 +1786,16 @@ test('machine and repository config files: precedence flag, env, repository, mac
   assert.equal(config({ gateSlots: '5' }, { PRLOOP_GATE_SLOTS: '3' }, { machine }).gateSlots, 5);
   writeFileSync(join(state, 'config.json'), JSON.stringify({ gateSlot: 4 }));
   assert.throws(() => machineConfig(), /unknown key gateSlot/);
+  // Regenerate approvals are bound to one repository: a command approved for one never runs in another.
+  writeFileSync(join(state, 'config.json'), JSON.stringify({ approvedRegenerate: { 'Octo/App': ['npm run generate'] } }));
+  const approved = machineConfig().approvedRegenerate;
+  assert.deepEqual(approvedFor(approved, 'octo/app'), ['npm run generate']);
+  assert.deepEqual(approvedFor(approved, 'octo/other'), []);
+  assert.deepEqual(approvedFor(undefined, 'octo/app'), []);
+  for (const bad of [['npm run generate'], { 'octo/app': 'npm run generate' }, null]) {
+    writeFileSync(join(state, 'config.json'), JSON.stringify({ approvedRegenerate: bad }));
+    assert.throws(() => machineConfig(), /approvedRegenerate must/);
+  }
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   assert.deepEqual(repoConfig(r.work), {});
