@@ -1820,6 +1820,11 @@ class GuidanceConsistencyTests(unittest.TestCase):
                 self.assertRegex(text, r"leave them unresolved,? \(?except a finding proven to misread (AGENTS\.md|this file), which (you|it) resolves? after the evidence reply once every AGENTS\.md that applies to its path confirms it is invalid")
                 self.assertRegex(text, r"(?i)read only the referenced files plus [^;\n]*?every (nested )?AGENTS\.md that applies to them")
 
+    def test_template_misread_rule_covers_nested_agents_files(self) -> None:
+        text = (ROOT / "templates/AGENTS.template.md").read_text(encoding="utf-8")
+        self.assertIn("comes from misreading this file or a nested AGENTS.md that applies to the path", text)
+        self.assertIn("correct the misleading wording in the file that was misread", text)
+
     def test_root_guidance_mirrors_template_supervisor_rules(self) -> None:
         for path in ("AGENTS.md", "templates/AGENTS.template.md"):
             with self.subTest(path=path):
