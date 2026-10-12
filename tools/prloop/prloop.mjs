@@ -932,6 +932,9 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
       for (const f of untracked()) if (!before.has(f)) rmSync(join(cwd, f), { force: true });
       return { verdict: 'error', error: why };
     };
+    // The command was loaded before syncing: if the synced .prloop.json changed it, the stale one must not run.
+    const regenOf = (rev) => { const t = tryGit(['show', `${rev}:.prloop.json`], cwd) ?? ''; try { return JSON.stringify(JSON.parse(t).regenerate ?? null); } catch { return t; } };
+    if (regenOf(head) !== regenOf('HEAD')) return fail('the sync changed regenerate in .prloop.json; rerun `prloop sync` so it uses the synced configuration');
     for (const cmd of [regenerate].flat()) {
       // Output is not reported: like gate output it may hold a secret, and the result reaches agents.
       const r = spawnSync('sh', ['-c', cmd], { cwd, stdio: 'ignore' });
