@@ -761,7 +761,8 @@ export function resolveUnion(cwd, globs, baseStage) {
 // Fetches the base and checks that origin/<base> contains the base commit GitHub reports for the PR,
 // so a fork's stale same-named branch is never used. Returns an error string or null.
 export function fetchBase(cwd, base, baseOid, remote = 'origin') {
-  if (tryGit(['fetch', '--quiet', remote, base], cwd) === null) return `could not fetch ${remote}/${base}`;
+  // An explicit destination: a single-branch clone's refspec would otherwise update only FETCH_HEAD.
+  if (tryGit(['fetch', '--quiet', remote, `+refs/heads/${base}:refs/remotes/${remote}/${base}`], cwd) === null) return `could not fetch ${remote}/${base}`;
   if (tryGit(['merge-base', `${remote}/${base}`, 'HEAD'], cwd) === null) return `${remote}/${base} shares no history with HEAD`;
   if (baseOid && tryGit(['merge-base', '--is-ancestor', baseOid, `${remote}/${base}`], cwd) === null) {
     return `${remote}/${base} does not contain the PR base commit ${short(baseOid)}; point ${remote} at the base repository`;
@@ -1078,8 +1079,8 @@ export function buildPrompt(t) {
   const data = t.trigger === 'conflict' ? `Conflicted files: ${t.conflicts.join(', ')}${t.generated?.length ? `\nGenerated files among them (regenerate them from their sources after resolving the rest, never merge them by hand): ${t.generated.join(', ')}` : ''}`
     : t.findings?.length ? `Findings:\n${t.findings.map((f) => `- ${f.id} ${f.path ?? ''}:${f.line ?? ''} ${plain(f.body).slice(0, 600)}`).join('\n')}`
       : `Missing: ${(t.missing ?? []).join('; ') || 'a review request on the current head'}`;
-  // Only the log path: the gate output may hold a secret, which stays in the owner-only local log.
-  const failure = t.gateFailure ? `\nThe full gate failed on head ${t.gateFailure.head}; its last lines are in the owner-only local log ${t.gateFailure.log} (it may hold secrets: rerun the failing step locally, and never quote a secret)` : '';
+  // Neither the output nor its log path: the output may hold a secret, and the agent reads every referenced file.
+  const failure = t.gateFailure ? `\nThe full gate failed on head ${t.gateFailure.head}; rerun its steps locally to find the failing one, and never quote a secret from their output` : '';
   const summary = t.summaries?.length ? `\nReviewer summary for this head (may hold findings that are not threads):\n${t.summaries.map(plain).join('\n').slice(0, 1500)}` : '';
   const request = t.localReview
     ? 'Do not post a review request: prloop reviews this PR locally once `prloop ready` passes.'
