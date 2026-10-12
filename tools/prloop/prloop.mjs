@@ -1453,8 +1453,9 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
       try { merge(); } catch (e) {
         // GitHub refuses a rebase merge of a branch with merge commits even when it reports the PR clean:
         // linearize it once (the new head then needs the gate again) or, when there is nothing to linearize, retry once.
+        // Any other refusal (API failure, permissions, rulesets) blocks: a linearizing force-push cannot fix it.
         const why = String(e.stderr || e.message).trim().slice(0, 300);
-        if (opts.merge !== 'rebase' || st.mergeRetried) return block(st, `GitHub refused the merge: ${why}`);
+        if (opts.merge !== 'rebase' || st.mergeRetried || !/merge commits?|can(?:no|')t be rebased/i.test(why)) return block(st, `GitHub refused the merge: ${why}`);
         st.mergeRetried = true;
         logEvent(st, { phase: 'merge_refused', reason: `${why}; syncing (linearize) and retrying once` });
         const v = syncPr(st, s, raw, cwd, slot, true);
