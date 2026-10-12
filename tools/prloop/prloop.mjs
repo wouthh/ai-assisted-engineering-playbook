@@ -1046,15 +1046,26 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
   if (unioned.size) {
     const mb = git(['merge-base', target, head], cwd);
     const show = (rev, f) => tryGit(['show', `${rev}:${f}`], cwd);
+    const regular = (rev, f) => /^100(644|755) /.test(tryGit(['ls-tree', rev, '--', f], cwd) ?? '');
+    const fail = (why) => {
+      // A resumed sync holds a manual resolution: keep it locally instead of discarding it.
+      if (resumed) return { verdict: 'error', error: `${why}; the synced branch is local only, at ${short(git(['rev-parse', 'HEAD'], cwd))}` };
+      git(['reset', '--quiet', '--hard', head], cwd);
+      return { verdict: 'error', error: why };
+    };
     for (const f of unioned) {
       const branchSide = show(head, f), baseSide = show(target, f);
-      if (branchSide === null || baseSide === null) continue;
+      if (branchSide === null || baseSide === null || show('HEAD', f) === null) continue; // resolved by deleting it
+      // A later commit (or a manual resolution) may have made the path a symlink: never write through it.
+      if (![head, target, 'HEAD'].every((rev) => regular(rev, f)) || lstatSync(join(cwd, f), { throwIfNoEntry: false })?.isFile() !== true) {
+        return fail(`union file ${f} is no longer a regular file; merge ${base} by hand`);
+      }
       writeFileSync(join(cwd, f), unionResult(show(mb, f) ?? '', baseSide, branchSide));
       git(['add', '--', f], cwd);
     }
     if (tryGit(['diff', '--cached', '--quiet'], cwd) === null && !step(['commit', '--quiet', '-m', `Remove lines the union merge brought back after syncing with ${base}`])) {
-      git(['reset', '--quiet', '--hard', head], cwd);
-      return { verdict: 'error', error: 'committing the corrected union files failed (a commit hook?); run the sync in the checkout to see why' };
+      if (resumed) git(['reset', '--quiet', '--hard'], cwd);
+      return fail('committing the corrected union files failed (a commit hook?); run the sync in the checkout to see why');
     }
   }
   // Once at the end, after every generated conflict took the base side (and always when finishing a resumed sync).
