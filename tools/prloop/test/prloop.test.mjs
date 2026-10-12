@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import {
-  EXIT, OUTPUT_TAIL, main, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, syncBranch, unionLines, waitFor,
+  EXIT, OUTPUT_TAIL, main, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, recordGatePass, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, syncBranch, unionLines, waitFor,
 } from '../prloop.mjs';
 
 const pick = (o, keys) => Object.fromEntries(keys.map((k) => [k, o[k]]));
@@ -107,7 +107,11 @@ test('a named commit clears the head only as its full OID or an abbreviation tha
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   const sha = r.run(r.work, 'rev-parse', 'HEAD');
   assert.deepEqual(disambiguate(sha.slice(0, 9), r.work), [sha]);
-  assert.deepEqual(disambiguate('0000000', r.work), []);
+  assert.deepEqual(disambiguate('0000000', r.work), []);  // The abbreviation resolves in the PR's worktree (`cfg.cwd`), not wherever prloop was launched.
+  const inWorktree = cleanWithoutAck(sha.slice(0, 9));
+  inWorktree.headRefOid = inWorktree.commits.nodes[0].commit.oid = sha;
+  assert.notEqual(classify(inWorktree, cfg, AFTER).verdict, 'clean');
+  assert.equal(classify(inWorktree, { ...cfg, cwd: r.work }, AFTER).verdict, 'clean');
 });
 
 test('a PR-body thumbs-up after a new request never clears it, even after this cycle\'s eyes', () => {
@@ -1985,6 +1989,16 @@ test('pipelined run: a gate failure on the requested head goes to a fix agent wi
   assert.equal(res.verdict, 'gate_failed', JSON.stringify(res)); // --agent none: the prompt is handed back
   assert.match(res.prompt, /Trigger: gate_failed/);
   assert.match(res.prompt, /The full gate failed on head [0-9a-f]{40}; its last lines:\nFAIL test_retry/);
+});
+
+test('pipelined run: a later pass of the same gate on the head supersedes a recorded gate failure', async (t) => {
+  const gate = 'echo FAIL test_retry; exit 1';
+  const { res, r } = await runPipelined(t, () => gate, { clean: true });
+  assert.equal(res.verdict, 'gate_failed', JSON.stringify(res));
+  recordGatePass(gate, r.work); // e.g. an agent's `prloop ready` passed after a flaky failure
+  const [again] = await runAll({ repo: 'example-org/example-repo', pr: '7', worktree: r.work, deadline: '1h' },
+    { ...cfg, agent: 'none', interval: 1, timeout: 1e12, ackTimeout: 1e12, gate, gateCost: 0, reviewBeforeGate: true }, { metrics: idle().metrics });
+  assert.equal(again.verdict, 'clean', JSON.stringify(again));
 });
 
 test('run linearizes once and retries when GitHub refuses a rebase merge of a clean PR', async (t) => {

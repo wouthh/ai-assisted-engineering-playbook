@@ -286,9 +286,9 @@ const isLocal = (body) => typeof body === 'string' && body.startsWith(LOCAL);
 export const localCleanBody = (head) => `${LOCAL} No issues found on ${head}.`;
 
 // A commit named in a comment is this head only as the full OID, or as an abbreviation that resolves to exactly
-// this one object in the local repository: a bare prefix match could name another commit with the same prefix.
+// this one object in the local repository (`cfg.cwd`, the PR's worktree): a bare prefix match could name another commit.
 export const disambiguate = (prefix, cwd) => (tryGit(['rev-parse', `--disambiguate=${prefix}`], cwd) ?? '').split('\n').filter(Boolean);
-const namesHead = (named, head, cfg) => (named.length === 40 ? named === head : (cfg.disambiguate ?? disambiguate)(named).join() === head);
+const namesHead = (named, head, cfg) => (named.length === 40 ? named === head : (cfg.disambiguate ?? disambiguate)(named, cfg.cwd).join() === head);
 
 // Classifies one PR snapshot. Rules carried over from the earlier review queue:
 // - only signals newer than the head commit (or the current request) count;
@@ -867,7 +867,7 @@ export async function waitFor(repo, prNum, cfg, { interval, fetch = fetchPr, now
   let reviewed; // { head, agentLog } of a local review that posted; reported only while that head is current
   for (let failures = 0; ; await pause(interval)) {
     let s;
-    try { s = classify(fetch(repo, prNum), cfg, now()); failures = 0; } catch (e) {
+    try { s = classify(fetch(repo, prNum), { ...cfg, cwd }, now()); failures = 0; } catch (e) {
       if (++failures >= 3) return { verdict: 'error', pr: Number(prNum), error: String(e.stderr || e.message).slice(0, 500) };
       continue;
     }
@@ -876,7 +876,7 @@ export async function waitFor(repo, prNum, cfg, { interval, fetch = fetchPr, now
     if (plan.local) {
       await admit(cfg, { metrics, now, pause, log }, resources);
       // The head may have moved while waiting for resources: review the current snapshot, or poll again.
-      try { s = classify(fetch(repo, prNum), cfg, now()); } catch { continue; }
+      try { s = classify(fetch(repo, prNum), { ...cfg, cwd }, now()); } catch { continue; }
       if (!reviewPlan(s, cfg).local) continue;
       const head = s.head;
       const r = await runLocal(repo, s, cfg, cwd, (p) => { reviewed = { head, agentLog: p }; });
@@ -1338,7 +1338,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     if (DENIED.test(`${r.final}\n${r.stderr}`)) return fail('the agent reported a permission denial');
     if (r.status !== 0) return fail(`the agent exited with status ${r.status}: ${cliWrapper(r.final) ? agentFailure(r.final) : tail(r.stderr)}`);
     const progressed = () => {
-      const after = classify(fetchPr(repo, st.pr), cfg);
+      const after = classify(fetchPr(repo, st.pr), { ...cfg, cwd });
       return after.head !== s.head || after.unresolvedThreads.length < s.unresolvedThreads.length
         || after.trigger?.id !== s.trigger?.id || (!testedBefore && tested(after.head));
     };
@@ -1375,15 +1375,19 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
   }
 
   async function step(st) {
-    let raw, s;
-    try { raw = fetchPr(repo, st.pr); s = classify(raw, cfg); st.failures = 0; } catch (e) {
+    let raw, s, cwd;
+    // The worktree is found before classifying: an abbreviated reviewed commit resolves in its object database.
+    try {
+      raw = fetchPr(repo, st.pr);
+      cwd = opts.worktree ? resolve(opts.worktree) : findWorktree(raw.headRefName, process.cwd());
+      s = classify(raw, { ...cfg, cwd }); st.failures = 0;
+    } catch (e) {
       if ((st.failures = (st.failures ?? 0) + 1) >= 3) block(st, `GitHub read failed: ${String(e.stderr || e.message).slice(0, 300)}`);
       return;
     }
     st.head = s.head;
     if (s.state === 'MERGED') return event(st, 'merged', { mergeCommit: s.mergeCommit });
     if (s.state === 'CLOSED') return block(st, 'the PR is closed');
-    const cwd = opts.worktree ? resolve(opts.worktree) : findWorktree(s.branch, process.cwd());
     // The holder check comes first: a locked fix agent's uncommitted edit or local commit is not a bad checkout.
     const holder = cwd && lockHolder(cwd, null);
     if (holder) return lockedOut(st, cwd, holder);
@@ -1411,6 +1415,8 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
       st.gateFailure = { head: s.head, tail: g?.tail ?? 'the worktree no longer matches the PR head' };
       return event(st, 'polling', { verdict: 'gate_failed', reason: `gate exited with ${g?.status}` });
     }
+    // A later pass of the same gate on this head (an agent's `prloop ready` after a flaky failure) supersedes the failure.
+    if (st.gateFailure?.head === s.head && gated(s.head)) st.gateFailure = undefined;
     const gateFailure = cfg.reviewBeforeGate && st.gateFailure?.head === s.head ? st.gateFailure : undefined;
     if (gateFailure && s.verdict !== 'findings') {
       if (!cwd) return block(st, `no worktree has ${s.branch} checked out; pass --worktree`);
@@ -1455,7 +1461,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
         if (v?.verdict !== 'up_to_date') return v;
         try { merge(); } catch (e2) { return block(st, `GitHub refused the merge again: ${String(e2.stderr || e2.message).trim().slice(0, 300)}`); }
       }
-      const after = classify(fetchPr(repo, st.pr), cfg);
+      const after = classify(fetchPr(repo, st.pr), { ...cfg, cwd });
       // A merge queue or auto-merge accepts the command without merging yet: report the real state.
       return after.state === 'MERGED' ? event(st, 'merged', { mergeCommit: after.mergeCommit })
         : event(st, 'merge_pending', { reason: `state ${after.state} after merge`, next: 'a merge queue or auto-merge holds the PR; verify later' });
