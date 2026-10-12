@@ -41,6 +41,8 @@ Packaging or build gate: <command or not applicable>
 
 State what each command proves and which environment is authoritative.
 
+Code that talks to a real external system (database, cache, queue, API) at startup or readiness is tested in the local gate against a real instance using production's restricted credentials and permissions, not only mocks or an all-powerful test login. Turn any production failure the gate could not see into such a regression test before its fix merges.
+
 ## Delivery
 
 1. For new work, verify and refresh the approved upstream target, then create a feature branch from it. Normally this is main; use the project's actual default/integration branch. Preserve dirty user work. Resume an authorized existing PR at its exact remote head with normal commits, without silent rebase/reset.
