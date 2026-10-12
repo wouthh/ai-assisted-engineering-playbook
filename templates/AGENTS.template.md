@@ -59,8 +59,11 @@ Install [`prloop`](https://github.com/wouthh/ai-assisted-engineering-playbook/tr
 Declare the gate once in `.prloop.json` at the repository root (flags override it). Use `"gateWeight": "light"` for a gate of a few minutes, which then skips the machine-wide slot queue while load allows; a `heavy` gate takes a full slot and turns on pipelined review (request first, gate in parallel):
 
 ```json
-{ "gate": "<full local gate>", "gateWeight": "heavy", "union": ["CHANGELOG.md"], "merge": "squash" }
+{ "gate": "<full local gate>", "gateWeight": "heavy", "union": ["CHANGELOG.md"], "merge": "squash",
+  "generated": ["<generated globs>"], "regenerate": "<command that rebuilds them>" }
 ```
+
+Keep `generated` (globs; `linguist-generated` files count too) and `regenerate` only when the repository has generated files: `prloop sync` then resolves conflicts limited to them itself by taking the base side and running `regenerate` once.
 
 ### Coordinator
 
@@ -79,7 +82,7 @@ Declare the gate once in `.prloop.json` at the repository root (flags override i
 
 1. Read only the referenced files plus this file and every nested AGENTS.md that applies to them.
 2. Fix each valid finding with a regression test; reply with evidence on invalid ones and leave them unresolved, except a finding proven to misread this file, which you resolve after the evidence reply once every AGENTS.md that applies to its path confirms it is invalid (see Instruction maintenance); resolve conflicts.
-3. Run focused tests, never the full gate directly, then commit and push normally (`prloop sync <pr>` first if the base moved).
+3. Run focused tests, never the full gate directly, then commit and push normally (`prloop sync <pr>` first if the base moved). Resolve sync conflicts only through `prloop sync <pr> --continue`, never a raw `git rebase` or `git merge`: it leaves the conflicts in the working tree; resolve them, then run it again to continue, regenerate, commit and push.
 4. Resolve the fixed threads; reply on disputed ones.
 5. `prloop ready <pr>` runs the gate once per tree (a gate already passed on the same clean tree is skipped) and marks the head tested. With pipelined review (`reviewBeforeGate`) it skips the gate while the head still needs a request, and the gate runs in parallel after the request. Run it and any long test command in the foreground with a timeout of at least the agent budget; never background a command, and wait for one that was backgrounded anyway before ending the turn. Exception: a subagent whose tooling caps one command below the gate's length (one briefed by a coordinator, not spawned by `prloop run`) runs `prloop ready` as a background job and waits for it to exit before continuing. If you already ran exactly the gate command and it passed on the current clean tree, `prloop mark-tested --gate "<cmd>"` records it instead. After a gate failure, rerun the failing tests or step with their focused command and fix them, including failures you did not cause, before calling `prloop ready` again. At most 5 calls; stop as blocked only when the same failure survives 3 consecutive fixes or the cause is environmental (missing tool, no network, permission denied).
 6. Post the review request once, reusing the previous request body.
