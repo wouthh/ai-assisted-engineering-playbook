@@ -1031,6 +1031,15 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
       return { verdict: 'error', error: why };
     };
     if (!final.regenerate) return fail(`the synced .prloop.json no longer declares regenerate: merge ${base} by hand and regenerate ${[...regenerated].join(', ') || 'the generated files'} from their sources`);
+    // Only a command the PR head already declared (or the caller passed, without a committed file) is approved to run:
+    // one the base introduced is shown and fails closed, so a new base commit never runs unreviewed shell commands.
+    const headFile = tryGit(['show', `${head}:.prloop.json`], cwd);
+    let approved = regenerate;
+    if (headFile !== null) try { approved = JSON.parse(headFile).regenerate; } catch { approved = undefined; }
+    const list = (c) => JSON.stringify([c ?? []].flat());
+    if (list(approved) !== list(final.regenerate)) {
+      return fail(`the synced .prloop.json changed regenerate to ${list(final.regenerate)}, which was not approved: inspect it, set the same regenerate in the branch's .prloop.json (commit and push), then rerun \`prloop sync\``);
+    }
     for (const cmd of [final.regenerate].flat()) {
       // Output is not reported: like gate output it may hold a secret, and the result reaches agents.
       const r = spawnSync('sh', ['-c', cmd], { cwd, stdio: 'ignore' });
