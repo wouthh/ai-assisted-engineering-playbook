@@ -752,7 +752,22 @@ test('sync fails closed when a moved union file is a tiny part of a much larger 
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
 });
 
-test('sync fails closed when a file added next to a modified union file cannot be read', (t) => {
+test('sync still unions a trimmed union file when the same commit added a submodule entry', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.commit('feature', { 'log.csv': 'id\na\nY\n' });
+  // A gitlink to a commit missing from this repository: `git show` cannot read it, but it holds no lines either.
+  r.run(r.work, 'update-index', '--add', '--cacheinfo', `160000,${'1'.repeat(40)},vendor/lib`);
+  r.commit('trim and add a submodule', { 'log.csv': 'id\na\n' });
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  divergeOnMain(r, { 'log.csv': 'id\na\nX\n' });
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true, squash: true }, union: ['*.csv'] });
+  assert.notEqual(v.verdict, 'error', JSON.stringify(v));
+  assert.equal(r.run(r.work, 'show', 'HEAD:log.csv'), 'id\na\nX');
+});
+
+test('sync fails closed when searching the files added next to a modified union file fails', (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   r.commit('feature', { 'log.csv': 'id\na\nY\n' });
@@ -760,15 +775,14 @@ test('sync fails closed when a file added next to a modified union file cannot b
   r.run(r.work, 'push', '-q', 'origin', 'feat');
   divergeOnMain(r, { 'log.csv': 'id\na\nX\n' });
   const head = r.run(r.work, 'rev-parse', 'HEAD');
-  // Stands in for a blob over the output buffer: only reads of the added file fail.
   const old = process.env.PATH, real = join(r.run(r.work, '--exec-path'), 'git');
   t.after(() => { process.env.PATH = old; });
   mkdirSync(join(r.dir, 'bin'));
-  writeFileSync(join(r.dir, 'bin', 'git'), `#!/bin/sh\ncase "$1 $2" in "show "*:big.bin) exit 1;; esac\nexec ${real} "$@"\n`, { mode: 0o755 });
+  writeFileSync(join(r.dir, 'bin', 'git'), `#!/bin/sh\n[ "$1" = grep ] && exit 2\nexec ${real} "$@"\n`, { mode: 0o755 });
   process.env.PATH = `${join(r.dir, 'bin')}:${old}`;
   const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true, squash: true }, union: ['*.csv'] });
   assert.equal(v.verdict, 'error', JSON.stringify(v));
-  assert.match(v.error, /reading big\.bin in .* failed/);
+  assert.match(v.error, /searching the files .* added failed/);
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
 });
 
