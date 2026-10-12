@@ -674,6 +674,27 @@ test('a local reviewer\'s raw output is kept and named when its result is malfor
   assert.match(readFileSync(v.agentLog, 'utf8'), /Looks fine to me[\s\S]*## stderr\nwarn/);
 });
 
+test('a local review diffs from the fetched base when the PR already merged a base newer than baseRefOid', async (t) => {
+  tempState(t);
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  const stale = r.run(r.work, 'rev-parse', 'main');
+  r.commit('feature', { 'app.txt': 'two\n' });
+  divergeOnMain(r, { 'log.csv': 'id\na\nb\n' });
+  r.run(r.work, 'merge', '-q', '--no-edit', 'origin/main');
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  markTested(head, r.work);
+  const old = process.env.PATH;
+  t.after(() => { process.env.PATH = old; });
+  mkdirSync(join(r.dir, 'bin'));
+  writeFileSync(join(r.dir, 'bin', 'claude'), `#!/bin/sh\nprintf '%s' "$2" > "${join(r.dir, 'prompt')}"\nexit 1\n`, { mode: 0o755 });
+  process.env.PATH = `${join(r.dir, 'bin')}:${old}`;
+  await localReview('example-org/example-repo', { pr: 7, head, branch: 'feat', base: 'main', baseOid: stale, unresolvedThreads: [] }, cfg, r.work);
+  const newBase = r.run(r.work, 'rev-parse', 'origin/main');
+  assert.match(readFileSync(join(r.dir, 'prompt'), 'utf8'), new RegExp(`git diff ${newBase}\\.\\.\\.HEAD`));
+});
+
 const PRLOOP = join(import.meta.dirname, '..', 'prloop.mjs');
 
 test('a held worktree lock refuses ready, sync and mark-tested unless the caller carries its token', (t) => {
@@ -1362,8 +1383,8 @@ test('sync reports a conflict with the fetched base even when the branch contain
 });
 
 test('the local review diffs from the reported base commit', () => {
-  assert.match(localReviewPrompt({ pr: 7, base: 'main', baseOid: 'b0b0', head: 'abc' }), /git diff b0b0\.\.\.HEAD/);
-  assert.match(localReviewPrompt({ pr: 7, base: 'main', head: 'abc' }), /git diff origin\/main\.\.\.HEAD/);
+  assert.match(localReviewPrompt({ pr: 7, base: 'main', baseOid: 'b0b0', head: 'abc' }, 'm3b4'), /git diff m3b4\.\.\.HEAD/);
+  assert.match(localReviewPrompt({ pr: 7, base: 'main', baseOid: 'b0b0', head: 'abc' }), /git diff origin\/main\.\.\.HEAD/);
 });
 
 test('worktree check: branch and PR head commit must match', (t) => {
@@ -1802,9 +1823,9 @@ test('a light gate skips the slot queue while load allows; a heavy gate may take
 
 test('the fix prompt follows pipelined review and carries a gate failure', () => {
   const t = { trigger: 'gate_failed', pr: 7, repo: 'o/r', branch: 'b', head: 'h', cwd: '/w', gate: 'make check', reviewBeforeGate: true, missing: ['x'],
-    gateFailure: { head: 'h', tail: 'FAIL test_retry' }, requestBody: '@codex review' };
+    gateFailure: { head: 'h', log: '/state/gate.log' }, requestBody: '@codex review' };
   const p = buildPrompt(t);
-  assert.match(p, /The full gate failed on head h; its last lines:\nFAIL test_retry/);
+  assert.match(p, /The full gate failed on head h; its last lines are in the owner-only local log \/state\/gate\.log/);
   assert.match(p, /requests the review first and prloop runs the full gate \(make check\) in parallel/);
   assert.match(buildPrompt({ ...t, localReview: true }), /prloop ready 7 --repo o\/r --review-before-gate false` runs the gate/);
 });
@@ -1985,10 +2006,14 @@ test('pipelined run: prloop gates the clean head itself, and a clean review plus
 });
 
 test('pipelined run: a gate failure on the requested head goes to a fix agent with the gate output', async (t) => {
-  const { res } = await runPipelined(t, () => 'echo FAIL test_retry; exit 1');
+  const { res } = await runPipelined(t, () => 'echo FAIL test_$((6*7)); exit 1');
   assert.equal(res.verdict, 'gate_failed', JSON.stringify(res)); // --agent none: the prompt is handed back
   assert.match(res.prompt, /Trigger: gate_failed/);
-  assert.match(res.prompt, /The full gate failed on head [0-9a-f]{40}; its last lines:\nFAIL test_retry/);
+  // The output may hold a secret: it stays in an owner-only local log, out of the agent prompt.
+  assert.doesNotMatch(res.prompt, /FAIL test_42/);
+  const log = res.prompt.match(/owner-only local log (\S+)/)[1];
+  assert.match(readFileSync(log, 'utf8'), /FAIL test_42/);
+  assert.equal(statSync(log).mode & 0o777, 0o600);
 });
 
 test('pipelined run: a later pass of the same gate on the head supersedes a recorded gate failure', async (t) => {
