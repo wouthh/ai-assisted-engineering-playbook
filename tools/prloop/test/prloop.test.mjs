@@ -6,7 +6,7 @@ import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import {
-  EXIT, OUTPUT_TAIL, main, approvedFor, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, gateProvenance, treeRss, recordGatePass, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, reconcileStates, syncBranch, unionLines, waitFor,
+  EXIT, OUTPUT_TAIL, main, approvedFor, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, saveState, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, gateProvenance, treeRss, recordGatePass, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, reconcileStates, syncBranch, unionLines, waitFor,
 } from '../prloop.mjs';
 
 const pick = (o, keys) => Object.fromEntries(keys.map((k) => [k, o[k]]));
@@ -1334,12 +1334,19 @@ test('run --status marks PRs merged or closed outside a run, with one GitHub cal
   // A supervisor holds PR 12's state lock and saves newer rounds after reconciliation has read GitHub: the update waits for it.
   write(12, 'waiting');
   const f12 = join(dir, 'example-org__example-repo__12.json');
-  writeFileSync(join(bin, 'gh'), `#!/bin/sh\necho "$*" >> "${bin}/calls.log"\n( sleep 0.5; printf '%s' '{"repo":"example-org/example-repo","pr":12,"phase":"agent","rounds":4}' > "${f12}"; rm -f "${f12}.lock" ) >/dev/null 2>&1 &\necho $! > "${f12}.lock"\necho '{"data":{"repository":{"p8":{"state":"OPEN"},"p12":{"state":"MERGED"}}}}'\n`, { mode: 0o755 });
+  writeFileSync(join(bin, 'gh'), `#!/bin/sh\necho "$*" >> "${bin}/calls.log"\nmkdir -p -m 700 "${f12}.lock.d"\n( sleep 0.5; printf '%s' '{"repo":"example-org/example-repo","pr":12,"phase":"agent","rounds":4}' > "${f12}"; rm -f "${f12}.lock.d"/* ) >/dev/null 2>&1 &\n: > "${f12}.lock.d/slot-0.$!.0"\necho '{"data":{"repository":{"p8":{"state":"OPEN"},"p12":{"state":"MERGED"}}}}'\n`, { mode: 0o755 });
   reconcileStates('example-org/example-repo');
   assert.deepEqual(pick(JSON.parse(readFileSync(f12, 'utf8')), ['phase', 'rounds']), { phase: 'merged', rounds: 4 });
-  assert.equal(existsSync(`${f12}.lock`), false);
+  assert.deepEqual(readdirSync(`${f12}.lock.d`), []);
   reconcileStates('example-org/example-repo', [8]); // only the open blocker remains a candidate, and a run skips its own PRs
   assert.equal(readFileSync(join(bin, 'calls.log'), 'utf8').trim().split('\n').length, 3);
+  // A supervisor that loaded PR 12 before it was merged saves a late agent result: the merged phase stays.
+  saveState({ repo: 'example-org/example-repo', pr: 12, phase: 'blocked', reason: 'agent made no progress', rounds: 5 });
+  assert.deepEqual(pick(JSON.parse(readFileSync(f12, 'utf8')), ['phase', 'reason', 'rounds']), { phase: 'merged', reason: 'the PR was merged on GitHub', rounds: 5 });
+  // A run started after the reconciliation (a reopened PR) loaded that record, so its own phases are kept.
+  const reopened = JSON.parse(readFileSync(f12, 'utf8'));
+  saveState({ ...reopened, phase: 'waiting', reason: undefined });
+  assert.equal(JSON.parse(readFileSync(f12, 'utf8')).phase, 'waiting');
 });
 
 test('reset-rounds resets the counter once, logs it, and refuses a second reset', (t) => {
@@ -2642,4 +2649,28 @@ test('run --merge reruns a self-reported gate pass itself before merging', async
 test('the fix prompt allows mark-tested --gate only right after that exact gate on that exact head', () => {
   const p = buildPrompt({ repo: 'o/n', pr: 1, trigger: 'findings', findings: [], gate: 'npm test' });
   assert.match(p, /`prloop mark-tested --gate "<cmd>"` only immediately after that exact gate command passed on this exact head and clean tree, never for a later commit/);
+});
+
+test('state writers racing to take over a dead lock claim never remove each other\'s live claim', async (t) => {
+  const dir = tempState(t);
+  const f = join(dir, 'example-org__example-repo__7.json'), lock = `${f}.lock.d`;
+  writeFileSync(f, JSON.stringify({ repo: 'example-org/example-repo', pr: 7, rounds: 0, seen: {} }));
+  mkdirSync(lock, { mode: 0o700 });
+  const holder = spawn('sleep', ['30']);
+  t.after(() => holder.kill());
+  writeFileSync(join(lock, `slot-0.${holder.pid}.0`), procStart(holder.pid) ?? '');
+  // Each writer loads the state and adds its own key under the lock, as one locked read-modify-write would.
+  const writer = (i) => {
+    const c = spawn(process.execPath, ['--input-type=module', '-e',
+      `import { recordCarry } from ${JSON.stringify(new URL('../prloop.mjs', import.meta.url).href)}; recordCarry('example-org/example-repo', 7, 'a', { head: 'h${i}', patchId: 'p' });`],
+      { env: { ...process.env, XDG_STATE_HOME: dirname(dir) } });
+    return new Promise((r) => c.on('exit', r));
+  };
+  const done = [1, 2, 3, 4, 5, 6].map(writer);
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(JSON.parse(readFileSync(f, 'utf8')).carry, undefined); // waits for the live holder
+  holder.kill(); // dies without removing its claim
+  assert.deepEqual(await Promise.all(done), [0, 0, 0, 0, 0, 0]);
+  assert.deepEqual(readdirSync(lock), []);
+  assert.match(JSON.parse(readFileSync(f, 'utf8')).carry.to, /^h[1-6]$/);
 });
