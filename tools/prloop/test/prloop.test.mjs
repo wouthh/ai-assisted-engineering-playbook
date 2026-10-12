@@ -83,16 +83,17 @@ function cleanWithoutAck(named) {
 }
 const AFTER = Date.parse('2026-01-01T22:07:00Z');
 
-test('a current request answered by a PR-body thumbs-up and a clean comment naming the head is clean without eyes', () => {
+test('without eyes, a clean comment naming the head clears it but a PR-body thumbs-up alone does not', () => {
   const both = cleanWithoutAck('2603924');
   both.reactions.nodes.push({ content: 'THUMBS_UP', createdAt: '2026-01-01T22:06:11Z', user: BOT });
   assert.deepEqual([classify(both, cfg, AFTER).reviewerState.state, classify(both, cfg, AFTER).verdict], ['clean', 'clean']);
   const thumbOnly = cleanWithoutAck('2603924');
   thumbOnly.comments.nodes.pop();
   thumbOnly.reactions.nodes.push({ content: 'THUMBS_UP', createdAt: '2026-01-01T22:06:11Z', user: BOT });
-  thumbOnly.comments.nodes.shift(); // no earlier request whose review could finish late
-  assert.equal(classify(thumbOnly, cfg, AFTER).verdict, 'clean'); // (a) a 👍 on the PR body after the request
-  assert.equal(classify(cleanWithoutAck('2603924'), cfg, AFTER).verdict, 'clean'); // (b) the comment names this head
+  thumbOnly.comments.nodes.shift(); // no earlier request visible
+  // No visible earlier cycle proves nothing: this 👍 may be a previous head's automatic review's first signal.
+  assert.equal(classify(thumbOnly, cfg, AFTER).reviewerState.state, 'none');
+  assert.equal(classify(cleanWithoutAck('2603924'), cfg, AFTER).verdict, 'clean'); // the comment names this head
 });
 
 test('a PR-body thumbs-up after a new request counts only after this cycle\'s eyes when an earlier cycle exists', () => {
@@ -139,11 +140,13 @@ test('an unacknowledged clean comment naming an older commit does not clear the 
   assert.equal(classify(before, cfg, AFTER).reviewerState.state, 'none');
 });
 
-test('an unacknowledged clean comment naming no commit counts only without an earlier review cycle', () => {
+test('an unacknowledged clean comment naming no commit never clears the head', () => {
   const pr = fixture();
   pr.comments.nodes.push({ id: 'IC_bot', databaseId: 102, body: "Codex Review: Didn't find any major issues.", createdAt: at('10:07'), author: BOT, reactions: { nodes: [] } });
   assert.equal(classify(pr, cfg, NOW).verdict, 'pending'); // the older request IC_old could still finish late
   pr.comments.nodes.shift();
+  assert.equal(classify(pr, cfg, NOW).verdict, 'pending'); // a previous head's automatic review may finish late too
+  request(pr).reactions.nodes.push({ content: 'EYES', createdAt: at('10:06'), user: BOT });
   assert.equal(classify(pr, cfg, NOW).verdict, 'clean');
 });
 
