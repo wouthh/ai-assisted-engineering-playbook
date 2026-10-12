@@ -752,6 +752,26 @@ test('sync fails closed when a moved union file is a tiny part of a much larger 
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
 });
 
+test('sync fails closed when a file added next to a modified union file cannot be read', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.commit('feature', { 'log.csv': 'id\na\nY\n' });
+  r.commit('trim and add', { 'log.csv': 'id\na\nb\n', 'big.bin': 'unrelated\n' });
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  divergeOnMain(r, { 'log.csv': 'id\na\nX\n' });
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  // Stands in for a blob over the output buffer: only reads of the added file fail.
+  const old = process.env.PATH, real = join(r.run(r.work, '--exec-path'), 'git');
+  t.after(() => { process.env.PATH = old; });
+  mkdirSync(join(r.dir, 'bin'));
+  writeFileSync(join(r.dir, 'bin', 'git'), `#!/bin/sh\ncase "$1 $2" in "show "*:big.bin) exit 1;; esac\nexec ${real} "$@"\n`, { mode: 0o755 });
+  process.env.PATH = `${join(r.dir, 'bin')}:${old}`;
+  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true, squash: true }, union: ['*.csv'] });
+  assert.equal(v.verdict, 'error', JSON.stringify(v));
+  assert.match(v.error, /reading big\.bin in .* failed/);
+  assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
+});
+
 test('sync fails closed on a renamed and recreated union file even under a low diff.renameLimit', (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
