@@ -833,14 +833,16 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
     const stray = [...git(['diff', '--name-only'], cwd).split('\n'), ...git(['ls-files', '--others', '--exclude-standard'], cwd).split('\n')].filter(Boolean);
     if (stray.length) return { verdict: 'conflict', conflicts: [], stray, generated: [], method: rebase ? 'rebase' : 'merge', inProgress: true,
       next: `stage (if a resolution) or discard ${stray.join(', ')} (unstaged or untracked, not part of the sync), then run \`prloop sync <pr> --continue\` again` };
-    // A staged file is a resolution only if the step itself changes it: the picked commit during a rebase, the base's
-    // side during a merge. Anything else staged would ride along into the pushed commit.
-    const lines = (args) => new Set(git(args, cwd).split('\n').filter(Boolean));
-    const touched = lines(rebase ? ['diff-tree', '--no-commit-id', '--name-only', '-r', '--root', '--no-renames', 'REBASE_HEAD']
-      : ['diff', '--name-only', '--no-renames', 'HEAD...MERGE_HEAD']);
-    const staged = [...lines(['diff', '--cached', '--name-only', '--no-renames', 'HEAD'])].filter((f) => !touched.has(f));
+    // A staged file is a resolution only where the step itself conflicted: everything else must keep the result Git
+    // merged on its own (the picked commit during a rebase, the base during a merge), or it would ride along unseen.
+    const empty = git(['hash-object', '-t', 'tree', '/dev/null'], cwd);
+    const mt = spawnSync('git', ['merge-tree', '--write-tree', '--name-only', ...(rebase
+      ? ['--merge-base', tryGit(['rev-parse', '-q', '--verify', 'REBASE_HEAD^'], cwd) ?? empty, 'HEAD', 'REBASE_HEAD'] : ['HEAD', 'MERGE_HEAD'])], { cwd, encoding: 'utf8' });
+    const [auto, ...conflicted] = mt.status <= 1 ? mt.stdout.split('\n\n')[0].split('\n').filter(Boolean) : [];
+    if (!auto) return { verdict: 'error', error: `could not recompute the ${rebase ? 'rebase' : 'merge'} step to check the staged resolutions` };
+    const staged = git(['diff', '--cached', '--name-only', '--no-renames', auto], cwd).split('\n').filter((f) => f && !conflicted.includes(f));
     if (staged.length) return { verdict: 'conflict', conflicts: [], stray: staged, generated: [], method: rebase ? 'rebase' : 'merge', inProgress: true,
-      next: `unstage and remove ${staged.join(', ')} (\`git restore --staged\`; staged but not changed by the sync), then run \`prloop sync <pr> --continue\` again` };
+      next: `restore ${staged.join(', ')} to the sync's own result (staged changes outside the conflicted files), then run \`prloop sync <pr> --continue\` again` };
     merges = rebase && !!git(['rev-list', '--merges', `${target}..${head}`], cwd);
     ok = step(rebase ? ['rebase', '--continue'] : ['commit', '--no-edit']);
   } else {
@@ -920,19 +922,23 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
     // Ignored files too: generators often write ignored build output, which a failed run must not leave behind.
     const untracked = () => git(['ls-files', '-z', '--others'], cwd).split('\0').filter(Boolean);
     const before = new Set(untracked());
-    for (const cmd of [regenerate].flat()) {
-      // Output is not reported: like gate output it may hold a secret, and the result reaches agents.
-      const r = spawnSync('sh', ['-c', cmd], { cwd, stdio: 'ignore' });
-      if (r.status === 0) continue;
-      const why = `regenerate command failed (${cmd}, exit ${r.status}); run it in the checkout to see why`;
+    const fail = (why) => {
       // A resumed sync holds a manual resolution: keep it locally instead of discarding it.
       if (resumed) return { verdict: 'error', error: `${why}; the synced branch is local only, at ${short(git(['rev-parse', 'HEAD'], cwd))}` };
       git(['reset', '--quiet', '--hard', head], cwd);
       // Also files the command created, so the checkout is as clean as before; older untracked files stay.
       for (const f of untracked()) if (!before.has(f)) rmSync(join(cwd, f), { force: true });
       return { verdict: 'error', error: why };
+    };
+    for (const cmd of [regenerate].flat()) {
+      // Output is not reported: like gate output it may hold a secret, and the result reaches agents.
+      const r = spawnSync('sh', ['-c', cmd], { cwd, stdio: 'ignore' });
+      if (r.status !== 0) return fail(`regenerate command failed (${cmd}, exit ${r.status}); run it in the checkout to see why`);
     }
     git(['add', '-A'], cwd);
+    // `add -A` cannot stage uncommitted changes inside a submodule: pushing would omit that output.
+    const nested = git(['diff', '--name-only', '--ignore-submodules=none'], cwd).split('\n').filter(Boolean);
+    if (nested.length) return fail(`regenerate left uncommitted changes in submodule ${nested.join(', ')}; commit them there or regenerate outside submodules`);
     if (tryGit(['diff', '--cached', '--quiet'], cwd) === null) git(['commit', '--quiet', '-m', `Regenerate generated files after syncing with ${base}`], cwd);
   }
   const push = rebase ? ['push', `--force-with-lease=${branch}:${head}`, headRemote, `HEAD:${branch}`] : ['push', headRemote, `HEAD:${branch}`];

@@ -2195,7 +2195,7 @@ for (const settings of [{ merge: true, squash: true }, { merge: false, squash: f
     r.run(r.work, 'add', 'scratch.txt'); // staged is not a resolution either
     v = syncBranch(args);
     assert.deepEqual([v.verdict, v.stray], ['conflict', ['scratch.txt']], JSON.stringify(v));
-    assert.match(v.next, /git restore --staged/);
+    assert.match(v.next, /outside the conflicted files/);
     r.run(r.work, 'rm', '-q', '--cached', 'scratch.txt');
     rmSync(join(r.work, 'scratch.txt'));
     v = syncBranch(args);
@@ -2207,6 +2207,52 @@ for (const settings of [{ merge: true, squash: true }, { merge: false, squash: f
     assert.equal(r.run(r.work, 'status', '--porcelain'), '');
   });
 }
+
+for (const settings of [{ merge: true, squash: true }, { merge: false, squash: false }]) {
+  test(`sync --continue (${settings.merge ? 'merge' : 'rebase'}) refuses staged edits to files the step applied cleanly`, (t) => {
+    const r = gitRepo();
+    t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+    r.commit('feature', { 'app.txt': 'feature\n', 'feat.txt': 'feature only\n' });
+    r.run(r.work, 'push', '-q', 'origin', 'feat');
+    divergeOnMain(r, { 'app.txt': 'base\n', 'base.txt': 'base only\n' });
+    const head = r.run(r.work, 'rev-parse', 'HEAD');
+    const args = { cwd: r.work, branch: 'feat', base: 'main', head, settings, resume: true };
+    assert.equal(syncBranch(args).verdict, 'conflict');
+    writeFileSync(join(r.work, 'app.txt'), 'both\n');
+    writeFileSync(join(r.work, 'feat.txt'), 'replaced\n');
+    writeFileSync(join(r.work, 'base.txt'), 'replaced\n');
+    r.run(r.work, 'add', 'app.txt', 'feat.txt', 'base.txt');
+    const v = syncBranch(args); // only the conflicted app.txt may differ from Git's own merge
+    assert.deepEqual([v.verdict, v.stray], ['conflict', ['base.txt', 'feat.txt']], JSON.stringify(v));
+    writeFileSync(join(r.work, 'feat.txt'), 'feature only\n');
+    writeFileSync(join(r.work, 'base.txt'), 'base only\n');
+    r.run(r.work, 'add', 'feat.txt', 'base.txt');
+    assert.equal(syncBranch(args).verdict, 'synced');
+    assert.equal(r.run(r.work, 'cat-file', '-p', 'HEAD:base.txt'), 'base only');
+    assert.equal(r.run(r.work, 'cat-file', '-p', 'HEAD:feat.txt'), 'feature only');
+  });
+}
+
+test('sync fails closed when regenerate leaves uncommitted changes inside a submodule', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  const sub = join(r.dir, 'sub');
+  r.run(r.dir, 'init', '-q', sub);
+  writeFileSync(join(sub, 'x'), 'x\n');
+  r.run(sub, 'add', 'x');
+  r.run(sub, '-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-qm', 'sub');
+  r.run(r.work, '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', sub, 'sub');
+  r.commit('feature', { 'gen.txt': 'feature\n' });
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  divergeOnMain(r, { 'gen.txt': 'base\n' });
+  r.run(r.work, '-c', 'protocol.file.allow=always', 'submodule', 'update', '-q', '--init');
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true }, generated: ['gen.txt'], regenerate: 'echo out > sub/out.txt' });
+  assert.equal(v.verdict, 'error', JSON.stringify(v));
+  assert.match(v.error, /submodule sub/);
+  assert.equal(r.run(r.work, 'rev-parse', 'HEAD'), head);
+  assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
+});
 
 test('a failing regenerate command restores the old head and reports no output', (t) => {
   const r = gitRepo();
