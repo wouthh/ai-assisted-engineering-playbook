@@ -19,7 +19,7 @@ The installed copy should be a checkout that tracks the published `main`; change
 
 ## Sharing one machine
 
-Several `prloop` processes, their agents and gates, and unrelated work often share one machine. Resource awareness is on by default:
+Several `prloop` processes, their agents and gates, and unrelated work often share one machine. Resource awareness is on by default. These limits are one machine-wide setting: set them once in `${XDG_STATE_HOME:-~/.local/state}/prloop/config.json`, which every `prloop` process of the user reads (keys `gateSlots`, `maxLoad`, `minFreeMem`, `resourceWait`, `gateTmpdir`; for example `{"gateSlots": 4, "gateTmpdir": "/var/tmp"}`). The environment overrides the file and a flag overrides both. `run` passes its effective gate, gate weight, limits and `reviewBeforeGate` to every agent it spawns, so the agent's own `prloop ready` uses the same values.
 
 | Option | Environment | Default | |
 |---|---|---|---|
@@ -27,9 +27,39 @@ Several `prloop` processes, their agents and gates, and unrelated work often sha
 | `--max-load <x>` | `PRLOOP_MAX_LOAD` | 0.75 x CPU cores | No agent, local review (also one started by `wait`) or gate starts while the 1-minute load average is higher. |
 | `--min-free-mem <size>` | `PRLOOP_MIN_FREE_MEM` | larger of 4G and 10% of RAM | ...or while available memory (`MemAvailable` on Linux, free memory elsewhere) is lower. Sizes take K, M, G or T (binary). |
 | `--resource-wait <dur>` | `PRLOOP_RESOURCE_WAIT` | 30m | The wait never deadlocks: after this long it proceeds with one slot only (one agent at a time in `run`, only the first gate slot in `ready`) and logs `resource_wait_expired`. |
-| `--gate-tmpdir <dir>` | `PRLOOP_GATE_TMPDIR` | off | Runs each gate, fix agent and local review with `TMPDIR` set to a private directory that prloop creates under `<dir>` for that run and deletes afterwards, so a test suite does not fill a small RAM-backed `/tmp` and leaves no scratch behind. |
+| `--gate-tmpdir <dir>` | `PRLOOP_GATE_TMPDIR` | off | Runs each gate, fix agent and local review with `TMPDIR` set to a private directory that prloop creates under `<dir>` for that run and deletes afterwards, so a test suite does not fill a small RAM-backed `/tmp` and leaves no scratch behind. prloop's own scratch for an agent or reviewer (codex output and schema files) goes there too. |
+
+A gate's slot cost comes from its [weight](#per-repository-config-prloopjson): a heavy gate (the default) takes one slot, a gate declared with a slot count takes that many (all at once or none), and a light gate takes no slot while load and memory allow, so a two-minute gate never waits behind 25-minute gates of another repository. After an expired resource wait a light gate queues for the one slot like any other.
 
 Resource checks repeat every `--interval`; one `waiting_for_resources` event with the load, its limit, free memory and its limit is logged per wait (in the run log for `run`, on stderr for `ready`). `prloop run --status` adds one `machine` line: load, free memory and gate slots in use. To turn a limit off in practice, raise it (for example `--gate-slots 64`).
+
+## Per-repository config (`.prloop.json`)
+
+A repository declares its own gate in `.prloop.json` at its root, so a coordinator does not repeat long `--gate` and `--union` strings, and the repository's AGENTS.md can point to it:
+
+```json
+{ "gate": "npm run check", "gateWeight": "heavy", "union": ["CHANGELOG.md"], "merge": "squash", "reviewBeforeGate": true }
+```
+
+| Key | |
+|---|---|
+| `gate` | The full validation command (`--gate`, `PRLOOP_GATE`). |
+| `gateWeight` | `light` (a short gate: no slot while load allows), `heavy` (one slot), or a slot count (`2`; a number below 1 counts as light). Unset means one slot. `--gate-weight`, `PRLOOP_GATE_WEIGHT`. |
+| `union` | Globs that `sync` merges as a union (`--union`). |
+| `merge` | The merge method used by `run --merge repo`. Merging itself still needs that explicit flag. |
+| `reviewBeforeGate` | [Pipelined review](#pipelined-review); defaults to on for a declared heavy gate (`heavy` or a slot count of 1 or more), off otherwise. `--review-before-gate true\|false`, `PRLOOP_REVIEW_BEFORE_GATE`. |
+
+`prloop` reads the file of the repository that holds the current directory (or `--worktree` for `run`); unknown keys or wrong types are a usage error (exit 40). A flag overrides the environment, which overrides the file.
+
+### Pipelined review
+
+With a heavy gate (20+ minutes plus slot waits), gating before every review request leaves the cloud reviewer idle. With `reviewBeforeGate`, each round runs the two in parallel on the same head:
+
+1. The fix agent pushes and resolves the addressed threads. `prloop ready` then checks everything except the gate and, while the head still needs a request, does not run the gate (`"gate": "deferred"`); the agent posts the request. A request already pending on the head, or a reviewer that already reviewed it, still blocks a new request.
+2. `run` runs the full gate on that head itself, while it keeps polling the other PRs. Outside `run`, calling `prloop ready` again after the request runs the gate (it then reports `"gate": "passed"` and not ready, because the request is pending).
+3. A merge (and the terminal `clean` of `run`) needs both a clean review and a passed gate on the same head. Findings start the next round as usual; a gate failure starts it with trigger `gate_failed` and the gate's last lines in the fix prompt. A failed gate after a request costs one round, which is acceptable because the previous round's gate usually passed and fixes are small.
+
+`--reviewer local` always gates first, since a local review needs a tested head. Repositories whose AGENTS.md requires the gate before a review request should update that wording when they turn this on.
 
 ## Recommended workflow: one background supervisor
 
@@ -42,7 +72,7 @@ prloop run --status --repo owner/name                                          #
 
 `run` polls every PR round-robin every `--interval`, in one process, and shares the machine with other work by default (see [Sharing one machine](#sharing-one-machine)). It syncs a branch that GitHub reports behind or conflicting (see [Saving cloud reviews](#saving-cloud-reviews)), waits for the reviewer, runs local reviews when needed, and spawns a fix agent only for findings, a manual conflict, a missing request, a timed-out request or a local-review gate gap. At most `--max-agents` (2) agents or local reviews run at once. It never needs the coordinator between steps and exits only when every PR is `merged`, `merge_pending`, `clean` (without `--merge`), `blocked`, `needs_human`, `needs_agent` (with `--agent none`) or past the `--deadline` (6h). It then prints one JSON line per PR: `verdict`, `reason`, last `head`, `rounds`, and `next`, what a human or the coordinator must do.
 
-Run `prloop run` as a direct background job of the coordinator's own shell (as above), so its exit notifies the coordinator, and always pass `--deadline`. Never supervise it through a detached process plus a `pgrep -f` watcher: the watcher's own command line can match its pattern, so it never sees the run end. After a tool failure (an agent that crashed, timed out or hit a missing tool or permission, not real review rounds), read the agent log named in the event and clear that PR's state file before rerunning, instead of spending `reset-rounds`.
+Run `prloop run` as a direct background job of the coordinator's own shell (as above), so its exit notifies the coordinator, and always pass `--deadline`. Subagents that a coordinator starts with its own agent tooling (not through `prloop run`) may have a per-command time cap, such as 10 minutes: their briefs must run long commands such as `prloop ready` with a full gate as a background job and wait for it to exit, never in the foreground. Agents spawned by `prloop` itself get a shell timeout as long as `--agent-timeout` instead. Never supervise it through a detached process plus a `pgrep -f` watcher: the watcher's own command line can match its pattern, so it never sees the run end. After a tool failure (an agent that crashed, timed out or hit a missing tool or permission, not real review rounds), read the agent log named in the event and clear that PR's state file before rerunning, instead of spending `reset-rounds`.
 
 Each PR's state lives in `${XDG_STATE_HOME:-~/.local/state}/prloop/<owner>__<name>__<pr>.json`, and every state change is appended to that run's `run-<time>.jsonl` event log in the same directory. `prloop run --status` prints all PR states as one JSON object, each with its last five events from the run log that state names. Each PR state also keeps `usage` totals over its fix agents and local reviews: `agentRuns`, `turns`, `costUsd`, `inputTokens` (including cache creation and cache reads) and `outputTokens`, read from the claude CLI's JSON wrapper (`num_turns`, `total_cost_usd`, `usage`) when each one ends. `run --status` and the final summary line of each PR show them. An agent whose output carries no usage, such as `codex exec` as prloop runs it, counts in `agentRuns` and leaves the other values blank (`null`) until a run reports them. Rounds and seen findings persist across runs on purpose; `prloop reset-rounds <pr>` resets the rounds once (see [At the round cap](#at-the-round-cap)), and deleting a PR's state file resets everything.
 
@@ -61,7 +91,7 @@ Each fix agent runs in the PR's worktree (found with `git worktree list` by bran
 2. fix each valid finding with a regression test, reply with evidence on invalid ones and leave them unresolved (except a finding proven to misread AGENTS.md, which it resolves after the evidence reply once every AGENTS.md that applies to its path confirms it is invalid), resolve conflicts;
 3. run focused tests while fixing, never the full project gate directly, then commit and push normally (`prloop sync` first if the base moved);
 4. resolve the fixed threads and reply on the disputed ones;
-5. run `prloop ready`, which runs the gate, in the foreground with a timeout of at least `--agent-timeout`, never backgrounded; after a gate failure, rerun the failing tests or step with their focused command and fix them, including failures it did not cause, before calling `prloop ready` again (at most 5 calls; blocked only when the same failure survives 3 consecutive fixes or the cause is environmental, such as a missing tool, no network or a permission denial);
+5. run `prloop ready`, which runs the gate (with [pipelined review](#pipelined-review) only once the request is posted, and `run` does that itself), in the foreground with a timeout of at least `--agent-timeout`, never backgrounded; after a gate failure, rerun the failing tests or step with their focused command and fix them, including failures it did not cause, before calling `prloop ready` again (at most 5 calls; blocked only when the same failure survives 3 consecutive fixes or the cause is environmental, such as a missing tool, no network or a permission denial);
 6. post the review request, reusing the previous request body (skipped with `--reviewer local`);
 7. end its final message with one JSON line on its own line, also when blocked (a denied action is reported as `blocked` naming the denied command): `{"status":"requested|blocked|nothing_to_do","head":"…","fixed":[…],"disputed":[…],"reason":"…"}`.
 
@@ -79,12 +109,12 @@ Fix agents never wait for or poll reviews, merge, touch other PRs, rewrite histo
 | `--agent claude` | yes | `claude -p <prompt> --model claude-opus-5-5 --effort medium --permission-mode auto --output-format json`, run in the worktree so the CLI loads that project's instructions. |
 | `--agent codex` | | `codex exec` with a workspace-write sandbox that allows network access. |
 | `--agent none` | | Stops the PR at `needs_agent` with the generated `prompt` in its summary, so the coordinator can spawn its own agent and rerun `run`. A needed local review stops the PR at `blocked` instead of running a reviewer. |
-| `--agent-timeout 90m` | 90m | `PRLOOP_AGENT_TIMEOUT`. Kills a fix agent or local reviewer (its whole process group) that runs longer and records it `blocked` with `agent timed out`. Claude agents also get `BASH_DEFAULT_TIMEOUT_MS` and `BASH_MAX_TIMEOUT_MS` set to this budget: Claude Code otherwise moves a long Bash command such as the gate to the background after its default timeout, and a `-p` session then ends before the gate completes. Codex has no such setting, so its prompt carries only the foreground rule. |
+| `--agent-timeout 90m` | 90m | `PRLOOP_AGENT_TIMEOUT`. Kills a fix agent or local reviewer (its whole process group) that works longer and records it `blocked` with `agent timed out after <budget> of work`, adding `with no output` when it printed nothing (the session was killed before its result; check its last command). Time its own `prloop ready` spends queued for the gate (the per-head gate lock, resource admission, a gate slot) is not counted: `run` passes `PRLOOP_QUEUE_FILE`, which `ready` holds while it waits, and the clock stops while that file names a live process. Claude agents also get `BASH_DEFAULT_TIMEOUT_MS` and `BASH_MAX_TIMEOUT_MS` set to this budget: Claude Code otherwise moves a long Bash command such as the gate to the background after its default timeout, and a `-p` session then ends before the gate completes. Codex has no such setting, so its prompt carries only the foreground rule. |
 | `--model`, `--effort` | | Override the agent model and effort (`PRLOOP_MODEL`, `PRLOOP_EFFORT`). |
 | `--max-agents 2` | 2 | Agents and local reviews running at the same time. |
 | `--max-rounds 6` | 6 | Fix-agent rounds per PR, across runs. |
 | `--deadline 6h` | 6h | Overall run deadline. |
-| `--merge rebase\|squash\|merge` | off | Merges only a head whose fresh snapshot is clean with no unresolved threads, marked tested in the PR worktree with a clean pushed tree, and reported mergeable, using `gh pr merge --match-head-commit <sha>`. A clean but untested head goes to an agent for the gate only. The result is `merged`, or `merge_pending` (exit 50) when a merge queue or auto-merge accepted it without merging yet. |
+| `--merge rebase\|squash\|merge\|repo` | off | `repo` takes the method from `.prloop.json`. With `rebase`, `run` syncs by rebase, and when GitHub refuses a rebase merge of a PR it reports clean (for example a branch with merge commits) it syncs (linearizes) once and retries; the linearized head needs the gate again. Merges only a head whose fresh snapshot is clean with no unresolved threads, marked tested in the PR worktree with a clean pushed tree, and reported mergeable, using `gh pr merge --match-head-commit <sha>`. A clean but untested head goes to an agent for the gate only. The result is `merged`, or `merge_pending` (exit 50) when a merge queue or auto-merge accepted it without merging yet. |
 | `--union <glob>` | | Passed to sync. Reviewer and timing options apply as for `wait`. |
 
 Failsafes end a PR in `blocked` (or `needs_human` for disputed findings) with a reason, never in a loop: maximum rounds per PR (`--max-rounds 6`), an agent that exits non-zero, prints no parseable result line without making progress, reports `blocked` or a permission denial, or makes no progress (no new commit, resolved thread, request or tested head), the same finding (path plus normalized first line) returning after two fixes, the overall deadline, and every local-review failsafe.
@@ -148,12 +178,12 @@ esac
 
 ## Syncing with the base
 
-`prloop sync <pr>` runs inside a clean checkout of the PR branch whose `HEAD` equals the remote head. It fetches the base, checks that `origin/<base>` contains the base commit GitHub reports for the PR (so a fork's stale branch is never used), and:
+`prloop sync <pr>` runs inside a clean checkout of the PR branch whose `HEAD` equals the remote head. It fetches the base, checks that `origin/<base>` contains the base commit GitHub reports for the PR (so a fork's stale branch is never used), compares and syncs against the fetched `origin/<base>`, never against that reported commit (GitHub's `baseRefOid` can lag far behind the base branch), and:
 
 - merges the base when the repository allows merge or squash merges, then pushes normally;
 - rebases onto the base when the repository allows only rebase merges, then pushes with `--force-with-lease=<branch>:<expected-sha>`, so it never overwrites commits it has not seen. A branch that already contains the base but has merge commits, which GitHub refuses to rebase-merge, is linearized the same way and reported with `linearized: true`. A rebase drops merge commits, so sync pushes only when the linearized tree equals merging the base into the old head (conflicts only in `--union` files are excluded from that comparison, since sync resolved them line by line, but every line the old head had in them must survive); when a merge commit carried its own edits it restores the old head and exits 40 instead.
 
-Conflicts in files matching `--union` globs (append-only changelogs, CSV ledgers) are resolved as a union of both sides, base lines first, with identical lines kept once. A matching file that is a symlink on either side is never resolved this way. Any other conflict aborts the merge or rebase, leaves the checkout as it was, and exits 41 with `verdict: "conflict"` and the conflicted files, for the agent to resolve by hand. Union resolution suits files where every line is an independent record; do not use it for files whose lines depend on order or on each other.
+Conflicts in files matching `--union` globs (append-only changelogs, CSV ledgers) are resolved as a union of both sides, base lines first, with identical lines kept once. A matching file that is a symlink on either side is never resolved this way. Any other conflict aborts the merge or rebase, leaves the checkout as it was, and exits 41 with `verdict: "conflict"` and the conflicted files, for the agent to resolve by hand. Conflicted files that `.gitattributes` marks `linguist-generated` are listed again under `generated`, and the fix prompt tells the agent to regenerate them from their sources instead of merging them. Union resolution suits files where every line is an independent record; do not use it for files whose lines depend on order or on each other.
 
 A successful sync changes the head, so it clears the tested marker of the old head (markers of other PR heads stay): run `prloop ready` (which reruns the gate). Its output reports `treeUnchanged` (the new head has the same tree as the old one), `patchId`, `unchanged` and the union-merged files; when the old head was reviewed clean and `unchanged` is true it also reports the recorded `carry` and no new review is needed. Otherwise request a review.
 

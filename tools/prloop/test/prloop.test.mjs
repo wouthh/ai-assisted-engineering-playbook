@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import {
-  EXIT, OUTPUT_TAIL, main, slotDir, agentFailure, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, syncBranch, unionLines, waitFor,
+  EXIT, OUTPUT_TAIL, main, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, syncBranch, unionLines, waitFor,
 } from '../prloop.mjs';
 
 const pick = (o, keys) => Object.fromEntries(keys.map((k) => [k, o[k]]));
@@ -85,6 +85,7 @@ const AFTER = Date.parse('2026-01-01T22:07:00Z');
 
 test('without eyes, a clean comment naming the head clears it but a PR-body thumbs-up alone does not', () => {
   const both = cleanWithoutAck('2603924');
+  const cfg = { ...config({}, {}), disambiguate: (p) => (p === '2603924' ? [both.headRefOid] : []) }; // the abbreviation resolves to the head only
   both.reactions.nodes.push({ content: 'THUMBS_UP', createdAt: '2026-01-01T22:06:11Z', user: BOT });
   assert.deepEqual([classify(both, cfg, AFTER).reviewerState.state, classify(both, cfg, AFTER).verdict], ['clean', 'clean']);
   const thumbOnly = cleanWithoutAck('2603924');
@@ -94,6 +95,19 @@ test('without eyes, a clean comment naming the head clears it but a PR-body thum
   // No visible earlier cycle proves nothing: this 👍 may be a previous head's automatic review's first signal.
   assert.equal(classify(thumbOnly, cfg, AFTER).reviewerState.state, 'none');
   assert.equal(classify(cleanWithoutAck('2603924'), cfg, AFTER).verdict, 'clean'); // the comment names this head
+});
+
+test('a named commit clears the head only as its full OID or an abbreviation that resolves to it alone', (t) => {
+  const head = cleanWithoutAck('x').headRefOid;
+  assert.equal(classify(cleanWithoutAck(head), cfg, AFTER).verdict, 'clean'); // the full OID needs no repository
+  assert.notEqual(classify(cleanWithoutAck('2603924'), cfg, AFTER).reviewerState.state, 'clean'); // unknown here: a prefix match is not enough
+  const twins = { ...cfg, disambiguate: () => [head, '2603924'.padEnd(40, 'b')] };
+  assert.notEqual(classify(cleanWithoutAck('2603924'), twins, AFTER).reviewerState.state, 'clean'); // ambiguous abbreviation
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  const sha = r.run(r.work, 'rev-parse', 'HEAD');
+  assert.deepEqual(disambiguate(sha.slice(0, 9), r.work), [sha]);
+  assert.deepEqual(disambiguate('0000000', r.work), []);
 });
 
 test('a PR-body thumbs-up after a new request never clears it, even after this cycle\'s eyes', () => {
@@ -1313,19 +1327,34 @@ test('a SHA that returns as the head gets a fresh observation time', async (t) =
   assert.ok(headSeenAt('o/n#7', 'S') > first); // rewound and fast-forwarded back
 });
 
-test('sync merges the reported base commit, not extra commits on the remote branch', (t) => {
+test('sync compares and merges against the fetched base, not a stale reported base commit', (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   r.commit('feature', { 'app.txt': 'feature\n' });
   r.run(r.work, 'push', '-q', 'origin', 'feat');
   divergeOnMain(r, { 'log.csv': 'id\na\nbase\n' });
-  const baseOid = r.run(r.work, 'rev-parse', 'main');
-  divergeOnMain(r, { 'extra.txt': 'not in the PR base\n' });
+  const baseOid = r.run(r.work, 'rev-parse', 'main'); // what GitHub still reports
+  divergeOnMain(r, { 'extra.txt': 'newer base\n' });
   const head = r.run(r.work, 'rev-parse', 'HEAD');
   const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', baseOid, head, settings: { merge: true } });
   assert.equal(v.verdict, 'synced', JSON.stringify(v));
-  assert.equal(r.run(r.work, 'merge-base', '--is-ancestor', baseOid, 'HEAD'), '');
-  assert.throws(() => r.run(r.work, 'cat-file', '-e', 'HEAD:extra.txt'));
+  assert.equal(r.run(r.work, 'cat-file', '-p', 'HEAD:extra.txt'), 'newer base');
+});
+
+test('sync reports a conflict with the fetched base even when the branch contains the reported base, naming generated files', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.commit('feature', { '.gitattributes': 'gen.txt linguist-generated\n', 'gen.txt': 'feature build\n', 'app.txt': 'feature\n' });
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  const baseOid = r.run(r.work, 'rev-parse', 'main'); // the branch already contains it: up to date by GitHub's stale view
+  divergeOnMain(r, { '.gitattributes': 'gen.txt linguist-generated\n', 'gen.txt': 'base build\n', 'app.txt': 'base\n' });
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', baseOid, head, settings: { merge: true } });
+  assert.equal(v.verdict, 'conflict', JSON.stringify(v));
+  assert.deepEqual(v.conflicts.sort(), ['app.txt', 'gen.txt']);
+  assert.deepEqual(v.generated, ['gen.txt']);
+  assert.match(v.next, /regenerate gen\.txt/);
+  assert.match(buildPrompt({ trigger: 'conflict', conflicts: v.conflicts, generated: v.generated, pr: 7, repo: 'o/r', gate: 'make test' }), /Generated files among them .*: gen\.txt/);
 });
 
 test('the local review diffs from the reported base commit', () => {
@@ -1583,7 +1612,7 @@ test('run carries a clean verdict across a sync that leaves the PR unchanged', a
 
 // A PR with one unresolved finding and a fake `claude` whose JSON wrapper reports error_max_turns and no result line.
 // With `resolves`, the agent resolves the thread (real progress) before its session ends.
-async function runNoResultAgent(t, resolves, { body, extra = {} } = {}) {
+async function runNoResultAgent(t, resolves, { body, extra = {}, cmd = 'claude' } = {}) {
   const state = tempState(t);
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
@@ -1598,7 +1627,7 @@ async function runNoResultAgent(t, resolves, { body, extra = {} } = {}) {
   request(done).reactions.nodes.push({ content: 'THUMBS_UP', createdAt: at('10:30'), user: BOT });
   const reply = JSON.stringify({ data: { viewer: { login: 'example-dev' }, repository: { mergeCommitAllowed: true, squashMergeAllowed: true, rebaseMergeAllowed: true, pullRequest: done } } });
   writeFileSync(join(r.dir, 'done.json'), reply);
-  writeFileSync(join(r.dir, 'bin', 'claude'), `#!/bin/sh
+  writeFileSync(join(r.dir, 'bin', cmd), `#!/bin/sh
 echo "$PRLOOP_LOCK_TOKEN" > "${r.dir}/token"
 echo "$BASH_DEFAULT_TIMEOUT_MS $BASH_MAX_TIMEOUT_MS" > "${r.dir}/bash-timeouts"
 ${resolves ? `cp "${r.dir}/done.json" "${r.dir}/pr.json"` : ''}
@@ -1653,10 +1682,125 @@ test('run kills an agent that outlives --agent-timeout and blocks with "agent ti
   const started = Date.now();
   const { res, r } = await runNoResultAgent(t, false, { body: 'sleep 30 & wait', extra: { agentTimeout: 300 } });
   assert.equal(res.verdict, 'blocked', JSON.stringify(res));
-  assert.equal(res.reason, 'agent timed out');
+  assert.equal(res.reason, 'agent timed out after 1s of work with no output: it was killed before printing its result, so check its last command (time its gate spent queued is not counted)');
   assert.ok(Date.now() - started < 20e3);
   assert.equal(readFileSync(join(r.dir, 'bash-timeouts'), 'utf8'), '300 300\n');
   assert.equal(lockHolder(r.work, null), null);
+});
+
+test('time an agent\'s gate spends queued does not count against --agent-timeout', async (t) => {
+  // The agent's `prloop ready` marks itself queued for 1.5s of a 0.6s budget, then works briefly and ends.
+  const body = `echo $$ > "$PRLOOP_QUEUE_FILE"; sleep 1.5; rm "$PRLOOP_QUEUE_FILE"; sleep 0.2
+echo '{"type":"result","subtype":"error_max_turns","is_error":true,"result":"Ran out of turns."}'`;
+  const { res } = await runNoResultAgent(t, false, { body, extra: { agentTimeout: 600 } });
+  assert.equal(res.reason, 'the agent session ended at its max-turns limit', JSON.stringify(res));
+  // A marker whose process is gone does not pause the clock.
+  const { res: stale } = await runNoResultAgent(t, false, { body: `echo ${deadPid()} > "$PRLOOP_QUEUE_FILE"; sleep 30`, extra: { agentTimeout: 600 } });
+  assert.match(stale.reason, /^agent timed out/);
+});
+
+test('ready marks its agent queued until its gate is admitted', async (t) => {
+  tempState(t);
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  const q = join(r.dir, 'queued');
+  const old = process.env.PRLOOP_QUEUE_FILE;
+  process.env.PRLOOP_QUEUE_FILE = q;
+  t.after(() => { if (old === undefined) delete process.env.PRLOOP_QUEUE_FILE; else process.env.PRLOOP_QUEUE_FILE = old; });
+  const dir = join(r.dir, 'slots');
+  const hold = acquireSlot(dir, 1);
+  const seen = [];
+  const pause = async () => { seen.push(readFileSync(q, 'utf8')); hold(); };
+  const g = await readyGate({ branch: 'feat', head, readyToRequest: false }, { ...cfg, gate: `test ! -e "${q}"`, gateSlots: 1 }, r.work, { ...idle(), pause, dir });
+  assert.deepEqual([g.ok, seen], [true, [String(process.pid)]]); // queued while the slot was taken, unmarked before the gate ran
+  assert.equal(existsSync(q), false);
+});
+
+test('codex agents and reviewers keep their scratch under --gate-tmpdir', async (t) => {
+  const base = mkdtempSync(join(tmpdir(), 'prloop-codex-tmp-'));
+  t.after(() => rmSync(base, { recursive: true, force: true }));
+  const tmp = join(base, 'tmp'), seen = join(base, 'seen');
+  // The fake codex records the scratch paths it was given (-o, and --output-schema for a reviewer).
+  const body = `for a; do case "$a" in "${tmp}"/*) echo "$a" >> "${seen}";; esac; done`;
+  const { res, r } = await runNoResultAgent(t, false, { body, cmd: 'codex', extra: { agent: 'codex', gateTmpdir: tmp } });
+  assert.equal(res.verdict, 'blocked', JSON.stringify(res));
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  markTested(head, r.work);
+  const v = await localReview('example-org/example-repo', { pr: 7, head, branch: 'feat', base: 'main', baseOid: head, unresolvedThreads: [] }, { ...cfg, agent: 'codex', gateTmpdir: tmp }, r.work);
+  assert.equal(v.verdict, 'blocked'); // no output file: the reviewer failed after being started
+  const paths = readFileSync(seen, 'utf8').trim().split('\n');
+  assert.ok(paths.some((p) => p.startsWith(join(tmp, 'prloop-agent-out-'))) && paths.some((p) => p.startsWith(join(tmp, 'prloop-review-'))), paths.join(' '));
+  assert.deepEqual(readdirSync(tmp), []); // all removed afterwards
+});
+
+test('machine and repository config files: precedence flag, env, repository, machine, default', (t) => {
+  const state = tempState(t);
+  writeFileSync(join(state, 'config.json'), JSON.stringify({ gateSlots: 4, resourceWait: '5m', gateTmpdir: '/var/tmp/example' }));
+  const machine = machineConfig();
+  assert.deepEqual(pick(config({}, {}, { machine }), ['gateSlots', 'resourceWait', 'gateTmpdir']), { gateSlots: 4, resourceWait: 5 * 60e3, gateTmpdir: '/var/tmp/example' });
+  assert.equal(config({}, { PRLOOP_GATE_SLOTS: '3' }, { machine }).gateSlots, 3);
+  assert.equal(config({ gateSlots: '5' }, { PRLOOP_GATE_SLOTS: '3' }, { machine }).gateSlots, 5);
+  writeFileSync(join(state, 'config.json'), JSON.stringify({ gateSlot: 4 }));
+  assert.throws(() => machineConfig(), /unknown key gateSlot/);
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  assert.deepEqual(repoConfig(r.work), {});
+  writeFileSync(join(r.work, '.prloop.json'), JSON.stringify({ gate: 'make check', gateWeight: 'heavy', union: ['CHANGELOG.md'], merge: 'squash' }));
+  mkdirSync(join(r.work, 'sub'));
+  const repo = repoConfig(join(r.work, 'sub')); // read from the repository root
+  assert.equal(repo.gate, 'make check');
+  const c = config({}, {}, { repo });
+  assert.deepEqual(pick(c, ['gate', 'gateCost', 'reviewBeforeGate']), { gate: 'make check', gateCost: 1, reviewBeforeGate: true }); // heavy: pipelined by default
+  assert.equal(config({ gate: 'make quick', reviewBeforeGate: 'false' }, {}, { repo }).gate, 'make quick');
+  assert.equal(config({ reviewBeforeGate: 'false' }, {}, { repo }).reviewBeforeGate, false);
+  assert.equal(config({ reviewer: 'local' }, {}, { repo }).reviewBeforeGate, false); // a local review needs the gate first
+  assert.equal(config({}, {}, {}).reviewBeforeGate, false); // undeclared weight: gate before review, as before
+  assert.deepEqual(['light', 'heavy', '0.5', 2, undefined].map(gateCost), [0, 1, 0, 2, 1]);
+  for (const w of ['medium', '1.5', '0', -1]) assert.throws(() => gateCost(w), /gate-weight/);
+  writeFileSync(join(r.work, '.prloop.json'), JSON.stringify({ union: 'CHANGELOG.md' }));
+  assert.throws(() => repoConfig(r.work), /union must be array/);
+});
+
+test('run passes its effective gate and limits to spawned agents', () => {
+  const c = config({ gate: 'make check', gateSlots: '4', gateWeight: 'light', maxLoad: '6', minFreeMem: '2G', resourceWait: '90s' }, {});
+  assert.deepEqual(pick(agentEnv(c, {}), ['PRLOOP_GATE', 'PRLOOP_GATE_WEIGHT', 'PRLOOP_GATE_SLOTS', 'PRLOOP_MAX_LOAD', 'PRLOOP_MIN_FREE_MEM', 'PRLOOP_RESOURCE_WAIT', 'PRLOOP_REVIEW_BEFORE_GATE']),
+    { PRLOOP_GATE: 'make check', PRLOOP_GATE_WEIGHT: 'light', PRLOOP_GATE_SLOTS: '4', PRLOOP_MAX_LOAD: '6', PRLOOP_MIN_FREE_MEM: String(2 * GiB), PRLOOP_RESOURCE_WAIT: '90s', PRLOOP_REVIEW_BEFORE_GATE: 'false' });
+  const back = config({}, agentEnv(c, {})); // the agent's own prloop reads the same values
+  assert.deepEqual(pick(back, ['gate', 'gateSlots', 'gateCost', 'maxLoad', 'minFreeMem', 'resourceWait', 'reviewBeforeGate']),
+    pick(c, ['gate', 'gateSlots', 'gateCost', 'maxLoad', 'minFreeMem', 'resourceWait', 'reviewBeforeGate']));
+});
+
+test('a light gate skips the slot queue while load allows; a heavy gate may take several slots', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'prloop-slots-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const full = acquireSlots(dir, 2, 2); // two long gates fill the pool
+  assert.equal(slotsInUse(dir), 2);
+  const light = { ...cfg, gateSlots: 2, gateCost: 0 };
+  assert.equal((await runGate('echo ran', dir, light, { ...idle(), dir })).stdout.trim(), 'ran');
+  // On a busy machine, after the resource wait, a light gate queues for the one slot like any other.
+  const x = idle({ load: 50 });
+  const pause = async (ms) => { x.clock.t += ms; if (x.clock.t > cfg.resourceWait) full(); };
+  await runGate('true', dir, light, { ...x, pause, dir });
+  assert.deepEqual(x.events.map((e) => e.event), ['waiting_for_resources', 'resource_wait_expired', 'waiting_for_gate_slot']);
+  const one = acquireSlot(dir, 3);
+  assert.equal(acquireSlots(dir, 3, 3), null); // all or nothing
+  assert.equal(slotsInUse(dir), 1);
+  one();
+  const three = acquireSlots(dir, 3, 3);
+  assert.equal(slotsInUse(dir), 3);
+  three();
+  assert.deepEqual(readdirSync(dir), []);
+});
+
+test('the fix prompt follows pipelined review and carries a gate failure', () => {
+  const t = { trigger: 'gate_failed', pr: 7, repo: 'o/r', branch: 'b', head: 'h', cwd: '/w', gate: 'make check', reviewBeforeGate: true, missing: ['x'],
+    gateFailure: { head: 'h', tail: 'FAIL test_retry' }, requestBody: '@codex review' };
+  const p = buildPrompt(t);
+  assert.match(p, /The full gate failed on head h; its last lines:\nFAIL test_retry/);
+  assert.match(p, /requests the review first and prloop runs the full gate \(make check\) in parallel/);
+  assert.match(buildPrompt({ ...t, localReview: true }), /prloop ready 7 --repo o\/r --review-before-gate false` runs the gate/);
 });
 
 test('only claude agents get the Bash timeout variables', () => {
@@ -1780,4 +1924,95 @@ test('a standalone sync holds the worktree lock for its whole run unless its tok
   const seen = readFileSync(join(r.dir, 'seen'), 'utf8');
   assert.match(seen, /fix agent for PR #7/);
   assert.doesNotMatch(seen, /sync of PR #7/); // the inherited claim covers it
+});
+
+test('pipelined ready: a head that needs a request is ready without the gate; once requested, ready runs the gate', (t) => {
+  const state = tempState(t);
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  writeFileSync(join(state, 'heads.json'), JSON.stringify({ 'example-org/example-repo#7': { sha: head, at: at('09:00') } }));
+  const pr = fixture();
+  Object.assign(pr, { headRefName: 'feat', headRefOid: head, mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE' });
+  const requested = JSON.parse(JSON.stringify(pr));
+  pr.comments.nodes = [];
+  fakeGh(t, r.dir, pr);
+  const ran = join(r.dir, 'ran');
+  const ready = () => spawnSync(process.execPath, [PRLOOP, 'ready', '7', '--repo', 'example-org/example-repo', '--gate', `touch "${ran}"`, '--review-before-gate', 'true'],
+    { cwd: r.work, encoding: 'utf8', env: { ...process.env, PRLOOP_LOCK_TOKEN: '', PRLOOP_GATE_WEIGHT: 'light', PRLOOP_MAX_LOAD: '100000', PRLOOP_MIN_FREE_MEM: '1K', PRLOOP_TIMEOUT: '99999h', PRLOOP_ACK_TIMEOUT: '99999h' } });
+  let res = ready();
+  assert.equal(res.status, 0, res.stdout);
+  assert.deepEqual(pick(JSON.parse(res.stdout), ['ready', 'gate']), { ready: true, gate: 'deferred' });
+  assert.equal(existsSync(ran), false); // requested first
+  writeFileSync(join(r.dir, 'pr.json'), JSON.stringify({ data: { viewer: { login: 'example-dev' }, repository: { mergeCommitAllowed: true, squashMergeAllowed: true, rebaseMergeAllowed: true, pullRequest: requested } } }));
+  res = ready();
+  assert.equal(res.status, 50, res.stdout); // the request is pending, so not ready for another one
+  assert.deepEqual(pick(JSON.parse(res.stdout), ['ready', 'gate']), { ready: false, gate: 'passed' });
+  assert.equal(existsSync(ran), true);
+  assert.equal(gatePassed(`touch "${ran}"`, r.work), head);
+});
+
+// A requested, pending PR under pipelined review: `run` gates the head itself while the review runs.
+async function runPipelined(t, gate, { clean = false } = {}) {
+  const state = tempState(t);
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  writeFileSync(join(state, 'heads.json'), JSON.stringify({ 'example-org/example-repo#7': { sha: head, at: at('09:00') } }));
+  const pr = fixture();
+  Object.assign(pr, { headRefName: 'feat', headRefOid: head, mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE' });
+  if (clean) request(pr).reactions.nodes.push({ content: 'THUMBS_UP', createdAt: at('10:20'), user: BOT });
+  const calls = fakeGh(t, r.dir, pr);
+  const [res] = await runAll({ repo: 'example-org/example-repo', pr: '7', worktree: r.work, deadline: '1h' },
+    { ...cfg, agent: 'none', interval: 1, timeout: 1e12, ackTimeout: 1e12, gate: gate(r), gateCost: 0, reviewBeforeGate: true }, { metrics: idle().metrics });
+  return { res, r, head, calls };
+}
+
+test('pipelined run: prloop gates the clean head itself, and a clean review plus a passed gate on that head finish it', async (t) => {
+  const { res, r, head, calls } = await runPipelined(t, (r) => `touch "${r.dir}/ran"`, { clean: true });
+  assert.equal(res.verdict, 'clean', JSON.stringify(res));
+  assert.equal(existsSync(join(r.dir, 'ran')), true);
+  assert.equal(gatePassed(`touch "${r.dir}/ran"`, r.work), head);
+  assert.ok(calls().every((c) => c.startsWith('api graphql')));
+});
+
+test('pipelined run: a gate failure on the requested head goes to a fix agent with the gate output', async (t) => {
+  const { res } = await runPipelined(t, () => 'echo FAIL test_retry; exit 1');
+  assert.equal(res.verdict, 'gate_failed', JSON.stringify(res)); // --agent none: the prompt is handed back
+  assert.match(res.prompt, /Trigger: gate_failed/);
+  assert.match(res.prompt, /The full gate failed on head [0-9a-f]{40}; its last lines:\nFAIL test_retry/);
+});
+
+test('run linearizes once and retries when GitHub refuses a rebase merge of a clean PR', async (t) => {
+  const state = tempState(t);
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.commit('feature', { 'app.txt': 'feature\n' });
+  divergeOnMain(r, { 'other.txt': 'base\n' });
+  r.run(r.work, 'merge', '-q', '--no-edit', 'main'); // a merge commit GitHub will not rebase-merge
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  markTested(head, r.work);
+  writeFileSync(join(state, 'heads.json'), JSON.stringify({ 'example-org/example-repo#7': { sha: head, at: at('09:00') } }));
+  const pr = fixture();
+  Object.assign(pr, { headRefName: 'feat', headRefOid: head, mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE' });
+  request(pr).reactions.nodes.push({ content: 'THUMBS_UP', createdAt: at('10:20'), user: BOT });
+  const calls = fakeGh(t, r.dir, pr);
+  // The first merge is refused.
+  const gh = join(r.dir, 'bin', 'gh');
+  writeFileSync(gh, readFileSync(gh, 'utf8').replace('"pr merge") ', `"pr merge") if [ ! -e "${r.dir}/refused" ]; then touch "${r.dir}/refused"; echo "Merge commits are not allowed on this branch" >&2; exit 1; fi; `));
+  const runP = runAll({ repo: 'example-org/example-repo', pr: '7', worktree: r.work, merge: 'rebase', deadline: '1h' }, { ...cfg, agent: 'none', interval: 1 }, { metrics: idle().metrics });
+  for (let i = 0; i < 400 && r.run(r.work, 'rev-parse', 'HEAD') === head; i++) await new Promise((d) => setTimeout(d, 5));
+  const linear = r.run(r.work, 'rev-parse', 'HEAD');
+  const merged = fixture();
+  Object.assign(merged, { headRefName: 'feat', headRefOid: linear, state: 'MERGED', mergeCommit: { oid: 'c'.repeat(40) } });
+  writeFileSync(join(r.dir, 'pr.json'), JSON.stringify({ data: { viewer: { login: 'example-dev' }, repository: { mergeCommitAllowed: true, squashMergeAllowed: true, rebaseMergeAllowed: true, pullRequest: merged } } }));
+  const [res] = await runP;
+  assert.notEqual(linear, head);
+  assert.equal(r.run(r.work, 'rev-list', '--merges', 'origin/main..origin/feat'), ''); // linearized and pushed
+  assert.equal(res.verdict, 'merged', JSON.stringify(res));
+  assert.equal(calls().filter((c) => c.startsWith('pr merge')).length, 1);
+  assert.match(readFileSync(JSON.parse(readFileSync(join(state, 'example-org__example-repo__7.json'), 'utf8')).log, 'utf8'), /"phase":"merge_refused"/);
 });
