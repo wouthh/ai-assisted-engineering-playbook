@@ -2001,6 +2001,20 @@ test('pipelined run: a later pass of the same gate on the head supersedes a reco
   assert.equal(again.verdict, 'clean', JSON.stringify(again));
 });
 
+test('pipelined run: a head that moved away and back is gated afresh, and the state file is owner-only', async (t) => {
+  let ok;
+  const { res, r } = await runPipelined(t, (r) => (ok = join(r.dir, 'ok'), `test -e "${ok}"`), { clean: true });
+  assert.equal(res.verdict, 'gate_failed', JSON.stringify(res));
+  const file = join(process.env.XDG_STATE_HOME, 'prloop', 'example-org__example-repo__7.json');
+  assert.equal(statSync(file).mode & 0o777, 0o600);
+  writeFileSync(ok, '');
+  const st = JSON.parse(readFileSync(file, 'utf8'));
+  writeFileSync(file, JSON.stringify({ ...st, head: '0'.repeat(40) })); // a poll saw another head meanwhile
+  const [again] = await runAll({ repo: 'example-org/example-repo', pr: '7', worktree: r.work, deadline: '1h' },
+    { ...cfg, agent: 'none', interval: 1, timeout: 1e12, ackTimeout: 1e12, gate: `test -e "${ok}"`, gateCost: 0, reviewBeforeGate: true }, { metrics: idle().metrics });
+  assert.equal(again.verdict, 'clean', JSON.stringify(again));
+});
+
 test('run linearizes once and retries when GitHub refuses a rebase merge of a clean PR', async (t) => {
   const state = tempState(t);
   const r = gitRepo();

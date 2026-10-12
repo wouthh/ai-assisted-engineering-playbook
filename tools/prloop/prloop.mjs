@@ -3,7 +3,7 @@
 // Single file, no dependencies. Needs Node 20+, git and an authenticated `gh`.
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { appendFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { availableParallelism, freemem, homedir, loadavg, tmpdir, totalmem } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -1022,7 +1022,9 @@ const saveState = (st) => {
   const disk = loadState(st.repo, st.pr).carry;
   if (disk && !(st.carry?.at >= disk.at)) st.carry = disk;
   mkdirSync(stateDir(), { recursive: true });
-  writeFileSync(statePath(st.repo, st.pr), JSON.stringify(st, null, 2));
+  // Owner-only: the state holds gate output, which may carry a secret the gate printed.
+  writeFileSync(statePath(st.repo, st.pr), JSON.stringify(st, null, 2), { mode: 0o600 });
+  chmodSync(statePath(st.repo, st.pr), 0o600);
 };
 
 // Appends one event to the PR's run log, or to a new log when no run has written this PR yet.
@@ -1385,6 +1387,8 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
       if ((st.failures = (st.failures ?? 0) + 1) >= 3) block(st, `GitHub read failed: ${String(e.stderr || e.message).slice(0, 300)}`);
       return;
     }
+    // A gate failure belongs to the observed head cycle: a head that leaves and later returns is gated afresh.
+    if (st.head !== s.head) st.gateFailure = undefined;
     st.head = s.head;
     if (s.state === 'MERGED') return event(st, 'merged', { mergeCommit: s.mergeCommit });
     if (s.state === 'CLOSED') return block(st, 'the PR is closed');
