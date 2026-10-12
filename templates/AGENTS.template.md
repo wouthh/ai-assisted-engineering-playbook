@@ -88,7 +88,7 @@ Keep `generated` (globs; `linguist-generated` files count too) and `regenerate` 
 6. Post the review request once, reusing the previous request body.
 7. Exit with one JSON line: `{"status":"requested|blocked|nothing_to_do","head":"…","fixed":[…],"disputed":[…],"reason":"…"}`.
 
-A prloop bug, gap or confusing behaviour (wrong status, refused sync, missed review signal, misleading docs): never patch the installed copy and never file an issue in another repository yourself. Put the proposed issue (observed and expected behaviour, a fixture-test idea, no project-specific details) in the exit status `reason`; the coordinator files it in the playbook when authorized.
+A prloop bug, gap or confusing behaviour (wrong status, refused sync, missed review signal, misleading docs): never patch the installed copy and never file an issue in another repository yourself. Put the proposed issue (observed and expected behaviour, a fixture-test idea, no project-specific details) in the exit status `reason` (prloop logs it as an `agent_reason` event); the coordinator files it in the playbook when authorized.
 
 Never wait for or poll reviews, merge, touch other PRs, rewrite history except through `prloop sync`, or retry in a loop. A permission denial or missing tool means stop as blocked.
 
