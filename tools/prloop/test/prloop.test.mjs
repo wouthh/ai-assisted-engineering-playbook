@@ -699,6 +699,46 @@ for (const settings of [{ merge: true, squash: true }, { merge: false, squash: f
   });
 }
 
+test('sync (merge) fails closed when a PR merge commit renamed a union file and recreated it', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.commit('feature', { 'log.csv': 'id\na\nY\n' });
+  r.run(r.work, 'switch', '-qc', 'side');
+  r.commit('side', { 'app.txt': 'side\n' });
+  r.run(r.work, 'switch', '-q', 'feat');
+  r.run(r.work, 'merge', '-q', '--no-ff', '--no-commit', 'side');
+  r.run(r.work, 'mv', 'log.csv', 'renamed.csv');
+  r.commit('merge side, rename and recreate', { 'renamed.csv': 'id\na\nY\nZ\n', 'log.csv': 'other\nunrelated\n' });
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  divergeOnMain(r, { 'log.csv': 'id\na\nX\n' });
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true, squash: true }, union: ['*.csv'] });
+  assert.equal(v.verdict, 'error', JSON.stringify(v));
+  assert.match(v.error, /renamed or deleted and then recreated/);
+  assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
+});
+
+test('sync fails closed when a union file whose name ends with a space was renamed and recreated', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  // z.csv conflicts too, so the spaced path is not the last line of git's (trimmed) conflict listing.
+  r.run(r.work, 'switch', '-q', 'main');
+  r.commit('spaced', { 'log.csv ': 'id\na\n', 'z.csv': 'id\n' });
+  r.run(r.work, 'push', '-q', 'origin', 'main');
+  r.run(r.work, 'switch', '-q', 'feat');
+  r.run(r.work, 'merge', '-q', '--ff-only', 'main');
+  r.commit('feature', { 'log.csv ': 'id\na\nY\n', 'z.csv': 'id\nY\n' });
+  r.run(r.work, 'mv', 'log.csv ', 'renamed.csv');
+  r.commit('rename and recreate', { 'renamed.csv': 'id\na\nY\nZ\n', 'log.csv ': 'other\nunrelated\n' });
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  divergeOnMain(r, { 'log.csv ': 'id\na\nX\n', 'z.csv': 'id\nX\n' });
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true, squash: true }, union: ['*.csv', '*.csv '] });
+  assert.equal(v.verdict, 'error', JSON.stringify(v));
+  assert.match(v.error, /renamed or deleted and then recreated/);
+  assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
+});
+
 test('sync --continue never writes a final union file through a symlink a later commit made', (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
