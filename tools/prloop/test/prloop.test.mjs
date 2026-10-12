@@ -358,8 +358,8 @@ test('durations and globs', () => {
 });
 
 test('the final union result keeps both sides\' end states and adds no line that neither had', () => {
-  // The PR removed b and added X; the base removed c and added Y; a duplicate both sides kept stays.
-  assert.equal(unionResult('a\nb\nc\nd\nd\n', 'a\nb\nd\nd\nY\n', 'a\nc\nd\nd\nX\n'), 'a\nd\nd\nY\nX\n');
+  // The PR removed b and added X; the base removed c and added Y; lines repeated in either end state are kept once.
+  assert.equal(unionResult('a\nb\nc\nd\nd\n', 'a\nb\nd\nd\nY\n', 'a\nc\nd\nd\nX\n\nX\n'), 'a\nd\nY\nX\n');
   assert.equal(unionResult('', '', ''), '');
 });
 
@@ -607,6 +607,8 @@ for (const settings of [{ merge: true, squash: true }, { merge: false, squash: f
     r.commit('feature app', { 'app.txt': 'feature\n' });
     r.run(r.work, 'push', '-q', 'origin', 'feat');
     divergeOnMain(r, { 'log.csv': 'id\na\nX\nb\n', 'app.txt': 'base\n' });
+    // A stale origin/main: the first sync fetches it after starting, and must save the union files under the fetched base.
+    r.run(r.work, 'update-ref', 'refs/remotes/origin/main', 'origin/main~1');
     const head = r.run(r.work, 'rev-parse', 'HEAD');
     const args = { cwd: r.work, branch: 'feat', base: 'main', head, settings, union: ['*.csv'], resume: true };
     let v = syncBranch(args);
