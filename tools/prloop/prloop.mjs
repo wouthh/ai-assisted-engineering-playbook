@@ -268,18 +268,13 @@ export function classify(pr, cfg, nowMs = Date.now()) {
 
   // A requested review reacts on the request, or on the PR body after the request. Without a request, PR-body reactions
   // count only once the bot has started (👀) after this head, so a late 👍 from a review of the previous head cannot clear this one.
-  // PR-body reactions carry no commit or request: with a request, a body 👍 counts only after this cycle's 👀, or when no
-  // earlier review cycle exists (no older request, no earlier bot reaction on the PR body, full comment and reaction history seen)
-  // that could finish late.
+  // PR-body reactions carry no commit or request: with a request, a body 👍 counts only after this cycle's 👀. The absence of
+  // an earlier visible signal proves nothing: a previous head's automatic review may send its first reaction after the request.
   const bodyReactions = (pr.reactions?.nodes ?? []).filter((r) => isBot(r) && r.createdAt >= headTime);
   // A PR-body 👀 from before the current request belongs to an earlier cycle and cannot acknowledge this one.
   const ackAt = [...(current ? triggerNode.reactions.nodes : []), ...bodyReactions].filter((r) => r.createdAt >= since)
     .filter((r) => isBot(r) && r.content === 'EYES').map((r) => r.createdAt).sort()[0];
-  const earlierCycle = !current || pr.comments.pageInfo?.hasPreviousPage || pr.reactions?.pageInfo?.hasPreviousPage
-    || pr.comments.nodes.some((c) => !isBot(c) && c.createdAt < triggerNode.createdAt && c.body.toLowerCase().includes(cfg.trigger.toLowerCase()))
-    // Any bot PR-body reaction before this request (even after the head) may belong to an automatic review still running.
-    || (pr.reactions?.nodes ?? []).some((r) => isBot(r) && r.createdAt < since);
-  const bodyOk = (r) => r.content === 'EYES' || !earlierCycle || (!!ackAt && r.createdAt >= ackAt);
+  const bodyOk = (r) => r.content === 'EYES' || (!!ackAt && r.createdAt >= ackAt);
   const reactions = current ? [...triggerNode.reactions.nodes, ...bodyReactions.filter(bodyOk)]
     : bodyReactions.some((r) => r.content === 'EYES') ? bodyReactions : [];
   const signals = reactions
@@ -297,9 +292,9 @@ export function classify(pr, cfg, nowMs = Date.now()) {
     ...botComments.map((c) => ({ at: c.createdAt, body: c.body, local: trusted(c), acked: !!ackAt && c.createdAt >= ackAt,
       named: /Reviewed commit:\W*([0-9a-f]{7,40})/i.exec(c.body)?.[1] }))]
     .filter((s) => s.body);
-  // Without an acknowledgement, a clean comment after the current request counts when it names this head, or names no
-  // commit while no earlier review cycle exists that could finish late. A comment naming another commit never clears this head.
-  const cleanOk = (s) => (s.named ? head.startsWith(s.named.toLowerCase()) && (s.acked || current) : s.acked || !earlierCycle);
+  // Without an acknowledgement, a clean comment after the current request counts only when it names this head.
+  // A comment naming another commit never clears this head.
+  const cleanOk = (s) => (s.named ? head.startsWith(s.named.toLowerCase()) && (s.acked || current) : s.acked);
   for (const s of summaries) {
     if (s.local ? s.body.includes(localCleanBody(head)) : cleanOk(s) && cfg.clean.test(s.body)) signals.push({ at: s.at, state: 'clean' });
     else if (!s.local && s.acked && cfg.unavailable.test(s.body)) signals.push({ at: s.at, state: 'unavailable' });
