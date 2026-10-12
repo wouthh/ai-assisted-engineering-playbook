@@ -96,13 +96,14 @@ test('without eyes, a clean comment naming the head clears it but a PR-body thum
   assert.equal(classify(cleanWithoutAck('2603924'), cfg, AFTER).verdict, 'clean'); // the comment names this head
 });
 
-test('a PR-body thumbs-up after a new request counts only after this cycle\'s eyes when an earlier cycle exists', () => {
+test('a PR-body thumbs-up after a new request never clears it, even after this cycle\'s eyes', () => {
   const pr = cleanWithoutAck('2603924');
   pr.comments.nodes.pop(); // only the PR-body reaction answers; IC_old's review could still finish late
   pr.reactions.nodes.push({ content: 'THUMBS_UP', createdAt: '2026-01-01T22:06:11Z', user: BOT });
   assert.equal(classify(pr, cfg, AFTER).reviewerState.state, 'none'); // a late 👍 from the earlier cycle must not clear this head
   request(pr).reactions.nodes.push({ content: 'EYES', createdAt: '2026-01-01T22:04:00Z', user: BOT });
-  assert.equal(classify(pr, cfg, AFTER).verdict, 'clean'); // this cycle acknowledged before the 👍
+  // Acknowledging this request does not bind a later PR-body 👍 to it: the earlier review may still post it.
+  assert.equal(classify(pr, cfg, AFTER).reviewerState.state, 'reviewing');
 });
 
 test('a PR-body eyes from before the current request does not let a late thumbs-up clear the new head', () => {
@@ -110,7 +111,7 @@ test('a PR-body eyes from before the current request does not let a late thumbs-
   pr.reactions = { nodes: [{ content: 'EYES', createdAt: at('10:02'), user: BOT }, { content: 'THUMBS_UP', createdAt: at('10:06'), user: BOT }] };
   assert.equal(classify(pr, cfg, NOW).reviewerState.state, 'none'); // both belong to IC_old's review
   pr.reactions.nodes.push({ content: 'EYES', createdAt: at('10:05'), user: BOT }, { content: 'THUMBS_UP', createdAt: at('10:07'), user: BOT });
-  assert.equal(classify(pr, cfg, Date.parse(at('10:08'))).verdict, 'clean'); // this cycle's eyes, then thumbs-up
+  assert.equal(classify(pr, cfg, Date.parse(at('10:08'))).reviewerState.state, 'reviewing'); // a body 👍 never clears a request
 });
 
 test('a PR-body eyes after the head but before the request marks an earlier cycle even without an older request', () => {
@@ -1728,12 +1729,15 @@ test('status reports tested from the configured gate, not from another gate\'s m
   const pr = fixture();
   Object.assign(pr, { headRefName: 'feat', headRefOid: head });
   fakeGh(t, r.dir, pr);
-  const status = (gate) => JSON.parse(spawnSync(process.execPath, [PRLOOP, 'status', '7', '--repo', 'example-org/example-repo', ...gate],
-    { cwd: r.work, encoding: 'utf8', env: { ...process.env, PRLOOP_LOCK_TOKEN: '', PRLOOP_GATE: '' } }).stdout);
+  const status = (gate, cwd = r.work) => JSON.parse(spawnSync(process.execPath, [PRLOOP, 'status', '7', '--repo', 'example-org/example-repo', ...gate],
+    { cwd, encoding: 'utf8', env: { ...process.env, PRLOOP_LOCK_TOKEN: '', PRLOOP_GATE: '' } }).stdout);
   assert.equal(status([]).tested, true);
   const s = status(['--gate', 'true']);
   assert.equal(s.tested, false);
   assert.ok(s.reasons.some((m) => m.includes('not marked tested')));
+  const outside = mkdtempSync(join(tmpdir(), 'prloop-nogit-'));
+  t.after(() => rmSync(outside, { recursive: true, force: true }));
+  assert.equal(status(['--gate', 'true'], outside).tested, false); // no checkout: a remote status, not a git error
 });
 
 test('a standalone sync holds the worktree lock for its whole run unless its token already owns it', (t) => {
