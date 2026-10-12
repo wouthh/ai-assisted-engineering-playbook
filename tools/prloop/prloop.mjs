@@ -1253,13 +1253,13 @@ function withStateLock(repo, pr, fn) {
 }
 export const saveState = (st) => withStateLock(st.repo, st.pr, () => writeState(st));
 // `prloop sync` may record a carry-over, and an agent's `prloop ready` a gate run, while a run holds this PR's state in
-// memory: the newer carry and the newer gate run win. A merged or closed phase that `run --status` recorded after this
-// copy was loaded wins too, so a late agent or gate result of that run cannot report the PR as blocked again.
+// memory: the newer carry and the newer gate run win. A phase that `run --status` reconciled (merged, closed or reopened)
+// after this copy was loaded wins too, so a late agent or gate result of that run cannot report the PR as blocked again.
 const writeState = (st) => {
   const disk = loadState(st.repo, st.pr);
   if (disk.carry && !(st.carry?.at >= disk.carry.at)) st.carry = disk.carry;
   if (disk.lastGate && !(st.lastGate?.end >= disk.lastGate.end)) st.lastGate = disk.lastGate;
-  if (disk.reconciledAt && disk.reconciledAt !== st.reconciledAt) for (const k of ['phase', 'reason', 'next', 'reconciledAt']) st[k] = disk[k];
+  if (disk.reconciledAt && !(st.reconciledAt >= disk.reconciledAt)) for (const k of ['phase', 'reason', 'next', 'reconciledAt']) st[k] = disk[k];
   mkdirSync(stateDir(), { recursive: true });
   // Owner-only, like the logs it points to.
   writeFileSync(statePath(st.repo, st.pr), JSON.stringify(st, null, 2), { mode: 0o600 });
@@ -1792,13 +1792,14 @@ export function runStatus(repoFilter, last = 5) {
 
 // Marks state files of PRs that GitHub reports merged or closed (for example merged by hand outside a run) as
 // `merged` or `closed`, with one GitHub call per repository; open PRs, live blockers included, stay as they are.
+// A closed PR can be reopened, so it stays a candidate: reopened, it gets back the phase it had before it closed.
 // Best effort: a failed read leaves that repository's states unchanged.
 export function reconcileStates(repoFilter, skip = []) {
   const dir = stateDir();
   const byRepo = new Map();
   for (const f of existsSync(dir) ? readdirSync(dir).filter((x) => /__\d+\.json$/.test(x)) : []) {
     let st; try { st = JSON.parse(readFileSync(join(dir, f), 'utf8')); } catch { continue; }
-    if (!st.repo || !Number.isInteger(st.pr) || ['merged', 'closed'].includes(st.phase) || skip.includes(st.pr) || (repoFilter && st.repo !== repoFilter)) continue;
+    if (!st.repo || !Number.isInteger(st.pr) || st.phase === 'merged' || skip.includes(st.pr) || (repoFilter && st.repo !== repoFilter)) continue;
     byRepo.set(st.repo, [...(byRepo.get(st.repo) ?? []), st]);
   }
   for (const [repo, states] of byRepo) {
@@ -1809,15 +1810,24 @@ export function reconcileStates(repoFilter, skip = []) {
       r = JSON.parse(ghRetry(['api', 'graphql', '-f', `query=${q}`, '-F', `owner=${owner}`, '-F', `name=${name}`])).data.repository;
     } catch { continue; }
     for (const st of states) {
-      const phase = { MERGED: 'merged', CLOSED: 'closed' }[r?.[`p${st.pr}`]?.state];
-      if (!phase) continue;
+      const gh = r?.[`p${st.pr}`]?.state;
+      const phase = { MERGED: 'merged', CLOSED: 'closed' }[gh];
+      if (!phase && !(gh === 'OPEN' && st.phase === 'closed')) continue;
       // One locked read-modify-write: a running supervisor may save newer rounds, findings or usage meanwhile.
       withStateLock(repo, st.pr, () => {
         const fresh = { ...loadState(repo, st.pr), repo, pr: st.pr };
-        if (['merged', 'closed'].includes(fresh.phase)) return;
-        const reason = `the PR was ${phase} on GitHub`;
         const at = new Date().toISOString();
-        Object.assign(fresh, { phase, reason, next: undefined, updatedAt: at, reconciledAt: at });
+        if (!phase) {
+          if (fresh.phase !== 'closed') return;
+          const back = fresh.beforeClose ?? { phase: 'reopened', reason: 'the PR was reopened on GitHub' };
+          Object.assign(fresh, { phase: back.phase, reason: back.reason, next: back.next, beforeClose: undefined, updatedAt: at, reconciledAt: at });
+          logEvent(fresh, { phase: fresh.phase, reason: 'the PR was reopened on GitHub' });
+          return writeState(fresh);
+        }
+        if (['merged', 'closed'].includes(fresh.phase) && !(phase === 'merged' && fresh.phase === 'closed')) return;
+        const reason = `the PR was ${phase} on GitHub`;
+        const beforeClose = phase === 'closed' ? pick(fresh, ['phase', 'reason', 'next']) : undefined;
+        Object.assign(fresh, { phase, reason, next: undefined, beforeClose, updatedAt: at, reconciledAt: at });
         logEvent(fresh, { phase, reason });
         writeState(fresh);
       });
