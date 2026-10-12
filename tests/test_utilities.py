@@ -1829,5 +1829,11 @@ class GuidanceConsistencyTests(unittest.TestCase):
                 self.assertIn("Never supervise it through a detached process plus a `pgrep -f` watcher", text)
                 self.assertIn("clear that PR's state file before rerunning, instead of spending `prloop reset-rounds`", text)
 
+    def test_gate_tmpdir_scope_matches_across_guidance(self) -> None:
+        for path in ("docs/review-wait-loop.md", "templates/AGENTS.template.md", "tools/prloop/README.md"):
+            with self.subTest(path=path):
+                text = (ROOT / path).read_text(encoding="utf-8")
+                self.assertRegex(text, r"gates?, fix agents? and local reviews?")
+
 if __name__ == "__main__":
     unittest.main()
