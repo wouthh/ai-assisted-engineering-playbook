@@ -1083,9 +1083,18 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
         const added = [], changed = [];
         for (let i = 0; i + 1 < t.length; i += 2) if (t[i] === 'A') added.push(t[i + 1]); else if (t[i] === 'M') changed.push(t[i + 1]);
         for (const f of changed.filter((f) => unioned.has(f) && !moved.has(f))) {
-          const kept = new Set((show(c, f) ?? '').split('\n'));
-          const lost = (show(p, f) ?? '').split('\n').filter((l) => l.trim() && !kept.has(l));
-          if (lost.length && added.some((a) => { const s = new Set((show(c, a) ?? '').split('\n')); return lost.some((l) => s.has(l)); })) moved.add(f);
+          // An unreadable blob (git failed, or it exceeds the output buffer) fails closed instead of reading as empty.
+          const after = show(c, f), before = show(p, f);
+          if (after === null || before === null) return fail(`reading union file ${f} in ${short(c)} failed; merge ${base} by hand`);
+          const kept = new Set(after.split('\n'));
+          const lost = before.split('\n').filter((l) => l.trim() && !kept.has(l));
+          if (!lost.length) continue;
+          for (const a of added) {
+            const blob = show(c, a);
+            if (blob === null) return fail(`reading ${a} in ${short(c)} failed; merge ${base} by hand`);
+            const s = new Set(blob.split('\n'));
+            if (lost.some((l) => s.has(l))) { moved.add(f); break; }
+          }
         }
       }
     }
