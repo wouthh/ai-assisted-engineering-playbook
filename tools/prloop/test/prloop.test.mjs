@@ -744,6 +744,21 @@ test('sync refuses a base ref that lacks the PR base commit', (t) => {
   assert.match(v.error, /does not contain the PR base commit/);
 });
 
+test('sync fetches the base into its remote-tracking ref in a single-branch clone', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.commit('feature', { 'app.txt': 'feature\n' });
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  r.run(r.work, 'config', 'remote.origin.fetch', '+refs/heads/feat:refs/remotes/origin/feat');
+  divergeOnMain(r, { 'other.txt': 'main\n' });
+  const main = r.run(r.work, 'rev-parse', 'main');
+  r.run(r.work, 'update-ref', 'refs/remotes/origin/main', `${main}~1`); // a stale tracking ref
+  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', baseOid: main, head, settings: { merge: true } });
+  assert.notEqual(v.verdict, 'error', JSON.stringify(v));
+  assert.equal(r.run(r.work, 'rev-parse', 'origin/main'), main);
+});
+
 test('ready runs the gate: a failure returns the tail, a pass marks the head tested', async (t) => {
   tempState(t);
   const r = gitRepo();
@@ -1825,7 +1840,8 @@ test('the fix prompt follows pipelined review and carries a gate failure', () =>
   const t = { trigger: 'gate_failed', pr: 7, repo: 'o/r', branch: 'b', head: 'h', cwd: '/w', gate: 'make check', reviewBeforeGate: true, missing: ['x'],
     gateFailure: { head: 'h', log: '/state/gate.log' }, requestBody: '@codex review' };
   const p = buildPrompt(t);
-  assert.match(p, /The full gate failed on head h; its last lines are in the owner-only local log \/state\/gate\.log/);
+  assert.match(p, /The full gate failed on head h; rerun its steps locally/);
+  assert.doesNotMatch(p, /gate\.log/); // the agent reads referenced files, and the log may hold a secret
   assert.match(p, /requests the review first and prloop runs the full gate \(make check\) in parallel/);
   assert.match(buildPrompt({ ...t, localReview: true }), /prloop ready 7 --repo o\/r --review-before-gate false` runs the gate/);
 });
@@ -2009,9 +2025,10 @@ test('pipelined run: a gate failure on the requested head goes to a fix agent wi
   const { res } = await runPipelined(t, () => 'echo FAIL test_$((6*7)); exit 1');
   assert.equal(res.verdict, 'gate_failed', JSON.stringify(res)); // --agent none: the prompt is handed back
   assert.match(res.prompt, /Trigger: gate_failed/);
-  // The output may hold a secret: it stays in an owner-only local log, out of the agent prompt.
+  // The output may hold a secret: it stays in an owner-only local log, and neither it nor its path reaches the prompt.
   assert.doesNotMatch(res.prompt, /FAIL test_42/);
-  const log = res.prompt.match(/owner-only local log (\S+)/)[1];
+  const { log } = JSON.parse(readFileSync(join(process.env.XDG_STATE_HOME, 'prloop', 'example-org__example-repo__7.json'), 'utf8')).gateFailure;
+  assert.ok(!res.prompt.includes(log));
   assert.match(readFileSync(log, 'utf8'), /FAIL test_42/);
   assert.equal(statSync(log).mode & 0o777, 0o600);
 });
