@@ -207,9 +207,11 @@ export function config(opts, env = process.env, { machine = {}, repo = {} } = {}
     mode,
     // Anchored: any account whose login merely contains the bot's name could otherwise approve.
     reviewer: new RegExp(opts.reviewerLogin ?? env.PRLOOP_REVIEWER_LOGIN ?? '^chatgpt-codex-connector(\\[bot\\])?$', 'i'),
-    // Phrasings seen from the Codex connector when it cannot review.
+    // Phrasings seen from the Codex connector when it cannot review ("You have reached your Codex usage limits for code
+    // reviews."). Quota words alone are not enough: ordinary review text may discuss quotas or limits.
     unavailable: new RegExp(opts.unavailableRegex ?? env.PRLOOP_UNAVAILABLE_REGEX
-      ?? 'reached your .*usage limits|couldn.t complete this request|unable to review|quota', 'i'),
+      ?? 'reached (?:your|the) [\\w ]{0,40}?(?:usage limit|quota)|(?:exceeded|out of|used up) (?:your|the) [\\w ]{0,40}?(?:usage|quota)'
+        + '|usage limits? (?:has been |have been )?(?:reached|exceeded)|couldn.t complete this request|unable to review', 'i'),
     maxLocal: Number(maxLocal),
     agent,
     model: opts.model ?? env.PRLOOP_MODEL,
@@ -373,7 +375,13 @@ export function classify(pr, cfg, nowMs = Date.now()) {
   const cleanOk = (s) => (s.named ? namesHead(s.named.toLowerCase(), head, cfg) && (s.acked || current) : s.acked);
   for (const s of summaries) {
     if (s.local ? s.body.includes(localCleanBody(head)) : cleanOk(s) && cfg.clean.test(s.body)) signals.push({ at: s.at, state: 'clean' });
-    else if (!s.local && s.acked && cfg.unavailable.test(s.body)) signals.push({ at: s.at, state: 'unavailable' });
+  }
+  // The bot answers a request (or its automatic review of this head) it cannot run with a plain reply and no 👀, so an
+  // unavailable reply after the request, or after the head without one, counts unacknowledged. At worst a late reply
+  // about an earlier cycle costs one local review of this head, which is a real review.
+  for (const n of [...pr.comments.nodes, ...botReviews]) {
+    const when = n.createdAt ?? n.submittedAt;
+    if (isBot(n) && !trusted(n) && when >= since && n.body && cfg.unavailable.test(n.body)) signals.push({ at: when, state: 'unavailable' });
   }
   const newFindings = threads.filter((t) => t.fromReviewer && t.createdAt >= since);
   // A local review whose findings could not be anchored inline carries them in its body.
