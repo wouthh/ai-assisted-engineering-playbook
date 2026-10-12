@@ -636,7 +636,7 @@ export function localGate(s, cwd, gate) {
     const local = git(['rev-parse', 'HEAD'], cwd);
     if (local !== s.head) reasons.push(`local HEAD ${short(local)} differs from remote PR head ${short(s.head)}: push or pull first`);
   }
-  if (gate ? gatePassed(gate, cwd) !== s.head : !isTested(s.head, cwd)) reasons.push(`head ${short(s.head)} not marked tested: run \`prloop ready --gate "<cmd>"\` (or your gate, then \`prloop mark-tested\`)`);
+  if (gate ? gatePassed(gate, cwd) !== s.head : !isTested(s.head, cwd)) reasons.push(`head ${short(s.head)} not marked tested: run \`prloop ready --gate "<cmd>"\` (or your gate, then \`prloop mark-tested${gate ? ' --gate "<cmd>"' : ''}\`)`);
   return reasons;
 }
 
