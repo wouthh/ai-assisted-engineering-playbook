@@ -14,7 +14,7 @@ const HELP = `prloop - wait for a PR review bot, gate review requests, and super
 
 Recommended: start the supervisor once in the background, check in with --status.
   prloop run --repo owner/name --pr N[,N...] [--gate "<cmd>"] [--max-agents 2] [--max-rounds 6]
-             [--agent claude|codex|none] [--merge rebase|squash|merge] [--worktree <path>]
+             [--agent claude|codex|none] [--merge rebase|squash|merge|repo] [--worktree <path>]
              [--deadline 6h] [--model <m>] [--effort <e>] [--union <glob>]...
   prloop run --status [--repo owner/name]   PR states plus one machine line (load, free memory, gate slots)
   prloop reset-rounds <pr> [--repo owner/name]   one explicit, logged reset of the round counter
@@ -42,12 +42,19 @@ Options (flag or env):
   --interval <dur>          PRLOOP_INTERVAL        default: 75s between polls
   --max-local-reviews <n>   PRLOOP_MAX_LOCAL_REVIEWS  default: 3 per PR
   --agent claude|codex|none PRLOOP_AGENT           fix agent and local reviewer; --model, --effort
-  --agent-timeout <dur>     PRLOOP_AGENT_TIMEOUT   default: 90m; kills the agent, also its foreground command budget
+  --agent-timeout <dur>     PRLOOP_AGENT_TIMEOUT   default: 90m of work (gate queueing not counted); kills the agent
+  --gate-weight <w>         PRLOOP_GATE_WEIGHT     light (skips the slot queue while load allows), heavy, or a slot count
+  --review-before-gate <b>  PRLOOP_REVIEW_BEFORE_GATE  true: request the review first, run the gate in parallel
+                                                   default: true for a declared heavy gate
+
+Per repository: .prloop.json in the repository root may set gate, gateWeight, union, merge (the method
+for --merge repo) and reviewBeforeGate; flags and environment override it.
 
 Self-check: \`run\` and \`ready\` warn when prloop's own checkout is dirty, off its default branch or behind it.
   --require-current         PRLOOP_REQUIRE_CURRENT=1  fail with a usage error instead of warning
 
-Machine resources (on by default; shared by every prloop process of the user):
+Machine resources (on by default; shared by every prloop process of the user; defaults may be set in
+<state dir>/config.json as gateSlots, maxLoad, minFreeMem, resourceWait and gateTmpdir):
   --gate-slots <n>          PRLOOP_GATE_SLOTS      default: 2 gates at once, machine-wide
   --max-load <x>            PRLOOP_MAX_LOAD        default: 0.75 x CPU cores (1-minute load average)
   --min-free-mem <size>     PRLOOP_MIN_FREE_MEM    default: the larger of 4G and 10% of RAM
@@ -128,15 +135,54 @@ const dirty = (cwd) => git(['--no-optional-locks', 'status', '--porcelain', '--u
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const short = (sha) => (sha ?? '').slice(0, 7);
 
-export function config(opts, env = process.env) {
+// Values that one key of a config file may hold; anything else is a usage error, not a silent default.
+const REPO_KEYS = { gate: 'string', gateWeight: 'string|number', union: 'array', merge: 'string', reviewBeforeGate: 'boolean' };
+const MACHINE_KEYS = { gateSlots: 'number|string', maxLoad: 'number|string', minFreeMem: 'number|string', resourceWait: 'string', gateTmpdir: 'string' };
+function readConfigFile(file, keys) {
+  if (!file || !existsSync(file)) return {};
+  let obj;
+  try { obj = JSON.parse(readFileSync(file, 'utf8')); } catch (e) { throw new Error(`${file}: ${e.message}`); }
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) throw new Error(`${file} must hold a JSON object`);
+  for (const [k, v] of Object.entries(obj)) {
+    const type = Array.isArray(v) ? 'array' : typeof v;
+    if (!keys[k]) throw new Error(`${file}: unknown key ${k} (known: ${Object.keys(keys).join(', ')})`);
+    if (!keys[k].split('|').includes(type) || (type === 'array' && !v.every((x) => typeof x === 'string'))) throw new Error(`${file}: ${k} must be ${keys[k]}`);
+  }
+  return obj;
+}
+// One machine-wide setting for every prloop process of the user: gate slots and resource limits.
+export const machineConfig = () => readConfigFile(join(stateDir(), 'config.json'), MACHINE_KEYS);
+// The repository's own declaration of its gate, in the root of the checkout `cwd` belongs to.
+export const repoConfig = (cwd) => { const top = tryGit(['rev-parse', '--show-toplevel'], cwd); return readConfigFile(top && join(top, '.prloop.json'), REPO_KEYS); };
+
+// light (a short gate) costs 0: it skips the slot queue while load and memory allow; heavy or N take 1 or N slots.
+export function gateCost(w) {
+  if (w === undefined || w === 'heavy') return 1;
+  if (w === 'light') return 0;
+  const n = Number(w);
+  if (!(n > 0) || !Number.isFinite(n) || (n >= 1 && !Number.isInteger(n))) throw new Error(`--gate-weight must be light, heavy or a positive slot count, not ${w}`);
+  return n < 1 ? 0 : n;
+}
+
+const bool = (name, v) => {
+  if (v === undefined || typeof v === 'boolean') return v;
+  if (/^(true|1|yes)$/i.test(v)) return true;
+  if (/^(false|0|no)$/i.test(v)) return false;
+  throw new Error(`--${name} must be true or false, not ${v}`);
+};
+
+// Precedence: flag, environment, repository file (.prloop.json), machine file (<state dir>/config.json), default.
+export function config(opts, env = process.env, { machine = {}, repo = {} } = {}) {
   const agent = String(opts.agent ?? env.PRLOOP_AGENT ?? 'claude');
   // Any other value would fall through to the write-enabled Claude agent.
   if (!['claude', 'codex', 'none'].includes(agent)) throw new Error(`--agent must be claude, codex or none, not ${agent}`);
   const maxLocal = String(opts.maxLocalReviews ?? env.PRLOOP_MAX_LOCAL_REVIEWS ?? 3);
   // NaN would make the cap check always false and silently lift it.
   if (!/^\d+$/.test(maxLocal)) throw new Error(`--max-local-reviews must be a nonnegative integer, not ${maxLocal}`);
+  const mode = String(opts.reviewer ?? env.PRLOOP_REVIEWER ?? 'auto');
+  const gateWeight = opts.gateWeight ?? env.PRLOOP_GATE_WEIGHT ?? repo.gateWeight;
   return {
-    mode: String(opts.reviewer ?? env.PRLOOP_REVIEWER ?? 'auto'),
+    mode,
     // Anchored: any account whose login merely contains the bot's name could otherwise approve.
     reviewer: new RegExp(opts.reviewerLogin ?? env.PRLOOP_REVIEWER_LOGIN ?? '^chatgpt-codex-connector(\\[bot\\])?$', 'i'),
     // Phrasings seen from the Codex connector when it cannot review.
@@ -146,7 +192,7 @@ export function config(opts, env = process.env) {
     agent,
     model: opts.model ?? env.PRLOOP_MODEL,
     effort: opts.effort ?? env.PRLOOP_EFFORT,
-    gate: opts.gate ?? env.PRLOOP_GATE,
+    gate: opts.gate ?? env.PRLOOP_GATE ?? repo.gate,
     forceGate: !!opts.forceGate,
     agentTimeout: parseDuration(opts.agentTimeout ?? env.PRLOOP_AGENT_TIMEOUT ?? '90m', 'agent-timeout'),
     trigger: String(opts.trigger ?? env.PRLOOP_TRIGGER ?? '@codex review'),
@@ -157,11 +203,15 @@ export function config(opts, env = process.env) {
     deadline: parseDuration(opts.deadline ?? '6h', 'deadline'),
     maxRounds: positiveInt('max-rounds', opts.maxRounds ?? 6),
     maxAgents: positiveInt('max-agents', opts.maxAgents ?? 2),
-    gateSlots: positiveInt('gate-slots', opts.gateSlots ?? env.PRLOOP_GATE_SLOTS ?? 2),
-    maxLoad: positiveNumber('max-load', opts.maxLoad ?? env.PRLOOP_MAX_LOAD),
-    minFreeMem: parseSize(opts.minFreeMem ?? env.PRLOOP_MIN_FREE_MEM),
-    resourceWait: parseDuration(opts.resourceWait ?? env.PRLOOP_RESOURCE_WAIT ?? '30m', 'resource-wait'),
-    gateTmpdir: (opts.gateTmpdir ?? env.PRLOOP_GATE_TMPDIR) && resolve(opts.gateTmpdir ?? env.PRLOOP_GATE_TMPDIR),
+    gateSlots: positiveInt('gate-slots', opts.gateSlots ?? env.PRLOOP_GATE_SLOTS ?? machine.gateSlots ?? 2),
+    maxLoad: positiveNumber('max-load', opts.maxLoad ?? env.PRLOOP_MAX_LOAD ?? machine.maxLoad),
+    minFreeMem: parseSize(opts.minFreeMem ?? env.PRLOOP_MIN_FREE_MEM ?? machine.minFreeMem),
+    resourceWait: parseDuration(opts.resourceWait ?? env.PRLOOP_RESOURCE_WAIT ?? machine.resourceWait ?? '30m', 'resource-wait'),
+    gateTmpdir: (tmp => tmp && resolve(tmp))(opts.gateTmpdir ?? env.PRLOOP_GATE_TMPDIR ?? machine.gateTmpdir),
+    gateWeight, gateCost: gateCost(gateWeight),
+    // A local review needs the gate first, so --reviewer local always gates before the review.
+    reviewBeforeGate: mode !== 'local' && (bool('review-before-gate', opts.reviewBeforeGate ?? env.PRLOOP_REVIEW_BEFORE_GATE ?? repo.reviewBeforeGate)
+      ?? (gateWeight !== undefined && gateCost(gateWeight) >= 1)),
   };
 }
 
@@ -232,6 +282,11 @@ export const LOCAL = '[local review]';
 const isLocal = (body) => typeof body === 'string' && body.startsWith(LOCAL);
 export const localCleanBody = (head) => `${LOCAL} No issues found on ${head}.`;
 
+// A commit named in a comment is this head only as the full OID, or as an abbreviation that resolves to exactly
+// this one object in the local repository: a bare prefix match could name another commit with the same prefix.
+export const disambiguate = (prefix, cwd) => (tryGit(['rev-parse', `--disambiguate=${prefix}`], cwd) ?? '').split('\n').filter(Boolean);
+const namesHead = (named, head, cfg) => (named.length === 40 ? named === head : (cfg.disambiguate ?? disambiguate)(named).join() === head);
+
 // Classifies one PR snapshot. Rules carried over from the earlier review queue:
 // - only signals newer than the head commit (or the current request) count;
 // - reactions on the request comment and on the PR body both count, and the latest one wins
@@ -293,7 +348,7 @@ export function classify(pr, cfg, nowMs = Date.now()) {
     .filter((s) => s.body);
   // Without an acknowledgement, a clean comment after the current request counts only when it names this head.
   // A comment naming another commit never clears this head.
-  const cleanOk = (s) => (s.named ? head.startsWith(s.named.toLowerCase()) && (s.acked || current) : s.acked);
+  const cleanOk = (s) => (s.named ? namesHead(s.named.toLowerCase(), head, cfg) && (s.acked || current) : s.acked);
   for (const s of summaries) {
     if (s.local ? s.body.includes(localCleanBody(head)) : cleanOk(s) && cfg.clean.test(s.body)) signals.push({ at: s.at, state: 'clean' });
     else if (!s.local && s.acked && cfg.unavailable.test(s.body)) signals.push({ at: s.at, state: 'unavailable' });
@@ -490,11 +545,27 @@ export function lockHolder(cwd, token = process.env.PRLOOP_LOCK_TOKEN) {
 
 export const lockMessage = (cwd, h) => `worktree ${cwd} is locked by prloop process ${h.pid} (${h.purpose ?? 'unknown purpose'}, since ${h.startedAt ?? 'unknown'}): wait until it finishes`;
 
+// `n` distinct slots at once, or none: a gate that needs several backs off fully instead of holding some while it waits.
+export function acquireSlots(dir, slots, n = 1) {
+  const got = [];
+  for (let r; got.length < Math.min(n, slots); got.push(r)) if (!(r = acquireSlot(dir, slots))) { got.forEach((f) => f()); return null; }
+  return Object.assign(() => got.forEach((f) => f()), { adopt: (pid) => got.forEach((f) => f.adopt(pid)) });
+}
+
+// While a `prloop ready` started by a fix agent waits for its gate (key lock, resources, slot), the agent is queued, not
+// working: `run` passes PRLOOP_QUEUE_FILE and stops that agent's --agent-timeout clock while the file names a live process.
+export function markQueued(on, file = process.env.PRLOOP_QUEUE_FILE) {
+  if (!file) return;
+  if (on) writeFileSync(file, String(process.pid)); else rmSync(file, { force: true });
+}
+const queuedNow = (file) => { try { return alive(Number(readFileSync(file, 'utf8'))); } catch { return false; } };
+
 export const slotsInUse = (dir) => {
   try { return new Set(readdirSync(dir).flatMap((f) => { const m = /^slot-(\d+)\.(\d+)\.\d+$/.exec(f); return m && slotClaimAlive(join(dir, f), Number(m[2])) ? [m[1]] : []; })).size; } catch { return 0; }
 };
 
-// Runs `gate` after admission, holding a machine-wide slot, optionally with a private TMPDIR that is removed
+// Runs `gate` after admission, holding machine-wide slots (cfg.gateCost; a light gate, cost 0, takes none while load
+// and memory allow, so a short gate never queues behind long ones), optionally with a private TMPDIR that is removed
 // afterwards (a full test suite can fill a small tmpfs /tmp). Admission is rechecked on every slot poll, so a
 // gate never starts on a machine that became busy while it waited. The slot claim adopts the gate shell, so the
 // slot stays taken while a gate whose prloop was killed still runs. Returns { status, stdout, stderr }.
@@ -502,12 +573,17 @@ export async function runGate(gate, cwd, cfg, deps = {}) {
   const { dir = slotDir(), pause = sleep, log = logStderr } = deps;
   const w = {};
   let release, logged = false;
+  const cost = cfg.gateCost ?? 1;
   for (;;) {
-    const slots = (await admit(cfg, deps, w)) === 'expired' ? 1 : cfg.gateSlots;
-    if ((release = acquireSlot(dir, slots))) break;
+    const admitted = await admit(cfg, deps, w);
+    // After an expired resource wait even a light gate takes the one slot, like any other gate.
+    if (cost === 0 && admitted === 'ok') { release = Object.assign(() => {}, { adopt() {} }); break; }
+    const slots = admitted === 'expired' ? 1 : cfg.gateSlots;
+    if ((release = acquireSlots(dir, slots, Math.max(1, cost)))) break;
     if (!logged) { logged = true; log({ event: 'waiting_for_gate_slot', slots, inUse: slotsInUse(dir) }); }
     await pause(SLOT_POLL);
   }
+  deps.admitted?.();
   let tmp;
   try {
     const env = { ...process.env };
@@ -589,13 +665,18 @@ function forgetGatePass(key) {
 // when nothing ran. `deps` injects the machine metrics, slot directory, clock and logger (see runGate).
 export async function readyGate(s, cfg, cwd, deps = {}) {
   if (!cfg.gate || localGate(s, cwd).some((r) => !r.includes('not marked tested'))) return null;
+  // Pipelined review: a head that still needs a review request is requested first; the gate runs once the request
+  // is posted (or the head is already reviewed), in parallel with the review.
+  if (cfg.reviewBeforeGate && s.readyToRequest && !cfg.forceGate && gatePassed(cfg.gate, cwd) !== s.head) return { ok: true, deferred: true };
   // Only an exact cached pass of this command on this head skips the gate: a marker left by another gate never does.
   const key = gateKey(cfg.gate, cwd);
-  const release = key ? await gateKeyLock(key, deps.pause ?? sleep) : () => {};
+  markQueued(true);
+  let release = () => {};
   try {
+    if (key) release = await gateKeyLock(key, deps.pause ?? sleep);
     const cached = !cfg.forceGate && gatePassed(cfg.gate, cwd);
     if (cached) { markTested(s.head, cwd); return { ok: true, cached }; }
-    const r = await runGate(cfg.gate, cwd, cfg, { ...deps, adopt: release.adopt }); // the gate shell keeps the key lock if ready dies
+    const r = await runGate(cfg.gate, cwd, cfg, { ...deps, adopt: release.adopt, admitted: () => markQueued(false) }); // the gate shell keeps the key lock if ready dies
     if (r.status === 0) {
       if (key && gateKey(cfg.gate, cwd) === key) recordGatePass(cfg.gate, cwd, key); // the gate left the tree as it found it
       markTested(s.head, cwd);
@@ -604,7 +685,7 @@ export async function readyGate(s, cfg, cwd, deps = {}) {
     unmarkTested(s.head, cwd); // a forced rerun that fails withdraws the earlier validation, cached pass included
     forgetGatePass(key);
     return { ok: false, status: r.status, tail: String(r.stdout || r.stderr).trimEnd().split('\n').slice(-60).join('\n') };
-  } finally { release(); }
+  } finally { markQueued(false); release(); }
 }
 
 // Single-flight per gate-cache key: concurrent `ready` runs for the same head and command check, run and record
@@ -695,7 +776,12 @@ export function patchId(cwd, base, head, unioned = []) {
   return text ? sh('git', ['patch-id', '--stable'], { cwd, input: `${text}\n`, stdio: ['pipe', 'pipe', 'pipe'] }).split(' ')[0] || null : null;
 }
 
-export function syncBranch({ cwd, branch, base, baseOid, head, settings, union = [], remote = 'origin' }) {
+// Conflicted files the repository marks generated (`linguist-generated` in .gitattributes): regenerate, don't hand-merge.
+const generatedFiles = (cwd, files) => (files.length ? tryGit(['check-attr', 'linguist-generated', '--', ...files], cwd) ?? '' : '')
+  .split('\n').flatMap((l) => { const m = /^(.*): linguist-generated: (set|true)$/.exec(l); return m ? [m[1]] : []; });
+
+// `rebase` forces a rebase (and linearizing), for `run --merge rebase`; otherwise the repository's merge settings decide.
+export function syncBranch({ cwd, branch, base, baseOid, head, settings, union = [], remote = 'origin', rebase: forceRebase = false }) {
   // A fork PR's branch usually tracks its own remote; push there, not to the base repository.
   const headRemote = tryGit(['config', `branch.${branch}.remote`], cwd) || remote;
   if (tryGit(['branch', '--show-current'], cwd) !== branch) return { verdict: 'error', error: `run sync inside a checkout of ${branch}` };
@@ -704,10 +790,11 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
   if (baseError) return { verdict: 'error', error: baseError };
   tryGit(['fetch', '--quiet', headRemote, branch], cwd);
   if (git(['rev-parse', 'HEAD'], cwd) !== head) return { verdict: 'error', error: `local HEAD differs from remote PR head ${short(head)}: push or pull first` };
-  // Sync to the exact base commit GitHub reports, not to whatever else the remote branch holds.
-  const target = baseOid ?? `${remote}/${base}`;
+  // Sync to the fetched base branch: GitHub's baseRefOid can lag far behind it, and a branch that contains that
+  // commit may still conflict with the real base. fetchBase checked that the fetched branch contains it.
+  const target = `${remote}/${base}`;
   // ponytail: merge whenever merge or squash merges are allowed; rebase only for rebase-only repos.
-  const rebase = !settings.merge && !settings.squash;
+  const rebase = forceRebase || (!settings.merge && !settings.squash);
   // A rebase-only repository refuses a branch with merge commits even when it contains the base: linearize it.
   const merges = rebase && !!git(['rev-list', '--merges', `${target}..HEAD`], cwd);
   const upToDate = tryGit(['merge-base', '--is-ancestor', target, 'HEAD'], cwd) !== null;
@@ -724,7 +811,9 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
     if (!manual.length) conflicted.forEach((f) => unioned.add(f));
     if (manual.length) {
       step([rebase ? 'rebase' : 'merge', '--abort']);
-      return { verdict: 'conflict', conflicts: manual, method: rebase ? 'rebase' : 'merge', next: 'resolve these conflicts by hand, then run your gate and push' };
+      const generated = generatedFiles(cwd, manual);
+      return { verdict: 'conflict', conflicts: manual, generated, method: rebase ? 'rebase' : 'merge',
+        next: `resolve these conflicts by hand${generated.length ? ` (regenerate ${generated.join(', ')} from their sources instead of merging them)` : ''}, then run your gate and push` };
     }
     ok = step(rebase ? ['rebase', '--continue'] : ['commit', '--no-edit']);
   }
@@ -855,14 +944,14 @@ export function localReviewPayload(head, findings, inline = true) {
 }
 
 async function runReviewer(cfg, prompt, cwd, keep) {
-  const dir = mkdtempSync(join(tmpdir(), 'prloop-review-'));
+  const dir = scratch(cfg, 'prloop-review-');
   try {
     if (cfg.agent === 'codex') { // otherwise claude; localReview never gets here with --agent none
       writeFileSync(join(dir, 'schema.json'), JSON.stringify(REVIEW_SCHEMA));
       const r = await spawnAgent('codex', ['exec', '--sandbox', 'read-only', '--output-schema', join(dir, 'schema.json'), '-o', join(dir, 'out.json'),
         ...(cfg.model ? ['-m', cfg.model] : []), ...(cfg.effort ? ['-c', `model_reasoning_effort=${cfg.effort}`] : []), prompt], cwd, cfg);
       keep({ ...r, final: existsSync(join(dir, 'out.json')) ? readFileSync(join(dir, 'out.json'), 'utf8') : r.stdout });
-      if (r.timedOut) throw new Error('agent timed out');
+      if (r.timedOut) throw new Error(timeoutReason(r, cfg));
       if (r.status !== 0) throw new Error(`codex reviewer exited with ${r.status}: ${(r.stderr ?? '').slice(-300)}`);
       return parseReview(readFileSync(join(dir, 'out.json'), 'utf8'));
     }
@@ -870,7 +959,7 @@ async function runReviewer(cfg, prompt, cwd, keep) {
       '--permission-mode', 'dontAsk', '--allowedTools', 'Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git show:*)',
       '--output-format', 'json', '--json-schema', JSON.stringify(REVIEW_SCHEMA)], cwd, cfg);
     keep({ ...r, final: r.stdout });
-    if (r.timedOut) throw new Error('agent timed out');
+    if (r.timedOut) throw new Error(timeoutReason(r, cfg));
     if (r.status !== 0) throw new Error(`claude reviewer exited with ${r.status}: ${(r.stderr ?? '').slice(-300)}`);
     const out = JSON.parse(r.stdout);
     return parseReview(out.structured_output ?? out.result);
@@ -980,20 +1069,24 @@ export const plain = (body) => String(body ?? '').replace(/\n+(AGENTS\.md refere
 
 // The fix agent sees only this trigger, never the round history.
 export function buildPrompt(t) {
-  const data = t.trigger === 'conflict' ? `Conflicted files: ${t.conflicts.join(', ')}`
+  const data = t.trigger === 'conflict' ? `Conflicted files: ${t.conflicts.join(', ')}${t.generated?.length ? `\nGenerated files among them (regenerate them from their sources after resolving the rest, never merge them by hand): ${t.generated.join(', ')}` : ''}`
     : t.findings?.length ? `Findings:\n${t.findings.map((f) => `- ${f.id} ${f.path ?? ''}:${f.line ?? ''} ${plain(f.body).slice(0, 600)}`).join('\n')}`
       : `Missing: ${(t.missing ?? []).join('; ') || 'a review request on the current head'}`;
+  const failure = t.gateFailure ? `\nThe full gate failed on head ${t.gateFailure.head}; its last lines:\n${t.gateFailure.tail.slice(-3000)}` : '';
   const summary = t.summaries?.length ? `\nReviewer summary for this head (may hold findings that are not threads):\n${t.summaries.map(plain).join('\n').slice(0, 1500)}` : '';
   const request = t.localReview
     ? 'Do not post a review request: prloop reviews this PR locally once `prloop ready` passes.'
     : `Post the review request as a new PR comment, reusing exactly:\n${t.requestBody}`;
-  const gate = t.gate
-    ? `\`prloop ready ${t.pr} --repo ${t.repo}\` runs the gate (${t.gate}) and marks the head tested`
-    : `\`prloop ready ${t.pr} --repo ${t.repo} --gate "<the full gate documented in AGENTS.md or README>"\` runs it and marks the head tested`;
+  // A local review needs the gate first, so its agent never defers it.
+  const pipelined = t.reviewBeforeGate && !t.localReview;
+  const ready = `prloop ready ${t.pr} --repo ${t.repo}${t.localReview ? ' --review-before-gate false' : ''}`;
+  const gate = pipelined ? `\`${ready}\` checks that the head may be requested; this repository requests the review first and prloop runs the full gate (${t.gate}) in parallel, so \`ready\` does not run it while the head still needs a request`
+    : t.gate ? `\`${ready}\` runs the gate (${t.gate}) and marks the head tested`
+      : `\`${ready} --gate "<the full gate documented in AGENTS.md or README>"\` runs it and marks the head tested`;
   const minutes = Math.ceil((t.agentTimeout ?? 90 * 6e4) / 6e4);
   return `You are fixing PR #${t.pr} in ${t.repo}, branch ${t.branch}, head ${t.head}, worktree ${t.cwd}.
 Trigger: ${t.trigger}. ${t.note ?? ''}
-${data}${summary}
+${data}${failure}${summary}
 
 Do these steps in order, in this session:
 1. Read only the referenced files plus every AGENTS.md that applies to them (root and nested).
@@ -1088,15 +1181,22 @@ export function pruneAgentLogs(now = Date.now()) {
 // child cannot exhaust the heap; callers use only the tail (failure reports, the agent's final JSON line).
 export const OUTPUT_TAIL = 4 << 20;
 const keepTail = (s) => (s.length > 2 * OUTPUT_TAIL ? s.slice(-OUTPUT_TAIL) : s);
-// With `timeout` the child leads its own process group, and the whole group is killed when the timer fires.
-const spawnAsync = (cmd, args, cwd, { env = process.env, lock, onSpawn = lock?.adopt, timeout } = {}) => new Promise((done) => {
+// With `timeout` the child leads its own process group, and the whole group is killed once it has used up that
+// budget. Time during which `paused()` is true (the agent's gate is queued) does not count.
+const spawnAsync = (cmd, args, cwd, { env = process.env, lock, onSpawn = lock?.adopt, timeout, paused = () => false } = {}) => new Promise((done) => {
   const c = spawn(cmd, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], detached: !!timeout, env: lock?.token ? { ...env, PRLOOP_LOCK_TOKEN: lock.token } : env });
   if (c.pid && onSpawn) onSpawn(c.pid);
-  let timedOut = false;
-  const timer = timeout && c.pid && setTimeout(() => {
+  let timedOut = false, timer, left = timeout, last = Date.now();
+  // ponytail: sampled at least every second, so a queue that starts or ends between samples is off by up to a second.
+  const tick = () => {
+    const t = Date.now();
+    if (!paused()) left -= t - last;
+    last = t;
+    if (left > 0) { timer = setTimeout(tick, Math.min(left, 1000)); return; }
     timedOut = true;
     try { process.kill(-c.pid, 'SIGKILL'); } catch { c.kill('SIGKILL'); }
-  }, timeout);
+  };
+  if (timeout && c.pid) timer = setTimeout(tick, Math.min(timeout, 1000));
   let stdout = '', stderr = '';
   c.stdout.on('data', (d) => { stdout = keepTail(stdout + d); });
   c.stderr.on('data', (d) => { stderr = keepTail(stderr + d); });
@@ -1105,22 +1205,39 @@ const spawnAsync = (cmd, args, cwd, { env = process.env, lock, onSpawn = lock?.a
   c.on('close', (code) => { clearTimeout(timer); done({ status: code ?? 1, stdout: tail(stdout), stderr: tail(stderr), ...(timedOut ? { timedOut } : {}) }); });
 });
 
+// The agent's own `prloop ready` gets this run's effective gate and limits, so it shares the same slot pool and weight.
 // Claude Code moves a Bash command to the background after its default timeout, and a -p session then ends
 // before the command (the gate) finishes: raise both limits to the agent's own budget.
-export const agentEnv = (cfg, env = process.env) => cfg.agent === 'claude'
-  ? { ...env, BASH_DEFAULT_TIMEOUT_MS: String(cfg.agentTimeout), BASH_MAX_TIMEOUT_MS: String(cfg.agentTimeout) } : env;
+export const agentEnv = (cfg, env = process.env) => {
+  const limits = { PRLOOP_GATE: cfg.gate, PRLOOP_GATE_WEIGHT: cfg.gateWeight, PRLOOP_GATE_SLOTS: cfg.gateSlots, PRLOOP_MAX_LOAD: cfg.maxLoad,
+    PRLOOP_MIN_FREE_MEM: cfg.minFreeMem, PRLOOP_RESOURCE_WAIT: cfg.resourceWait && `${Math.ceil(cfg.resourceWait / 1e3)}s`,
+    PRLOOP_GATE_TMPDIR: cfg.gateTmpdir, PRLOOP_REVIEW_BEFORE_GATE: cfg.reviewBeforeGate };
+  const out = { ...env, ...Object.fromEntries(Object.entries(limits).filter(([, v]) => v !== undefined).map(([k, v]) => [k, String(v)])) };
+  return cfg.agent === 'claude' ? { ...out, BASH_DEFAULT_TIMEOUT_MS: String(cfg.agentTimeout), BASH_MAX_TIMEOUT_MS: String(cfg.agentTimeout) } : out;
+};
+// Scratch for prloop and its agents: under --gate-tmpdir when set (a small /tmp fills up), else the system tmpdir.
+const scratch = (cfg, prefix) => {
+  if (cfg.gateTmpdir) mkdirSync(cfg.gateTmpdir, { recursive: true });
+  return mkdtempSync(join(cfg.gateTmpdir ?? tmpdir(), prefix));
+};
 // With --gate-tmpdir, each agent run gets its own TMPDIR there too (agents may run tests), removed when it ends.
 async function spawnAgent(cmd, args, cwd, cfg) {
   const env = { ...agentEnv(cfg) };
-  let tmp;
-  if (cfg.gateTmpdir) { mkdirSync(cfg.gateTmpdir, { recursive: true }); env.TMPDIR = tmp = mkdtempSync(join(cfg.gateTmpdir, 'prloop-agent-')); }
-  try { return await spawnAsync(cmd, args, cwd, { lock: cfg.lock, timeout: cfg.agentTimeout, env }); }
-  finally { if (tmp) rmSync(tmp, { recursive: true, force: true }); }
+  const tmp = cfg.gateTmpdir && (env.TMPDIR = scratch(cfg, 'prloop-agent-'));
+  mkdirSync(join(stateDir(), 'agents'), { recursive: true, mode: 0o700 });
+  const queue = env.PRLOOP_QUEUE_FILE = join(stateDir(), 'agents', `queued-${randomUUID()}`);
+  try { return await spawnAsync(cmd, args, cwd, { lock: cfg.lock, timeout: cfg.agentTimeout, env, paused: () => queuedNow(queue) }); }
+  finally { if (tmp) rmSync(tmp, { recursive: true, force: true }); rmSync(queue, { force: true }); }
 }
+
+// A timed-out agent that printed nothing was most likely stuck on one command; say so instead of an empty log.
+const minutes = (ms) => (ms >= 6e4 ? `${Math.round(ms / 6e4)}m` : `${Math.ceil(ms / 1e3)}s`);
+const timeoutReason = (r, cfg) => `agent timed out after ${minutes(cfg.agentTimeout)} of work${String(r.stdout).trim() || String(r.stderr).trim() ? ''
+  : ' with no output: it was killed before printing its result, so check its last command (time its gate spent queued is not counted)'}`;
 
 async function runFixAgent(cfg, prompt, cwd) {
   if (cfg.agent === 'codex') {
-    const dir = mkdtempSync(join(tmpdir(), 'prloop-agent-'));
+    const dir = scratch(cfg, 'prloop-agent-out-');
     try {
       const r = await spawnAgent('codex', ['exec', '--sandbox', 'workspace-write', '-c', 'sandbox_workspace_write.network_access=true', '-o', join(dir, 'last.txt'),
         ...(cfg.model ? ['-m', cfg.model] : []), ...(cfg.effort ? ['-c', `model_reasoning_effort=${cfg.effort}`] : []), prompt], cwd, cfg);
@@ -1164,7 +1281,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
   pruneAgentLogs();
   const log = join(stateDir(), `run-${new Date().toISOString().replace(/[:.]/g, '-')}.jsonl`);
   // Rounds and seen findings persist across runs on purpose; `prloop reset-rounds` resets the rounds once.
-  const states = prs.map((n) => ({ ...loadState(repo, n), repo, pr: n, log, phase: 'polling', reason: undefined, next: undefined, agentLog: undefined }));
+  const states = prs.map((n) => ({ ...loadState(repo, n), repo, pr: n, log, phase: 'polling', reason: undefined, next: undefined, agentLog: undefined, mergeRetried: undefined }));
   const busy = new Map();
   const event = (st, phase, extra = {}) => {
     Object.assign(st, { phase, updatedAt: new Date().toISOString() }, extra);
@@ -1201,7 +1318,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
       const repeated = recordFindings(st.seen, v.findings);
       if (repeated.length) return block(st, 'the same finding came back after two fixes', 'decide whether the finding is valid');
     }
-    const t = { ...v, repo, pr: st.pr, branch: s.branch, head: s.head, cwd, gate: cfg.gate, agentTimeout: cfg.agentTimeout, localReview: cfg.mode === 'local' || !!v.localReview, requestBody: s.rerequestBody };
+    const t = { ...v, repo, pr: st.pr, branch: s.branch, head: s.head, cwd, gate: cfg.gate, agentTimeout: cfg.agentTimeout, reviewBeforeGate: cfg.reviewBeforeGate, localReview: cfg.mode === 'local' || !!v.localReview, requestBody: s.rerequestBody };
     const prompt = buildPrompt(t);
     if (cfg.agent === 'none') return event(st, 'needs_agent', { verdict: v.verdict, prompt, next: 'spawn an agent with this prompt, then rerun prloop run' });
     event(st, 'agent', { verdict: v.verdict });
@@ -1213,7 +1330,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     addUsage(st, r.stdout);
     const agentLog = st.agentLog = saveAgentLog(repo, st.pr, r);
     const fail = (reason) => event(st, 'blocked', { reason, next: `a human decision is needed; the agent output is in ${agentLog}`, agentLog });
-    if (r.timedOut) return fail('agent timed out');
+    if (r.timedOut) return fail(timeoutReason(r, cfg));
     const result = parseAgentResult(r.final);
     if (DENIED.test(`${r.final}\n${r.stderr}`)) return fail('the agent reported a permission denial');
     if (r.status !== 0) return fail(`the agent exited with status ${r.status}: ${cliWrapper(r.final) ? agentFailure(r.final) : tail(r.stderr)}`);
@@ -1237,6 +1354,23 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     event(st, 'polling', { status: result.status });
   }
 
+  // Locked like a standalone sync, so two supervisors never fetch, merge or push in one checkout at once.
+  // Returns the sync result only when the branch was already up to date; otherwise it handled the outcome.
+  function syncPr(st, s, raw, cwd, slot, rebase = opts.merge === 'rebase') {
+    const lock = takeLock(cwd, `sync of PR #${st.pr}`);
+    if (lock.holder) return lockedOut(st, cwd, lock.holder);
+    let v;
+    try { v = syncBranch({ cwd, branch: s.branch, base: s.base, baseOid: raw.baseRefOid, head: s.head, settings: raw.repoSettings, union: opts.union, rebase }); } finally { lock.release(); }
+    if (v.verdict === 'error') return block(st, `sync failed: ${v.error}`);
+    if (v.verdict === 'synced' && v.unchanged && s.verdict === 'clean') {
+      st.carry = recordCarry(repo, st.pr, s.head, v);
+      return event(st, 'polling', { verdict: 'carried', head: v.head });
+    }
+    if (v.verdict === 'synced') return event(st, 'polling', { verdict: 'synced', head: v.head });
+    if (v.verdict === 'conflict') return slot() && fix(st, s, cwd, { verdict: 'conflict', trigger: 'conflict', conflicts: v.conflicts, generated: v.generated });
+    return v;
+  }
+
   async function step(st) {
     let raw, s;
     try { raw = fetchPr(repo, st.pr); s = classify(raw, cfg); st.failures = 0; } catch (e) {
@@ -1257,18 +1391,27 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     // state before a merge; an unchanged patch carries the clean review, so this costs no new review.
     if (s.mergeState === 'BEHIND' || s.mergeState === 'DIRTY' || s.mergeable === 'CONFLICTING') {
       if (!cwd) return block(st, `PR is ${s.mergeState} and no worktree has ${s.branch}; pass --worktree`);
-      // Locked like a standalone sync, so two supervisors never fetch, merge or push in one checkout at once.
-      const lock = takeLock(cwd, `sync of PR #${st.pr}`);
+      const v = syncPr(st, s, raw, cwd, slot);
+      if (v?.verdict !== 'up_to_date') return v;
+    }
+    // Pipelined review: once the head is requested (or already reviewed clean), prloop runs the gate itself, in parallel
+    // with the review. A failure goes to a fix agent with the gate's tail; a merge needs both on the same head.
+    const gated = (sha) => gatePassed(cfg.gate, cwd) === sha;
+    if (cfg.reviewBeforeGate && cfg.gate && cwd && ['pending', 'clean'].includes(s.verdict) && !gated(s.head) && st.gateFailure?.head !== s.head) {
+      const lock = takeLock(cwd, `gate of PR #${st.pr}`);
       if (lock.holder) return lockedOut(st, cwd, lock.holder);
-      let v;
-      try { v = syncBranch({ cwd, branch: s.branch, base: s.base, baseOid: raw.baseRefOid, head: s.head, settings: raw.repoSettings, union: opts.union }); } finally { lock.release(); }
-      if (v.verdict === 'error') return block(st, `sync failed: ${v.error}`);
-      if (v.verdict === 'synced' && v.unchanged && s.verdict === 'clean') {
-        st.carry = recordCarry(repo, st.pr, s.head, v);
-        return event(st, 'polling', { verdict: 'carried', head: v.head });
-      }
-      if (v.verdict === 'synced') return event(st, 'polling', { verdict: 'synced', head: v.head });
-      if (v.verdict === 'conflict') return slot() && fix(st, s, cwd, { verdict: 'conflict', trigger: 'conflict', conflicts: v.conflicts });
+      st.lockedBy = undefined;
+      event(st, 'gate');
+      let g;
+      try { g = await readyGate(s, cfg, cwd, { metrics, now, log: ({ event: phase, ...e }) => logEvent(st, { phase, ...e }) }); } finally { lock.release(); }
+      if (g?.ok) return event(st, 'polling', { verdict: 'gate_passed' });
+      st.gateFailure = { head: s.head, tail: g?.tail ?? 'the worktree no longer matches the PR head' };
+      return event(st, 'polling', { verdict: 'gate_failed', reason: `gate exited with ${g?.status}` });
+    }
+    const gateFailure = cfg.reviewBeforeGate && st.gateFailure?.head === s.head ? st.gateFailure : undefined;
+    if (gateFailure && s.verdict !== 'findings') {
+      if (!cwd) return block(st, `no worktree has ${s.branch} checked out; pass --worktree`);
+      return slot() && fix(st, s, cwd, { verdict: 'gate_failed', trigger: 'gate_failed', gateFailure, missing: [`the full gate passing on head ${short(s.head)}`] });
     }
     const plan = reviewPlan(s, cfg);
     if (plan.blocked) return block(st, plan.blocked);
@@ -1295,7 +1438,18 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
       if (missing.length) return slot() && fix(st, s, cwd, { verdict: 'not_tested', trigger: 'not_requested', missing,
         note: 'The head is already reviewed clean and only needs the gate: run `prloop ready`, which runs the gate and marks the head tested, then reports that the head is already reviewed clean. That report is expected: skip the review request and report status nothing_to_do.' });
       if (s.mergeable !== 'MERGEABLE') return s.mergeable === 'UNKNOWN' ? undefined : block(st, `GitHub reports mergeable=${s.mergeable}`);
-      sh('gh', ['pr', 'merge', String(st.pr), '--repo', repo, `--${opts.merge}`, '--match-head-commit', s.head]);
+      const merge = () => sh('gh', ['pr', 'merge', String(st.pr), '--repo', repo, `--${opts.merge}`, '--match-head-commit', s.head]);
+      try { merge(); } catch (e) {
+        // GitHub refuses a rebase merge of a branch with merge commits even when it reports the PR clean:
+        // linearize it once (the new head then needs the gate again) or, when there is nothing to linearize, retry once.
+        const why = String(e.stderr || e.message).trim().slice(0, 300);
+        if (opts.merge !== 'rebase' || st.mergeRetried) return block(st, `GitHub refused the merge: ${why}`);
+        st.mergeRetried = true;
+        logEvent(st, { phase: 'merge_refused', reason: `${why}; syncing (linearize) and retrying once` });
+        const v = syncPr(st, s, raw, cwd, slot, true);
+        if (v?.verdict !== 'up_to_date') return v;
+        try { merge(); } catch (e2) { return block(st, `GitHub refused the merge again: ${String(e2.stderr || e2.message).trim().slice(0, 300)}`); }
+      }
       const after = classify(fetchPr(repo, st.pr), cfg);
       // A merge queue or auto-merge accepts the command without merging yet: report the real state.
       return after.state === 'MERGED' ? event(st, 'merged', { mergeCommit: after.mergeCommit })
@@ -1305,7 +1459,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     if (!slot()) return;
     const trigger = s.verdict === 'timeout' ? 'timeout' : s.verdict === 'not_requested' ? 'not_requested'
       : s.unresolvedThreads.some((x) => isLocal(x.body)) ? 'local_review' : 'findings';
-    return fix(st, s, cwd, { verdict: s.verdict, trigger, findings: s.unresolvedThreads, summaries: s.verdict === 'findings' ? s.summaries : [], missing: [...s.reasons, ...localGate(s, cwd)] });
+    return fix(st, s, cwd, { verdict: s.verdict, trigger, findings: s.unresolvedThreads, summaries: s.verdict === 'findings' ? s.summaries : [], missing: [...s.reasons, ...localGate(s, cwd)], gateFailure });
   }
 
   for (;;) {
@@ -1315,7 +1469,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
       const p = step(st).catch((e) => block(st, `prloop error: ${String(e.stderr || e.message).slice(0, 300)}`))
         .finally(() => busy.delete(st.pr));
       busy.set(st.pr, p);
-      if (!['agent', 'local_review'].includes(st.phase)) await p; // only agents and local reviews run in parallel
+      if (!['agent', 'local_review', 'gate'].includes(st.phase)) await p; // only agents, local reviews and gates run in parallel
     }
     if (states.every((st) => TERMINAL.has(st.phase))) break;
     await Promise.race([sleep(cfg.interval), ...busy.values()]);
@@ -1399,7 +1553,11 @@ export async function main(argv) {
       const gatePassedHead = gate && tested === git(['rev-parse', 'HEAD'], cwd) ? recordGatePass(gate, cwd) : null;
       return out({ verdict: 'ok', tested, ...(gatePassedHead ? { gatePassedHead } : {}) }, 0);
     }
-    const cfg = config(opts);
+    const repoFile = repoConfig(opts.worktree ? resolve(opts.worktree) : process.cwd());
+    const cfg = config(opts, process.env, { machine: machineConfig(), repo: repoFile });
+    if (!opts.union.length && repoFile.union) opts.union = repoFile.union;
+    // The repository file names the method; merging itself still needs an explicit --merge.
+    if (opts.merge === 'repo') opts.merge = repoFile.merge ?? (() => { throw new Error('--merge repo needs "merge" in .prloop.json'); })();
     if (cmd === 'run' && opts.status) return out({ machine: machineLine(cfg), ...runStatus(opts.repo) }, 0);
     if (cmd === 'run' || cmd === 'ready') {
       const c = selfCheck(SCRIPT_DIR);
@@ -1408,7 +1566,7 @@ export async function main(argv) {
     }
     if (cmd === 'run') {
       if (!opts.repo || !opts.pr) throw new Error('run needs --repo owner/name and --pr N[,N...]');
-      if (opts.merge && !['rebase', 'squash', 'merge'].includes(opts.merge)) throw new Error('--merge must be rebase, squash or merge');
+      if (opts.merge && !['rebase', 'squash', 'merge'].includes(opts.merge)) throw new Error('--merge must be rebase, squash, merge or repo');
       const results = await runAll(opts, cfg);
       for (const r of results) console.log(JSON.stringify(r));
       return runExitCode(results);
@@ -1430,9 +1588,12 @@ export async function main(argv) {
       if (gate && !gate.ok) return out({ ready: false, pr: s.pr, head: s.head, gate: 'failed', exitCode: gate.status, tail: gate.tail,
         next: 'rerun the failing tests or step with its focused command, fix until it passes, then run `prloop ready` again' }, EXIT.blocked);
       // Waiting for admission or a slot can outlast a push from elsewhere: judge the PR as it is now, not the gated snapshot.
-      if (gate) s = classify(fetchPr(repo, prArg), cfg);
-      const missing = [...s.reasons, ...localGate(s, process.cwd(), cfg.gate)];
-      return out({ ready: !missing.length, pr: s.pr, head: s.head, missing, trigger: cfg.trigger }, missing.length ? EXIT.blocked : 0);
+      if (gate && !gate.deferred) s = classify(fetchPr(repo, prArg), cfg);
+      // A deferred gate (pipelined review) runs after the request: an untested head does not block the request.
+      const missing = [...s.reasons, ...localGate(s, process.cwd(), cfg.gate)].filter((r) => !(gate?.deferred && r.includes('not marked tested')));
+      const pipelined = gate?.deferred ? { gate: 'deferred', next: 'post the review request; the full gate runs next, in parallel (`prloop run` runs it, or call `prloop ready` again after the request)' }
+        : gate && cfg.reviewBeforeGate ? { gate: 'passed' } : {};
+      return out({ ready: !missing.length, pr: s.pr, head: s.head, missing, trigger: cfg.trigger, ...pipelined }, missing.length ? EXIT.blocked : 0);
     }
     if (cmd === 'wait') {
       pruneAgentLogs();
