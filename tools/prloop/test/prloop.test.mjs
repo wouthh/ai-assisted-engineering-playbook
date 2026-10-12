@@ -6,7 +6,7 @@ import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import {
-  EXIT, OUTPUT_TAIL, main, approvedFor, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, saveState, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, gateProvenance, treeRss, recordGatePass, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, reconcileStates, syncBranch, unionLines, waitFor,
+  EXIT, OUTPUT_TAIL, main, approvedFor, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, recordEvent, saveState, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, gateProvenance, treeRss, recordGatePass, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, reconcileStates, syncBranch, unionLines, waitFor,
 } from '../prloop.mjs';
 
 const pick = (o, keys) => Object.fromEntries(keys.map((k) => [k, o[k]]));
@@ -1490,6 +1490,19 @@ test('run logs a merged phase reconciled meanwhile instead of its own stale bloc
   const [pr] = runStatus('example-org/example-repo').prs;
   assert.equal(pr.phase, 'merged');
   assert.deepEqual(pick(pr.events.at(-1), ['phase', 'reason']), { phase: 'merged', reason: 'the PR was merged on GitHub' });
+});
+
+test('a run saves and logs its phase under one state lock, so a reconciliation cannot land between them', (t) => {
+  const state = tempState(t);
+  const lock = join(state, 'example-org__example-repo__7.json.lock.d');
+  const held = [];
+  const st = { repo: 'example-org/example-repo', pr: 7, rounds: 0, seen: {} };
+  const log = join(state, 'run-test.jsonl');
+  // logEvent reads st.log while appending: record whether this process's state claim is held at that moment.
+  Object.defineProperty(st, 'log', { enumerable: false, get: () => { held.push(readdirSync(lock).some((f) => f.includes(`.${process.pid}.`))); return log; }, set() {} });
+  recordEvent(st, 'blocked', { reason: 'x' });
+  assert.ok(held.length && held.every(Boolean));
+  assert.equal(JSON.parse(readFileSync(log, 'utf8')).phase, 'blocked');
 });
 
 test('run ends a PR closed on GitHub as closed, not blocked', async (t) => {
