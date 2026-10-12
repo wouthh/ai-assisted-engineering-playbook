@@ -920,12 +920,14 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
   // Once at the end, after every generated conflict took the base side (and always when finishing a resumed sync).
   if (regenerate && (regenerated.size || resumed)) {
     // Ignored files too: generators often write ignored build output, which a failed run must not leave behind.
-    const untracked = () => git(['ls-files', '-z', '--others'], cwd).split('\0').filter(Boolean);
+    // Nested submodules too, which a top-level reset or listing does not descend into.
+    const repos = ['', ...git(['submodule', 'foreach', '--quiet', '--recursive', 'echo "$displaypath"'], cwd).split('\n').filter(Boolean)];
+    const untracked = () => repos.flatMap((p) => git(['ls-files', '-z', '--others'], join(cwd, p)).split('\0').filter(Boolean).map((f) => (p ? `${p}/${f}` : f)));
     const before = new Set(untracked());
     const fail = (why) => {
       // A resumed sync holds a manual resolution: keep it locally instead of discarding it.
       if (resumed) return { verdict: 'error', error: `${why}; the synced branch is local only, at ${short(git(['rev-parse', 'HEAD'], cwd))}` };
-      git(['reset', '--quiet', '--hard', head], cwd);
+      git(['reset', '--quiet', '--hard', '--recurse-submodules', head], cwd);
       // Also files the command created, so the checkout is as clean as before; older untracked files stay.
       for (const f of untracked()) if (!before.has(f)) rmSync(join(cwd, f), { force: true });
       return { verdict: 'error', error: why };

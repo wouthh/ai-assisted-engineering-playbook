@@ -2247,9 +2247,13 @@ test('sync fails closed when regenerate leaves uncommitted changes inside a subm
   divergeOnMain(r, { 'gen.txt': 'base\n' });
   r.run(r.work, '-c', 'protocol.file.allow=always', 'submodule', 'update', '-q', '--init');
   const head = r.run(r.work, 'rev-parse', 'HEAD');
-  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true }, generated: ['gen.txt'], regenerate: 'echo out > sub/out.txt' });
+  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true }, generated: ['gen.txt'], regenerate: 'echo out > sub/out.txt; echo y > sub/x' });
   assert.equal(v.verdict, 'error', JSON.stringify(v));
   assert.match(v.error, /submodule sub/);
+  // The rollback restores the submodule too, so the checkout is clean for the next sync.
+  assert.ok(!existsSync(join(r.work, 'sub', 'out.txt')));
+  assert.equal(readFileSync(join(r.work, 'sub', 'x'), 'utf8'), 'x\n');
+  assert.equal(r.run(r.work, 'status', '--porcelain', '--ignore-submodules=none'), '');
   assert.equal(r.run(r.work, 'rev-parse', 'HEAD'), head);
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
 });
