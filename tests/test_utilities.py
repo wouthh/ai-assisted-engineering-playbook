@@ -1842,5 +1842,12 @@ class GuidanceConsistencyTests(unittest.TestCase):
                 text = (ROOT / path).read_text(encoding="utf-8")
                 self.assertRegex(text, r"gates?, fix agents? and local reviews?")
 
+    def test_real_system_gate_rule_keeps_hosted_provider_checks_behind_approval(self) -> None:
+        for path in ("templates/AGENTS.template.md", "docs/validation-and-review.md"):
+            with self.subTest(path=path):
+                text = (ROOT / path).read_text(encoding="utf-8")
+                self.assertIn("locally run real instance", text)
+                self.assertIn("Checks that authenticate to a hosted provider, including its sandbox or test tenant, and checks with production credentials stay out of the routine gate and behind separate approval.", text)
+
 if __name__ == "__main__":
     unittest.main()
