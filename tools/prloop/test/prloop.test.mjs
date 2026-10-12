@@ -384,12 +384,31 @@ test('quota and failure replies mark the cloud reviewer unavailable', () => {
   }
 });
 
-test('a failure reply before this cycle is acknowledged does not mark it unavailable', () => {
-  const pr = fixture();
-  pr.comments.nodes.push(botComment('IC_q', "Codex couldn't complete this request. Try again later.", '10:06'));
+test('the bot\'s real quota reply marks it unavailable without any acknowledgement', () => {
+  const pr = fixture(); // a current request answered by a plain quota comment and no 👀, as the connector does
+  pr.comments.nodes.push(botComment('IC_q', QUOTA, '10:06'));
   const s = classify(pr, cfg, NOW);
-  assert.equal(s.verdict, 'pending');
-  assert.deepEqual(reviewPlan(s, cfg), {});
+  assert.equal(s.verdict, 'unavailable');
+  assert.deepEqual(reviewPlan(s, cfg), { local: true });
+  pr.comments.nodes = pr.comments.nodes.filter((c) => c.id !== 'IC_req'); // its automatic review of the head, no request
+  assert.equal(classify(pr, cfg, NOW).verdict, 'unavailable');
+  pr.comments.nodes.find((c) => c.id === 'IC_q').createdAt = at('09:30'); // a reply before this head does not count
+  assert.equal(classify(pr, cfg, NOW).verdict, 'not_requested');
+});
+
+test('the default unavailable regex matches quota phrasings but not ordinary review text', () => {
+  for (const body of [QUOTA, 'You have reached the usage limit for reviews.', 'Usage limit reached. Try again tomorrow.',
+    'You have exceeded your monthly review quota.', "Codex couldn't complete this request.", 'Codex is unable to review this PR.']) {
+    assert.match(body, cfg.unavailable, body);
+  }
+  for (const body of ['P1: Enforce the per-user quota before retrying', 'The rate limit is exceeded when the retry loop spins',
+    'Codex Review: Here are some automated review suggestions.', 'P2: Reset the usage counter after the limit is reached']) {
+    assert.doesNotMatch(body, cfg.unavailable, body);
+    const pr = fixture();
+    request(pr).reactions.nodes.push({ content: 'EYES', createdAt: at('10:05'), user: BOT });
+    pr.comments.nodes.push(botComment('IC_r', body, '10:06'));
+    assert.equal(classify(pr, cfg, NOW).verdict, 'pending', body);
+  }
 });
 
 test('auto falls back only after two timed-out requests on the same head', () => {
@@ -3071,4 +3090,42 @@ test('state writers racing to take over a dead lock claim never remove each othe
   assert.deepEqual(await Promise.all(done), [0, 0, 0, 0, 0, 0]);
   assert.deepEqual(readdirSync(lock), []);
   assert.match(JSON.parse(readFileSync(f, 'utf8')).carry.to, /^h[1-6]$/);
+});
+
+// A head answered by the bot's quota reply, with a fake `claude` that only records that it ran (its output is no review).
+async function runQuotaReply(t, rounds) {
+  const state = tempState(t);
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  markTested(head, r.work);
+  writeFileSync(join(state, 'heads.json'), JSON.stringify({ 'example-org/example-repo#7': { sha: head, at: at('09:00') } }));
+  writeFileSync(join(state, 'example-org__example-repo__7.json'), JSON.stringify({ repo: 'example-org/example-repo', pr: 7, rounds, seen: {} }));
+  const pr = fixture();
+  Object.assign(pr, { headRefName: 'feat', headRefOid: head, baseRefOid: r.run(r.work, 'rev-parse', 'origin/main'), mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE' });
+  pr.comments.nodes.push(botComment('IC_q', QUOTA, '10:06'));
+  const calls = fakeGh(t, r.dir, pr);
+  writeFileSync(join(r.dir, 'bin', 'claude'), `#!/bin/sh\necho ran >> "${r.dir}/claude-runs"\necho '{"type":"result","subtype":"success","result":"no review"}'\n`, { mode: 0o755 });
+  const [res] = await runAll({ repo: 'example-org/example-repo', pr: '7', worktree: r.work, deadline: '1h' }, { ...cfg, maxRounds: 6, interval: 1 }, { metrics: idle().metrics });
+  const phases = runStatus('example-org/example-repo').prs[0].events.map((e) => e.phase);
+  const st = JSON.parse(readFileSync(join(state, 'example-org__example-repo__7.json'), 'utf8'));
+  return { res, phases, st, calls: calls(), runs: readFileSync(join(r.dir, 'claude-runs'), 'utf8').trim().split('\n').length };
+}
+
+test('run answers the bot\'s quota reply with a local review, not a fix agent or a round', async (t) => {
+  const { phases, st, calls, runs } = await runQuotaReply(t, 2);
+  assert.ok(phases.includes('local_review'), phases.join());
+  assert.ok(!phases.includes('agent'), phases.join());
+  assert.equal(runs, 1);
+  assert.equal(st.rounds, 2);
+  assert.ok(!calls.some((c) => c.includes('comments')), 'no review request was posted');
+});
+
+test('run still gives an unavailable head one local review at the round cap', async (t) => {
+  const { res, phases, st, runs } = await runQuotaReply(t, 6);
+  assert.ok(phases.includes('local_review'), phases.join());
+  assert.doesNotMatch(String(res.reason), /max rounds/);
+  assert.equal(runs, 1);
+  assert.equal(st.rounds, 6);
 });
