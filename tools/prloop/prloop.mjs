@@ -1242,28 +1242,24 @@ const statePath = (repo, pr) => join(stateDir(), `${repo.replace('/', '__')}__${
 const loadState = (repo, pr) => {
   try { return JSON.parse(readFileSync(statePath(repo, pr), 'utf8')); } catch { return { rounds: 0, seen: {} }; }
 };
-// `prloop sync` may record a carry-over, and an agent's `prloop ready` a gate run, while a run holds this PR's state in
-// memory: the newer carry and the newer gate run win.
-// Serializes one state file's read-modify-write across prloop processes with a `<state>.lock` claim holding the
-// writer's PID; a claim of a dead process, or one held past 10s, is taken over.
+// Serializes one state file's read-modify-write across prloop processes with a one-slot claim directory
+// `<state>.lock.d`, as editLines does: a dead owner's claim has a unique name, so taking it over never removes a live claim.
 function withStateLock(repo, pr, fn) {
   mkdirSync(stateDir(), { recursive: true });
-  const lock = `${statePath(repo, pr)}.lock`;
-  for (const until = Date.now() + 10e3; ;) {
-    try { writeFileSync(lock, String(process.pid), { flag: 'wx', mode: 0o600 }); break; } catch (e) {
-      if (e.code !== 'EEXIST') throw e;
-      let pid; try { pid = Number(readFileSync(lock, 'utf8')); } catch { continue; }
-      if ((pid && !alive(pid)) || Date.now() > until) { rmSync(lock, { force: true }); continue; }
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
-    }
-  }
-  try { return fn(); } finally { rmSync(lock, { force: true }); }
+  const wait = new Int32Array(new SharedArrayBuffer(4));
+  let release;
+  while (!(release = acquireSlot(`${statePath(repo, pr)}.lock.d`, 1))) Atomics.wait(wait, 0, 0, 10 + Math.random() * 20);
+  try { return fn(); } finally { release(); }
 }
-const saveState = (st) => withStateLock(st.repo, st.pr, () => writeState(st));
+export const saveState = (st) => withStateLock(st.repo, st.pr, () => writeState(st));
+// `prloop sync` may record a carry-over, and an agent's `prloop ready` a gate run, while a run holds this PR's state in
+// memory: the newer carry and the newer gate run win. A merged or closed phase that `run --status` recorded after this
+// copy was loaded wins too, so a late agent or gate result of that run cannot report the PR as blocked again.
 const writeState = (st) => {
   const disk = loadState(st.repo, st.pr);
   if (disk.carry && !(st.carry?.at >= disk.carry.at)) st.carry = disk.carry;
   if (disk.lastGate && !(st.lastGate?.end >= disk.lastGate.end)) st.lastGate = disk.lastGate;
+  if (disk.reconciledAt && disk.reconciledAt !== st.reconciledAt) for (const k of ['phase', 'reason', 'next', 'reconciledAt']) st[k] = disk[k];
   mkdirSync(stateDir(), { recursive: true });
   // Owner-only, like the logs it points to.
   writeFileSync(statePath(st.repo, st.pr), JSON.stringify(st, null, 2), { mode: 0o600 });
@@ -1811,7 +1807,8 @@ export function reconcileStates(repoFilter, skip = []) {
         const fresh = { ...loadState(repo, st.pr), repo, pr: st.pr };
         if (['merged', 'closed'].includes(fresh.phase)) return;
         const reason = `the PR was ${phase} on GitHub`;
-        Object.assign(fresh, { phase, reason, next: undefined, updatedAt: new Date().toISOString() });
+        const at = new Date().toISOString();
+        Object.assign(fresh, { phase, reason, next: undefined, updatedAt: at, reconciledAt: at });
         logEvent(fresh, { phase, reason });
         writeState(fresh);
       });
