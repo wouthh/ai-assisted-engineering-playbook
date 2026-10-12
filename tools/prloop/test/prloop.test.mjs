@@ -2481,6 +2481,45 @@ test('pipelined ready: a head that needs a request is ready without the gate; on
   assert.equal(gatePassed(`touch "${ran}"`, r.work), head);
 });
 
+// #41: once the head's request is posted or the bot answered it, a head that may be requested again (timed out,
+// unavailable) must not defer the gate again, or `ready` never gates it. Only a head with neither still defers.
+test('pipelined ready runs the gate once the request is posted or the bot answered, even when the head may be requested again', (t) => {
+  const state = tempState(t);
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  writeFileSync(join(state, 'heads.json'), JSON.stringify({ 'example-org/example-repo#7': { sha: head, at: at('09:00') } }));
+  const base = fixture();
+  Object.assign(base, { headRefName: 'feat', headRefOid: head, mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE' });
+  fakeGh(t, r.dir, base);
+  const variant = (edit) => { const pr = JSON.parse(JSON.stringify(base)); edit(pr); return pr; };
+  const noRequest = (pr) => { pr.comments.nodes = pr.comments.nodes.filter((c) => c.id !== 'IC_req'); };
+  const cases = [
+    ['request posted, no reply yet', variant(() => {}), {}, 50],
+    ['request posted, no reply, timed out', variant(() => {}), { PRLOOP_ACK_TIMEOUT: '1m' }, 0],
+    ['quota reply to the request', variant((pr) => pr.comments.nodes.push(botComment('IC_q', QUOTA, '10:06'))), {}, 0],
+    ['quota reply to the automatic review', variant((pr) => { noRequest(pr); pr.comments.nodes.push(botComment('IC_q', QUOTA, '10:06')); }), {}, 0],
+    ['bot reviewing (eyes on the PR body)', variant((pr) => { noRequest(pr); pr.reactions.nodes.push({ content: 'EYES', createdAt: at('10:06'), user: BOT }); }), {}, 50],
+  ];
+  cases.forEach(([name, pr, env, status], i) => {
+    writeFileSync(join(r.dir, 'pr.json'), JSON.stringify({ data: { viewer: { login: 'example-dev' }, repository: { mergeCommitAllowed: true, squashMergeAllowed: true, rebaseMergeAllowed: true, pullRequest: pr } } }));
+    const ran = join(r.dir, `ran-${i}`);
+    const res = spawnSync(process.execPath, [PRLOOP, 'ready', '7', '--repo', 'example-org/example-repo', '--gate', `touch "${ran}"`, '--review-before-gate', 'true'],
+      { cwd: r.work, encoding: 'utf8', env: { ...process.env, PRLOOP_LOCK_TOKEN: '', PRLOOP_GATE_WEIGHT: 'light', PRLOOP_MAX_LOAD: '100000', PRLOOP_MIN_FREE_MEM: '1K', PRLOOP_TIMEOUT: '99999h', PRLOOP_ACK_TIMEOUT: '99999h', ...env } });
+    assert.equal(res.status, status, `${name}: ${res.stdout}${res.stderr}`);
+    assert.equal(JSON.parse(res.stdout).gate, 'passed', name);
+    assert.equal(existsSync(ran), true, name);
+  });
+  // Neither a request nor an answer on this head: still requested first.
+  writeFileSync(join(r.dir, 'pr.json'), JSON.stringify({ data: { viewer: { login: 'example-dev' }, repository: { mergeCommitAllowed: true, squashMergeAllowed: true, rebaseMergeAllowed: true, pullRequest: variant(noRequest) } } }));
+  const ran = join(r.dir, 'ran-none');
+  const res = spawnSync(process.execPath, [PRLOOP, 'ready', '7', '--repo', 'example-org/example-repo', '--gate', `touch "${ran}"`, '--review-before-gate', 'true'],
+    { cwd: r.work, encoding: 'utf8', env: { ...process.env, PRLOOP_LOCK_TOKEN: '', PRLOOP_GATE_WEIGHT: 'light', PRLOOP_MAX_LOAD: '100000', PRLOOP_MIN_FREE_MEM: '1K', PRLOOP_TIMEOUT: '99999h', PRLOOP_ACK_TIMEOUT: '99999h' } });
+  assert.deepEqual(pick(JSON.parse(res.stdout), ['ready', 'gate']), { ready: true, gate: 'deferred' });
+  assert.equal(existsSync(ran), false);
+});
+
 // A requested, pending PR under pipelined review: `run` gates the head itself while the review runs.
 async function runPipelined(t, gate, { clean = false } = {}) {
   const state = tempState(t);
