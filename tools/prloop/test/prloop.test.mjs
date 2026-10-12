@@ -6,7 +6,7 @@ import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import {
-  EXIT, OUTPUT_TAIL, main, approvedFor, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, recordEvent, saveState, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, gateProvenance, treeRss, recordGatePass, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, reconcileStates, syncBranch, unionLines, waitFor,
+  EXIT, OUTPUT_TAIL, main, approvedFor, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, recordEvent, saveState, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, gateProvenance, treeRss, recordGatePass, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, reconcileStates, syncBranch, unionLines, unionResult, waitFor,
 } from '../prloop.mjs';
 
 const pick = (o, keys) => Object.fromEntries(keys.map((k) => [k, o[k]]));
@@ -357,6 +357,12 @@ test('durations and globs', () => {
   assert.ok(!globToRegex('*.csv').test('data/updates.csv'));
 });
 
+test('the final union result keeps both sides\' end states and adds no line that neither had', () => {
+  // The PR removed b and added X; the base removed c and added Y; a duplicate both sides kept stays.
+  assert.equal(unionResult('a\nb\nc\nd\nd\n', 'a\nb\nd\nd\nY\n', 'a\nc\nd\nd\nX\n'), 'a\nd\nd\nY\nX\n');
+  assert.equal(unionResult('', '', ''), '');
+});
+
 test('union keeps base lines first and drops duplicates', () => {
   assert.equal(unionLines('id,title\na,1\nb,2\n', 'id,title\na,1\nc,3\n'), 'id,title\na,1\nb,2\nc,3\n');
 });
@@ -573,6 +579,25 @@ for (const settings of [{ merge: true, squash: true }, { merge: false, squash: f
     assert.equal(readFileSync(join(r.work, 'log.csv'), 'utf8'), 'id\na\nbase\nfeature\n');
     assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), v.head);
   });
+
+  // Replaying commit by commit (a rebase) once re-added a row a later PR commit deleted, or duplicated one (#29).
+  for (const [name, c1, c2, expected] of [['re-adds no row a later PR commit deleted', 'id\na\nY\nb\n', 'id\na\nX\n', 'id\na\nX\nb'],
+    ['duplicates no row', 'id\na\nY\n', 'id\na\nY\nb\n', 'id\na\nX\nb\nY']]) {
+    test(`sync (${method}) by union ${name}`, (t) => {
+      const r = gitRepo();
+      t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+      r.commit('feature', { 'log.csv': c1 });
+      r.commit('feature fix', { 'log.csv': c2 });
+      r.run(r.work, 'push', '-q', 'origin', 'feat');
+      divergeOnMain(r, { 'log.csv': 'id\na\nX\nb\n' });
+      const head = r.run(r.work, 'rev-parse', 'HEAD');
+      const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings, union: ['*.csv'] });
+      assert.equal(v.verdict, 'synced', JSON.stringify(v));
+      assert.equal(r.run(r.work, 'show', `${v.head}:log.csv`), expected);
+      assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), v.head);
+      assert.equal(r.run(r.work, 'status', '--porcelain'), '');
+    });
+  }
 
   test(`sync (${method}) aborts cleanly on other conflicts`, (t) => {
     const r = gitRepo();
@@ -1359,6 +1384,27 @@ test('run --status marks PRs merged or closed outside a run, with one GitHub cal
   assert.deepEqual(pick(reopenedPhases, [9, 11, 13]), {
     9: ['waiting', undefined, 'the PR was reopened on GitHub'], 11: ['closed', 'the PR was closed on GitHub', 'the PR was closed on GitHub'], 13: ['reopened', 'the PR was reopened on GitHub', 'the PR was reopened on GitHub'] });
   assert.equal(JSON.parse(readFileSync(join(dir, 'example-org__example-repo__9.json'), 'utf8')).beforeClose, undefined);
+});
+
+test('a stale save after a reconciled close keeps beforeClose, so a reopen restores the prior phase', (t) => {
+  const dir = tempState(t);
+  const bin = mkdtempSync(join(tmpdir(), 'prloop-gh-'));
+  const old = process.env.PATH;
+  t.after(() => { process.env.PATH = old; rmSync(bin, { recursive: true, force: true }); });
+  process.env.PATH = `${bin}:${old}`;
+  const f = join(dir, 'example-org__example-repo__7.json');
+  const loaded = { repo: 'example-org/example-repo', pr: 7, phase: 'waiting', reason: 'review requested', next: 'wait', rounds: 2 };
+  writeFileSync(f, JSON.stringify(loaded));
+  const gh = (state) => writeFileSync(join(bin, 'gh'), `#!/bin/sh\necho '{"data":{"repository":{"p7":{"state":"${state}"}}}}'\n`, { mode: 0o755 });
+  gh('CLOSED');
+  reconcileStates('example-org/example-repo');
+  // A run that loaded PR 7 before the close saves a late result.
+  saveState({ ...loaded, phase: 'blocked', reason: 'agent made no progress', rounds: 3 });
+  assert.deepEqual(pick(JSON.parse(readFileSync(f, 'utf8')), ['phase', 'beforeClose', 'rounds']),
+    { phase: 'closed', beforeClose: { phase: 'waiting', reason: 'review requested', next: 'wait' }, rounds: 3 });
+  gh('OPEN');
+  reconcileStates('example-org/example-repo');
+  assert.deepEqual(pick(JSON.parse(readFileSync(f, 'utf8')), ['phase', 'reason', 'next']), { phase: 'waiting', reason: 'review requested', next: 'wait' });
 });
 
 test('reset-rounds resets the counter once, logs it, and refuses a second reset', (t) => {
