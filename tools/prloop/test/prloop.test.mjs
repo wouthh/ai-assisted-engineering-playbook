@@ -599,6 +599,27 @@ for (const settings of [{ merge: true, squash: true }, { merge: false, squash: f
     });
   }
 
+  test(`sync --continue (${method}) still corrects union files resolved before the pause`, (t) => {
+    const r = gitRepo();
+    t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+    r.commit('feature', { 'log.csv': 'id\na\nY\nb\n' });
+    r.commit('feature fix', { 'log.csv': 'id\na\nX\n' });
+    r.commit('feature app', { 'app.txt': 'feature\n' });
+    r.run(r.work, 'push', '-q', 'origin', 'feat');
+    divergeOnMain(r, { 'log.csv': 'id\na\nX\nb\n', 'app.txt': 'base\n' });
+    const head = r.run(r.work, 'rev-parse', 'HEAD');
+    const args = { cwd: r.work, branch: 'feat', base: 'main', head, settings, union: ['*.csv'], resume: true };
+    let v = syncBranch(args);
+    assert.deepEqual([v.verdict, v.conflicts], ['conflict', ['app.txt']], JSON.stringify(v));
+    writeFileSync(join(r.work, 'app.txt'), 'both\n');
+    r.run(r.work, 'add', 'app.txt');
+    v = syncBranch(args);
+    assert.equal(v.verdict, 'synced', JSON.stringify(v));
+    assert.deepEqual(v.unioned, ['log.csv']);
+    assert.equal(r.run(r.work, 'show', `${v.head}:log.csv`), 'id\na\nX\nb');
+    assert.equal(r.run(r.work, 'status', '--porcelain'), '');
+  });
+
   test(`sync (${method}) aborts cleanly on other conflicts`, (t) => {
     const r = gitRepo();
     t.after(() => rmSync(r.dir, { recursive: true, force: true }));
