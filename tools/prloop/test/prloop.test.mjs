@@ -1338,8 +1338,12 @@ test('run --status marks PRs merged or closed outside a run, with one GitHub cal
   reconcileStates('example-org/example-repo');
   assert.deepEqual(pick(JSON.parse(readFileSync(f12, 'utf8')), ['phase', 'rounds']), { phase: 'merged', rounds: 4 });
   assert.deepEqual(readdirSync(`${f12}.lock.d`), []);
-  reconcileStates('example-org/example-repo', [8]); // only the open blocker remains a candidate, and a run skips its own PRs
-  assert.equal(readFileSync(join(bin, 'calls.log'), 'utf8').trim().split('\n').length, 3);
+  writeFileSync(join(bin, 'gh'), `#!/bin/sh\necho "$*" >> "${bin}/calls.log"\necho '{"data":{"repository":{"p9":{"state":"CLOSED"},"p11":{"state":"CLOSED"}}}}'\n`, { mode: 0o755 });
+  reconcileStates('example-org/example-repo', [8]); // merged PRs are no candidates any more, and a run skips its own PRs
+  const lastCalls = readFileSync(join(bin, 'calls.log'), 'utf8').trim().split('\n');
+  assert.equal(lastCalls.length, 4);
+  assert.match(lastCalls[3], /p11:.*p9:/);
+  assert.doesNotMatch(lastCalls[3], /p(7|8|10|12):/);
   // A supervisor that loaded PR 12 before it was merged saves a late agent result: the merged phase stays.
   saveState({ repo: 'example-org/example-repo', pr: 12, phase: 'blocked', reason: 'agent made no progress', rounds: 5 });
   assert.deepEqual(pick(JSON.parse(readFileSync(f12, 'utf8')), ['phase', 'reason', 'rounds']), { phase: 'merged', reason: 'the PR was merged on GitHub', rounds: 5 });
@@ -1347,6 +1351,14 @@ test('run --status marks PRs merged or closed outside a run, with one GitHub cal
   const reopened = JSON.parse(readFileSync(f12, 'utf8'));
   saveState({ ...reopened, phase: 'waiting', reason: undefined });
   assert.equal(JSON.parse(readFileSync(f12, 'utf8')).phase, 'waiting');
+  // Closed PRs stay candidates: reopened, PR 9 gets back the phase it had before it closed; PR 13, closed by a run, shows as reopened.
+  writeFileSync(join(dir, 'example-org__example-repo__13.json'), JSON.stringify({ repo: 'example-org/example-repo', pr: 13, phase: 'closed' }));
+  writeFileSync(join(bin, 'gh'), `#!/bin/sh\necho '{"data":{"repository":{"p9":{"state":"OPEN"},"p11":{"state":"CLOSED"},"p13":{"state":"OPEN"}}}}'\n`, { mode: 0o755 });
+  reconcileStates('example-org/example-repo', [8]);
+  const reopenedPhases = Object.fromEntries(runStatus('example-org/example-repo').prs.map((p) => [p.pr, [p.phase, p.reason, p.events.at(-1)?.reason]]));
+  assert.deepEqual(pick(reopenedPhases, [9, 11, 13]), {
+    9: ['waiting', undefined, 'the PR was reopened on GitHub'], 11: ['closed', 'the PR was closed on GitHub', 'the PR was closed on GitHub'], 13: ['reopened', 'the PR was reopened on GitHub', 'the PR was reopened on GitHub'] });
+  assert.equal(JSON.parse(readFileSync(join(dir, 'example-org__example-repo__9.json'), 'utf8')).beforeClose, undefined);
 });
 
 test('reset-rounds resets the counter once, logs it, and refuses a second reset', (t) => {
