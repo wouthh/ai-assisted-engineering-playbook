@@ -57,7 +57,7 @@ With a heavy gate (20+ minutes plus slot waits), gating before every review requ
 
 1. The fix agent pushes and resolves the addressed threads. `prloop ready` then checks everything except the gate and, while the head still needs a request, does not run the gate (`"gate": "deferred"`); the agent posts the request. A request already pending on the head, or a reviewer that already reviewed it, still blocks a new request.
 2. `run` runs the full gate on that head itself, while it keeps polling the other PRs. Outside `run`, calling `prloop ready` again after the request runs the gate (it then reports `"gate": "passed"` and not ready, because the request is pending).
-3. A merge (and the terminal `clean` of `run`) needs both a clean review and a passed gate on the same head. Findings start the next round as usual; a gate failure starts it with trigger `gate_failed` and the gate's last lines in the fix prompt. A failed gate after a request costs one round, which is acceptable because the previous round's gate usually passed and fixes are small.
+3. A merge (and the terminal `clean` of `run`) needs both a clean review and a passed gate on the same head. Findings start the next round as usual; a gate failure starts it with trigger `gate_failed` and the path of an owner-only log of the gate's last lines in the fix prompt (the output itself stays out of the prompt, since it may hold a secret). A failed gate after a request costs one round, which is acceptable because the previous round's gate usually passed and fixes are small.
 
 `--reviewer local` always gates first, since a local review needs a tested head. Repositories whose AGENTS.md requires the gate before a review request should update that wording when they turn this on.
 
