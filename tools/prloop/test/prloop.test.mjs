@@ -2192,6 +2192,11 @@ for (const settings of [{ merge: true, squash: true }, { merge: false, squash: f
     v = syncBranch(args); // neither the unstaged edit nor the untracked file may be committed
     assert.deepEqual([v.verdict, v.stray], ['conflict', ['log.csv', 'scratch.txt']], JSON.stringify(v));
     r.run(r.work, 'checkout', '--', 'log.csv');
+    r.run(r.work, 'add', 'scratch.txt'); // staged is not a resolution either
+    v = syncBranch(args);
+    assert.deepEqual([v.verdict, v.stray], ['conflict', ['scratch.txt']], JSON.stringify(v));
+    assert.match(v.next, /git restore --staged/);
+    r.run(r.work, 'rm', '-q', '--cached', 'scratch.txt');
     rmSync(join(r.work, 'scratch.txt'));
     v = syncBranch(args);
     assert.equal(v.verdict, 'synced', JSON.stringify(v));
