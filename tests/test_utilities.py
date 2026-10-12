@@ -1848,7 +1848,9 @@ class GuidanceConsistencyTests(unittest.TestCase):
                 text = (ROOT / path).read_text(encoding="utf-8")
                 self.assertIn("locally run real instance", text)
                 self.assertIn("Checks that authenticate to a hosted provider, including its sandbox or test tenant, and checks with production credentials stay out of the routine gate and behind separate approval.", text)
-                self.assertIn("A hosted-only API with no official emulator or self-hostable implementation is covered in the routine gate by local contract tests", text)
+                self.assertIn("or the available one does not faithfully model a capability the code depends on (for example authentication, IAM or permission checks)", text)
+                self.assertIn("keeps any emulator integration tests for what it does model and covers the missing capability with local contract tests", text)
+                self.assertIn("Do not count emulator runs as permission coverage when the emulator does not enforce permissions", text)
 
 if __name__ == "__main__":
     unittest.main()
