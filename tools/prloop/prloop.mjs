@@ -268,14 +268,13 @@ export function classify(pr, cfg, nowMs = Date.now()) {
 
   // A requested review reacts on the request, or on the PR body after the request. Without a request, PR-body reactions
   // count only once the bot has started (👀) after this head, so a late 👍 from a review of the previous head cannot clear this one.
-  // PR-body reactions carry no commit or request: with a request, a body 👍 counts only after this cycle's 👀. The absence of
-  // an earlier visible signal proves nothing: a previous head's automatic review may send its first reaction after the request.
+  // PR-body reactions carry no commit or request: with a request, a body 👍 never counts, even after this cycle's 👀, since a
+  // previous head's review still in flight may post it then. A requested result must be bound to the request or the head.
   const bodyReactions = (pr.reactions?.nodes ?? []).filter((r) => isBot(r) && r.createdAt >= headTime);
   // A PR-body 👀 from before the current request belongs to an earlier cycle and cannot acknowledge this one.
   const ackAt = [...(current ? triggerNode.reactions.nodes : []), ...bodyReactions].filter((r) => r.createdAt >= since)
     .filter((r) => isBot(r) && r.content === 'EYES').map((r) => r.createdAt).sort()[0];
-  const bodyOk = (r) => r.content === 'EYES' || (!!ackAt && r.createdAt >= ackAt);
-  const reactions = current ? [...triggerNode.reactions.nodes, ...bodyReactions.filter(bodyOk)]
+  const reactions = current ? [...triggerNode.reactions.nodes, ...bodyReactions.filter((r) => r.content === 'EYES')]
     : bodyReactions.some((r) => r.content === 'EYES') ? bodyReactions : [];
   const signals = reactions
     .filter((r) => isBot(r) && r.createdAt >= since && (r.content === 'EYES' || r.content === 'THUMBS_UP'))
@@ -1415,10 +1414,11 @@ export async function main(argv) {
     const repo = resolveRepo(opts);
     if (cmd === 'status') {
       const s = classify(fetchPr(repo, prArg), cfg);
-      const local = tryGit(['rev-parse', '--git-dir']) ? localGate(s, process.cwd(), cfg.gate) : [];
+      const checkout = !!tryGit(['rev-parse', '--git-dir']);
+      const local = checkout ? localGate(s, process.cwd(), cfg.gate) : [];
       const unresolvedThreads = s.unresolvedThreads.map((t) => ({ ...t, body: t.body.slice(0, 300) }));
       return out({ ...s, unresolvedThreads, reasons: [...s.reasons, ...local], readyToRequest: s.readyToRequest && !local.length,
-        tested: cfg.gate ? gatePassed(cfg.gate, process.cwd()) === s.head : isTested(s.head, process.cwd()) }, 0);
+        tested: !checkout ? false : cfg.gate ? gatePassed(cfg.gate, process.cwd()) === s.head : isTested(s.head, process.cwd()) }, 0);
     }
     if (cmd === 'ready') {
       let s = classify(fetchPr(repo, prArg), cfg);
