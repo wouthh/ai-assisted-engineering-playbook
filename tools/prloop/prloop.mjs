@@ -151,6 +151,9 @@ function readConfigFile(file, keys) {
     if (!keys[k]) throw new Error(`${file}: unknown key ${k} (known: ${Object.keys(keys).join(', ')})`);
     if (!keys[k].split('|').includes(type) || (type === 'array' && !v.every((x) => typeof x === 'string'))) throw new Error(`${file}: ${k} must be ${keys[k]}`);
   }
+  // An empty command list would take the base side of every generated conflict and regenerate nothing.
+  const regen = 'regenerate' in obj ? [obj.regenerate].flat() : null;
+  if (regen && (!regen.length || regen.some((c) => !c.trim()))) throw new Error(`${file}: regenerate must hold at least one non-blank command`);
   return obj;
 }
 // One machine-wide setting for every prloop process of the user: gate slots and resource limits.
@@ -902,7 +905,8 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
   }
   // Once at the end, after every generated conflict took the base side (and always when finishing a resumed sync).
   if (regenerate && (regenerated.size || resumed)) {
-    const untracked = () => git(['ls-files', '-z', '--others', '--exclude-standard'], cwd).split('\0').filter(Boolean);
+    // Ignored files too: generators often write ignored build output, which a failed run must not leave behind.
+    const untracked = () => git(['ls-files', '-z', '--others'], cwd).split('\0').filter(Boolean);
     const before = new Set(untracked());
     for (const cmd of [regenerate].flat()) {
       // Output is not reported: like gate output it may hold a secret, and the result reaches agents.
