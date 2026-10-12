@@ -23,6 +23,7 @@ Describe what this repository owns and the audience it serves.
 - Identify allowed areas for ordinary work.
 - Identify changes that require a separate plan or explicit approval.
 - Separate implementation from merge, deployment, provider access, and destructive recovery.
+- Keep no permanent compatibility code for state from before a change: no legacy branches, aliases, shims, or fallbacks for old data or names. First check whether any real environment still holds the old state; if none does, just make the change, and if one does, prefer a one-time migration that converts that state (data, receipts, names) so the code only knows the new shape.
 
 ## Architecture and invariants
 
