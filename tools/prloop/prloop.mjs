@@ -958,12 +958,19 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
     if (!existsSync(file)) return hadFile ? {} : { generated, regenerate };
     try { return readConfigFile(file, REPO_KEYS); } catch (e) { return { generated, regenerate, invalid: e.message }; }
   };
+  // Only configuration the PR head already declared (or the caller passed, without a committed file) is approved: a base
+  // that adds a regenerate command or broadens generated (globs or linguist-generated) must not run or discard code unseen.
+  const headFile = tryGit(['show', `${head}:.prloop.json`], cwd);
+  let approved = { generated, regenerate };
+  if (headFile !== null) try { approved = JSON.parse(headFile); } catch { approved = {}; }
   const unioned = new Set(), regenerated = new Set();
   for (let i = 0; !ok && i < 200; i++) {
     const conflicted = unmerged(cwd);
     if (!conflicted.length) break; // the step failed for another reason
     const now = synced();
-    const gen = now.regenerate ? generatedFiles(cwd, conflicted.filter((f) => !unionRes.some((r) => r.test(f))), [target, head], now.generated ?? []) : [];
+    const candidates = conflicted.filter((f) => !unionRes.some((r) => r.test(f)));
+    // A file takes the base side only when both the synced and the approved configuration call it generated.
+    const gen = now.regenerate ? generatedFiles(cwd, generatedFiles(cwd, candidates, [head], approved.generated ?? []), [target, head], now.generated ?? []) : [];
     gen.forEach((f) => { takeBase(f); regenerated.add(f); });
     const manual = unmerged(cwd).length ? resolveUnion(cwd, union, baseStage) : [];
     conflicted.filter((f) => !gen.includes(f) && !manual.includes(f)).forEach((f) => unioned.add(f));
@@ -1031,13 +1038,9 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
       return { verdict: 'error', error: why };
     };
     if (!final.regenerate) return fail(`the synced .prloop.json no longer declares regenerate: merge ${base} by hand and regenerate ${[...regenerated].join(', ') || 'the generated files'} from their sources`);
-    // Only a command the PR head already declared (or the caller passed, without a committed file) is approved to run:
-    // one the base introduced is shown and fails closed, so a new base commit never runs unreviewed shell commands.
-    const headFile = tryGit(['show', `${head}:.prloop.json`], cwd);
-    let approved = regenerate;
-    if (headFile !== null) try { approved = JSON.parse(headFile).regenerate; } catch { approved = undefined; }
+    // A command the base introduced is shown and fails closed, so a new base commit never runs unreviewed shell commands.
     const list = (c) => JSON.stringify([c ?? []].flat());
-    if (list(approved) !== list(final.regenerate)) {
+    if (list(approved.regenerate) !== list(final.regenerate)) {
       return fail(`the synced .prloop.json changed regenerate to ${list(final.regenerate)}, which was not approved: inspect it, set the same regenerate in the branch's .prloop.json (commit and push), then rerun \`prloop sync\``);
     }
     for (const cmd of [final.regenerate].flat()) {
