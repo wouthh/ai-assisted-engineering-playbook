@@ -28,7 +28,9 @@ Agent-in-the-loop commands:
   prloop mark-tested [--sha <sha>] [--gate "<cmd>"]
                                          manual escape hatch; with --gate, records that this gate passed on the clean tree
   prloop wait <pr>
-  prloop sync <pr> [--union <glob>]...
+  prloop sync <pr> [--union <glob>]... [--continue]
+                                         --continue: start or finish a sync whose manual conflicts stay in the
+                                         working tree; resolve them, then run it again to continue and push
 
 Options (flag or env):
   --gate <cmd>              PRLOOP_GATE            the project's full validation command
@@ -48,7 +50,8 @@ Options (flag or env):
                                                    default: true for a declared heavy gate
 
 Per repository: .prloop.json in the repository root may set gate, gateWeight, union, merge (the method
-for --merge repo) and reviewBeforeGate; flags and environment override it.
+for --merge repo), reviewBeforeGate, generated (globs) and regenerate (a command or a list, which lets sync
+resolve conflicts limited to generated files itself); flags and environment override it.
 
 Self-check: \`run\` and \`ready\` warn when prloop's own checkout is dirty, off its default branch or behind it.
   --require-current         PRLOOP_REQUIRE_CURRENT=1  fail with a usage error instead of warning
@@ -66,7 +69,7 @@ Exit codes: 0 clean/ok/merged, 10 findings, 20 not_requested, 21 requested_while
 
 // ---------- small helpers ----------
 
-const FLAGS = new Set(['help', 'status', 'requireCurrent', 'forceGate']);
+const FLAGS = new Set(['help', 'status', 'requireCurrent', 'forceGate', 'continue']);
 
 // Every option except FLAGS takes a value; a missing one fails instead of becoming `true`.
 export function parseArgs(argv) {
@@ -136,7 +139,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const short = (sha) => (sha ?? '').slice(0, 7);
 
 // Values that one key of a config file may hold; anything else is a usage error, not a silent default.
-const REPO_KEYS = { gate: 'string', gateWeight: 'string|number', union: 'array', merge: 'string', reviewBeforeGate: 'boolean' };
+const REPO_KEYS = { gate: 'string', gateWeight: 'string|number', union: 'array', merge: 'string', reviewBeforeGate: 'boolean', regenerate: 'string|array', generated: 'array' };
 const MACHINE_KEYS = { gateSlots: 'number|string', maxLoad: 'number|string', minFreeMem: 'number|string', resourceWait: 'string', gateTmpdir: 'string' };
 function readConfigFile(file, keys) {
   if (!file || !existsSync(file)) return {};
@@ -739,23 +742,25 @@ export function unionLines(baseSide, branchSide) {
 }
 
 // Resolves conflicts that only touch union files; returns the remaining manual conflicts.
+const unmerged = (cwd) => git(['diff', '--name-only', '--diff-filter=U'], cwd).split('\n').filter(Boolean);
+
+// Resolves the conflicted union files; returns the remaining manual conflicts (null when nothing is conflicted).
 export function resolveUnion(cwd, globs, baseStage) {
-  const files = git(['diff', '--name-only', '--diff-filter=U'], cwd).split('\n').filter(Boolean);
+  const files = unmerged(cwd);
   if (!files.length) return null; // the step failed for another reason
   const res = globs.map(globToRegex);
   const manual = files.filter((f) => !res.some((r) => r.test(f)));
-  if (manual.length) return manual;
-  for (const f of files) {
+  for (const f of files.filter((x) => !manual.includes(x))) {
     const stage = (n) => tryGit(['show', `:${n}:${f}`], cwd);
     const base = stage(baseStage), branch = stage(baseStage === 2 ? 3 : 2);
-    if (base === null || branch === null) return [f]; // delete/modify: needs a human
+    if (base === null || branch === null) { manual.push(f); continue; } // delete/modify: needs a human
     // A symlink side would make the write follow the link and stage the link instead of the union.
     const modes = git(['ls-files', '-u', '--', f], cwd).split('\n').map((l) => l.split(' ')[0]);
-    if (modes.some((m) => m !== '100644' && m !== '100755') || lstatSync(join(cwd, f)).isSymbolicLink()) return [f];
+    if (modes.some((m) => m !== '100644' && m !== '100755') || lstatSync(join(cwd, f)).isSymbolicLink()) { manual.push(f); continue; }
     writeFileSync(join(cwd, f), unionLines(base, branch));
     git(['add', '--', f], cwd);
   }
-  return [];
+  return manual;
 }
 
 // Fetches the base and checks that origin/<base> contains the base commit GitHub reports for the PR,
@@ -780,61 +785,104 @@ export function patchId(cwd, base, head, unioned = []) {
   return text ? sh('git', ['patch-id', '--stable'], { cwd, input: `${text}\n`, stdio: ['pipe', 'pipe', 'pipe'] }).split(' ')[0] || null : null;
 }
 
-// Conflicted files that either side marks generated (`linguist-generated` in its .gitattributes): regenerate, don't hand-merge.
-const generatedFiles = (cwd, files, revs) => files.filter((f) => revs.some((rev) =>
+// Conflicted files matching the `generated` globs or that either side marks generated (`linguist-generated` in its
+// .gitattributes): regenerate, don't hand-merge.
+const generatedFiles = (cwd, files, revs, globs = []) => files.filter((f) => globs.some((g) => globToRegex(g).test(f)) || revs.some((rev) =>
   /: linguist-generated: (set|true)$/.test(tryGit(['check-attr', `--source=${rev}`, 'linguist-generated', '--', f], cwd) ?? '')));
+const MARKER = /^(<{7}|>{7})( |$)/m;
+const hasMarkers = (cwd, f) => { try { return MARKER.test(readFileSync(join(cwd, f), 'utf8')); } catch { return false; } };
 
 // `rebase` forces a rebase (and linearizing), for `run --merge rebase`; otherwise the repository's merge settings decide.
-export function syncBranch({ cwd, branch, base, baseOid, head, settings, union = [], remote = 'origin', rebase: forceRebase = false }) {
+// With `regenerate`, conflicts limited to generated files take the base side and the command runs once at the end.
+// `resume` (`sync --continue`) leaves manual conflicts in the working tree instead of aborting, and on the next call
+// continues the sync in progress: the caller resolved them by hand.
+export function syncBranch({ cwd, branch, base, baseOid, head, settings, union = [], generated = [], regenerate, remote = 'origin', rebase: forceRebase = false, resume = false }) {
   // A fork PR's branch usually tracks its own remote; push there, not to the base repository.
   const headRemote = tryGit(['config', `branch.${branch}.remote`], cwd) || remote;
-  if (tryGit(['branch', '--show-current'], cwd) !== branch) return { verdict: 'error', error: `run sync inside a checkout of ${branch}` };
-  if (dirty(cwd)) return { verdict: 'error', error: 'working tree is not clean' };
-  const baseError = fetchBase(cwd, base, baseOid, remote);
-  if (baseError) return { verdict: 'error', error: baseError };
-  tryGit(['fetch', '--quiet', headRemote, branch], cwd);
-  if (git(['rev-parse', 'HEAD'], cwd) !== head) return { verdict: 'error', error: `local HEAD differs from remote PR head ${short(head)}: push or pull first` };
   // Sync to the fetched base branch: GitHub's baseRefOid can lag far behind it, and a branch that contains that
   // commit may still conflict with the real base. fetchBase checked that the fetched branch contains it.
   const target = `${remote}/${base}`;
-  // ponytail: merge whenever merge or squash merges are allowed; rebase only for rebase-only repos.
-  const rebase = forceRebase || (!settings.merge && !settings.squash);
-  // A rebase-only repository refuses a branch with merge commits even when it contains the base: linearize it.
-  const merges = rebase && !!git(['rev-list', '--merges', `${target}..HEAD`], cwd);
-  const upToDate = tryGit(['merge-base', '--is-ancestor', target, 'HEAD'], cwd) !== null;
-  if (!merges && upToDate) return { verdict: 'up_to_date', head };
   const env = { ...process.env, GIT_EDITOR: 'true' };
   const step = (args) => spawnSync('git', args, { cwd, env, encoding: 'utf8' }).status === 0;
-  const unioned = new Set();
-  let ok = step(rebase ? ['rebase', target] : ['merge', '--no-edit', target]);
+  const rebaseDir = resolve(cwd, git(['rev-parse', '--git-path', 'rebase-merge'], cwd));
+  const inRebase = existsSync(rebaseDir), inMerge = tryGit(['rev-parse', '-q', '--verify', 'MERGE_HEAD'], cwd) !== null;
+  const resumed = resume && (inRebase || inMerge);
+  let rebase, merges, upToDate = false, ok;
+  if (resumed) {
+    // Only a sync of this branch at the PR head onto the fetched base may be continued.
+    rebase = inRebase;
+    const read = (f) => tryGit(['rev-parse', '-q', '--verify', readFileSync(join(rebaseDir, f), 'utf8').trim()], cwd);
+    const onto = tryGit(['rev-parse', target], cwd);
+    const ours = rebase
+      ? readFileSync(join(rebaseDir, 'head-name'), 'utf8').trim() === `refs/heads/${branch}` && read('orig-head') === head && read('onto') === onto
+      : tryGit(['branch', '--show-current'], cwd) === branch && git(['rev-parse', 'HEAD'], cwd) === head && git(['rev-parse', 'MERGE_HEAD'], cwd) === onto;
+    if (!ours) return { verdict: 'error', error: `the ${rebase ? 'rebase' : 'merge'} in progress is not a sync of ${branch} at ${short(head)} onto ${target}` };
+    const left = unmerged(cwd).filter((f) => hasMarkers(cwd, f));
+    if (left.length) return { verdict: 'conflict', conflicts: left, generated: [], method: rebase ? 'rebase' : 'merge', inProgress: true,
+      next: 'remove the conflict markers from these files, then run `prloop sync <pr> --continue` again' };
+    git(['add', '-u'], cwd);
+    merges = rebase && !!git(['rev-list', '--merges', `${target}..${head}`], cwd);
+    ok = step(rebase ? ['rebase', '--continue'] : ['commit', '--no-edit']);
+  } else {
+    if (tryGit(['branch', '--show-current'], cwd) !== branch) return { verdict: 'error', error: `run sync inside a checkout of ${branch}` };
+    if (dirty(cwd)) return { verdict: 'error', error: 'working tree is not clean' };
+    const baseError = fetchBase(cwd, base, baseOid, remote);
+    if (baseError) return { verdict: 'error', error: baseError };
+    tryGit(['fetch', '--quiet', headRemote, branch], cwd);
+    if (git(['rev-parse', 'HEAD'], cwd) !== head) return { verdict: 'error', error: `local HEAD differs from remote PR head ${short(head)}: push or pull first` };
+    // ponytail: merge whenever merge or squash merges are allowed; rebase only for rebase-only repos.
+    rebase = forceRebase || (!settings.merge && !settings.squash);
+    // A rebase-only repository refuses a branch with merge commits even when it contains the base: linearize it.
+    merges = rebase && !!git(['rev-list', '--merges', `${target}..HEAD`], cwd);
+    upToDate = tryGit(['merge-base', '--is-ancestor', target, 'HEAD'], cwd) !== null;
+    if (!merges && upToDate) return { verdict: 'up_to_date', head };
+    ok = step(rebase ? ['rebase', target] : ['merge', '--no-edit', target]);
+  }
+  const method = rebase ? 'rebase' : 'merge';
+  // During a rebase stage 2 is the base side; during a merge stage 3 is.
+  const baseStage = rebase ? 2 : 3;
+  const unionRes = union.map(globToRegex);
+  const takeBase = (f) => {
+    if (git(['ls-files', '-u', '--', f], cwd).split('\n').some((l) => l.split(/\s+/)[2] === String(baseStage))) {
+      git(['checkout', rebase ? '--ours' : '--theirs', '--', f], cwd);
+      git(['add', '--', f], cwd);
+    } else git(['rm', '-q', '--', f], cwd); // the base deleted it
+  };
+  const unioned = new Set(), regenerated = new Set();
   for (let i = 0; !ok && i < 200; i++) {
-    const conflicted = git(['diff', '--name-only', '--diff-filter=U'], cwd).split('\n').filter(Boolean);
-    // During a rebase stage 2 is the base side; during a merge stage 3 is.
-    const manual = resolveUnion(cwd, union, rebase ? 2 : 3);
-    if (!manual) break;
-    if (!manual.length) conflicted.forEach((f) => unioned.add(f));
+    const conflicted = unmerged(cwd);
+    if (!conflicted.length) break; // the step failed for another reason
+    const gen = regenerate ? generatedFiles(cwd, conflicted.filter((f) => !unionRes.some((r) => r.test(f))), [target, head], generated) : [];
+    gen.forEach((f) => { takeBase(f); regenerated.add(f); });
+    const manual = unmerged(cwd).length ? resolveUnion(cwd, union, baseStage) : [];
+    conflicted.filter((f) => !gen.includes(f) && !manual.includes(f)).forEach((f) => unioned.add(f));
     if (manual.length) {
+      if (resume) return { verdict: 'conflict', conflicts: manual, generated: gen, method, inProgress: true,
+        next: `resolve these conflicts in the working tree${gen.length ? ' (the generated files already take the base side and are regenerated at the end)' : ''}, then run \`prloop sync <pr> --continue\`` };
       step([rebase ? 'rebase' : 'merge', '--abort']);
-      const generated = generatedFiles(cwd, manual, [target, head]);
-      return { verdict: 'conflict', conflicts: manual, generated, method: rebase ? 'rebase' : 'merge',
-        next: `resolve these conflicts by hand${generated.length ? ` (regenerate ${generated.join(', ')} from their sources instead of merging them)` : ''}, then run your gate and push` };
+      const named = regenerate ? gen : generatedFiles(cwd, manual, [target, head], generated);
+      return { verdict: 'conflict', conflicts: manual, generated: named, method,
+        next: regenerate
+          ? `run \`prloop sync <pr> --continue\`, resolve these conflicts in the working tree it leaves, then run it again to finish${gen.length ? ` (it regenerates ${gen.join(', ')} itself)` : ''}`
+          : `resolve these conflicts by hand${named.length ? ` (regenerate ${named.join(', ')} from their sources instead of merging them)` : ''}, then run your gate and push` };
     }
     ok = step(rebase ? ['rebase', '--continue'] : ['commit', '--no-edit']);
   }
   if (!ok) {
     step([rebase ? 'rebase' : 'merge', '--abort']);
-    return { verdict: 'error', error: `${rebase ? 'rebase' : 'merge'} failed` };
+    return { verdict: 'error', error: `${method} failed` };
   }
   // A rebase drops merge commits, including edits made only in them: push only when the result equals merging the base.
   if (merges) {
-    // merge-tree exits 1 on conflicts but still writes a tree; conflicts only in union-resolved files are excluded
-    // from the tree comparison, since the rebase resolved them line by line. Instead every line the old head had in
-    // such a file must survive, with the merged mode, so lines or modes changed only in a merge commit are not dropped.
+    // merge-tree exits 1 on conflicts but still writes a tree; conflicts only in union-resolved or regenerated files are
+    // excluded from the tree comparison, since sync resolved them itself. Instead every line the old head had in a
+    // union file must survive, with the merged mode, so lines or modes changed only in a merge commit are not dropped.
+    // ponytail: a sync resumed after manual resolution has unknown resolved files, so its conflicts fail this closed.
     const mt = upToDate ? null : spawnSync('git', ['merge-tree', '--write-tree', '--name-only', target, head], { cwd, encoding: 'utf8' });
     const [tree, ...conflicts] = upToDate ? [git(['rev-parse', `${head}^{tree}`], cwd)] : mt.status <= 1 ? mt.stdout.split('\n\n')[0].split('\n').filter(Boolean) : [];
-    const same = !!tree && conflicts.every((f) => unioned.has(f))
+    const same = !!tree && conflicts.every((f) => unioned.has(f) || regenerated.has(f))
       && tryGit(['diff', '--quiet', tree, 'HEAD', '--', '.', ...conflicts.map((f) => `:(exclude,literal)${f}`)], cwd) !== null
-      && conflicts.every((f) => {
+      && conflicts.filter((f) => unioned.has(f)).every((f) => {
         // Modes too: a merge-only chmod would otherwise be dropped silently.
         const mode = (rev) => (tryGit(['ls-tree', rev, '--', f], cwd) ?? '').split(' ')[0];
         if (mode(tree) !== mode('HEAD')) return false;
@@ -846,15 +894,31 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
       return { verdict: 'error', error: 'linearizing would drop changes made in merge commits: linearize the branch by hand' };
     }
   }
+  // Once at the end, after every generated conflict took the base side (and always when finishing a resumed sync).
+  if (regenerate && (regenerated.size || resumed)) {
+    for (const cmd of [regenerate].flat()) {
+      // Output is not reported: like gate output it may hold a secret, and the result reaches agents.
+      const r = spawnSync('sh', ['-c', cmd], { cwd, stdio: 'ignore' });
+      if (r.status === 0) continue;
+      const why = `regenerate command failed (${cmd}, exit ${r.status}); run it in the checkout to see why`;
+      // A resumed sync holds a manual resolution: keep it locally instead of discarding it.
+      if (resumed) return { verdict: 'error', error: `${why}; the synced branch is local only, at ${short(git(['rev-parse', 'HEAD'], cwd))}` };
+      git(['reset', '--quiet', '--hard', head], cwd);
+      return { verdict: 'error', error: why };
+    }
+    git(['add', '-A'], cwd);
+    if (tryGit(['diff', '--cached', '--quiet'], cwd) === null) git(['commit', '--quiet', '-m', `Regenerate generated files after syncing with ${base}`], cwd);
+  }
   const push = rebase ? ['push', `--force-with-lease=${branch}:${head}`, headRemote, `HEAD:${branch}`] : ['push', headRemote, `HEAD:${branch}`];
   if (!step(push)) return { verdict: 'error', error: 'push failed; the branch is updated locally only' };
   unmarkTested(head, cwd);
   const newHead = git(['rev-parse', 'HEAD'], cwd);
-  // No manual resolution happened here (that aborts above); any difference in the PR's own change needs a new review.
+  // A manual resolution (a resumed sync) always needs a new review; otherwise compare the PR's own change.
   const before = patchId(cwd, target, head, [...unioned]), after = patchId(cwd, target, newHead, [...unioned]);
-  const unchanged = !!before && before === after;
+  const unchanged = !resumed && !!before && before === after;
   const treeUnchanged = git(['rev-parse', `${head}^{tree}`], cwd) === git(['rev-parse', 'HEAD^{tree}'], cwd);
-  return { verdict: 'synced', method: rebase ? 'rebase' : 'merge', ...(merges ? { linearized: true } : {}), head: newHead, previousHead: head, patchId: after, unchanged, treeUnchanged, unioned: [...unioned],
+  return { verdict: 'synced', method, ...(merges ? { linearized: true } : {}), ...(resumed ? { resumed: true } : {}), head: newHead, previousHead: head, patchId: after, unchanged, treeUnchanged,
+    unioned: [...unioned], regenerated: [...regenerated],
     next: unchanged ? 'head changed but the PR\'s own change did not: run your gate; a previous clean review carries over'
       : 'head changed: run your gate, `prloop mark-tested`, then request a review' };
 }
@@ -1076,7 +1140,8 @@ export const plain = (body) => String(body ?? '').replace(/\n+(AGENTS\.md refere
 
 // The fix agent sees only this trigger, never the round history.
 export function buildPrompt(t) {
-  const data = t.trigger === 'conflict' ? `Conflicted files: ${t.conflicts.join(', ')}${t.generated?.length ? `\nGenerated files among them (regenerate them from their sources after resolving the rest, never merge them by hand): ${t.generated.join(', ')}` : ''}`
+  const data = t.trigger === 'conflict' ? `Conflicted files: ${t.conflicts.join(', ')}${t.generated?.length ? `\nGenerated files among them (regenerate them from their sources after resolving the rest, never merge them by hand): ${t.generated.join(', ')}` : ''}
+Resolve them through prloop, never with a raw \`git rebase\` or \`git merge\`: run \`prloop sync ${t.pr} --continue\`, which leaves the conflicts in the working tree; resolve them there (remove every conflict marker; \`git add\` new files), then run \`prloop sync ${t.pr} --continue\` again, which continues, regenerates generated files when the repository declares \`regenerate\`, commits and pushes. Repeat while it reports more conflicts.`
     : t.findings?.length ? `Findings:\n${t.findings.map((f) => `- ${f.id} ${f.path ?? ''}:${f.line ?? ''} ${plain(f.body).slice(0, 600)}`).join('\n')}`
       : `Missing: ${(t.missing ?? []).join('; ') || 'a review request on the current head'}`;
   // Neither the output nor its log path: the output may hold a secret, and the agent reads every referenced file.
@@ -1373,7 +1438,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     const lock = takeLock(cwd, `sync of PR #${st.pr}`);
     if (lock.holder) return lockedOut(st, cwd, lock.holder);
     let v;
-    try { v = syncBranch({ cwd, branch: s.branch, base: s.base, baseOid: raw.baseRefOid, head: s.head, settings: raw.repoSettings, union: opts.union, rebase }); } finally { lock.release(); }
+    try { v = syncBranch({ cwd, branch: s.branch, base: s.base, baseOid: raw.baseRefOid, head: s.head, settings: raw.repoSettings, union: opts.union, generated: opts.generated, regenerate: opts.regenerate, rebase }); } finally { lock.release(); }
     if (v.verdict === 'error') return block(st, `sync failed: ${v.error}`);
     if (v.verdict === 'synced' && v.unchanged && s.verdict === 'clean') {
       st.carry = recordCarry(repo, st.pr, s.head, v);
@@ -1572,7 +1637,8 @@ export async function main(argv) {
       return out({ dir, locked: !!holder, holder: holder ? pick(holder, ['pid', 'purpose', 'startedAt']) : null }, holder ? EXIT.blocked : 0);
     }
     if (cmd === 'mark-tested') {
-      const cwd = process.cwd(), tested = markTested(opts.sha, cwd), gate = opts.gate ?? process.env.PRLOOP_GATE;
+      // The repository's own gate counts too, so a gate declared only in .prloop.json reaches the gate cache.
+      const cwd = process.cwd(), gate = opts.gate ?? process.env.PRLOOP_GATE ?? repoConfig(cwd).gate, tested = markTested(opts.sha, cwd);
       // The caller ran this gate itself on the current clean tree: record it so `ready` does not rerun it.
       const gatePassedHead = gate && tested === git(['rev-parse', 'HEAD'], cwd) ? recordGatePass(gate, cwd) : null;
       return out({ verdict: 'ok', tested, ...(gatePassedHead ? { gatePassedHead } : {}) }, 0);
@@ -1580,6 +1646,7 @@ export async function main(argv) {
     const repoFile = repoConfig(opts.worktree ? resolve(opts.worktree) : process.cwd());
     const cfg = config(opts, process.env, { machine: machineConfig(), repo: repoFile });
     if (!opts.union.length && repoFile.union) opts.union = repoFile.union;
+    Object.assign(opts, { generated: repoFile.generated ?? [], regenerate: repoFile.regenerate });
     // The repository file names the method; merging itself still needs an explicit --merge.
     if (opts.merge === 'repo') opts.merge = repoFile.merge ?? (() => { throw new Error('--merge repo needs "merge" in .prloop.json'); })();
     if (cmd === 'run' && opts.status) return out({ machine: machineLine(cfg), ...runStatus(opts.repo) }, 0);
@@ -1633,7 +1700,7 @@ export async function main(argv) {
       try {
         const pr = fetchPr(repo, prArg);
         const clean = classify(pr, cfg).verdict === 'clean';
-        const v = syncBranch({ cwd, branch: pr.headRefName, base: pr.baseRefName, baseOid: pr.baseRefOid, head: pr.headRefOid, settings: pr.repoSettings, union: opts.union });
+        const v = syncBranch({ cwd, branch: pr.headRefName, base: pr.baseRefName, baseOid: pr.baseRefOid, head: pr.headRefOid, settings: pr.repoSettings, union: opts.union, generated: opts.generated, regenerate: opts.regenerate, resume: !!opts.continue });
         const carry = v.verdict === 'synced' && v.unchanged && clean ? recordCarry(repo, prArg, pr.headRefOid, v) : undefined;
         return out({ pr: Number(prArg), ...v, carry }, v.verdict === 'conflict' ? EXIT.conflict : v.verdict === 'error' ? EXIT.error : 0);
       } finally { lock.release(); }
