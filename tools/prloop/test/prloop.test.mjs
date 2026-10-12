@@ -1477,6 +1477,21 @@ test('run blocks after three GitHub read failures on fresh state', async (t) => 
   assert.match(r.reason, /GitHub read failed/);
 });
 
+test('run logs a merged phase reconciled meanwhile instead of its own stale blocked event', async (t) => {
+  const state = tempState(t);
+  const dir = mkdtempSync(join(tmpdir(), 'prloop-late-'));
+  const old = process.env.PATH;
+  t.after(() => { rmSync(dir, { recursive: true, force: true }); process.env.PATH = old; });
+  const f = join(state, 'example-org__example-repo__7.json');
+  // `run --status` reconciles PR 7 as merged while this run holds its older state in memory.
+  writeFileSync(join(dir, 'gh'), `#!/bin/sh\n[ -e "${dir}/done" ] || { : > "${dir}/done"; printf '%s' '{"repo":"example-org/example-repo","pr":7,"phase":"merged","reason":"the PR was merged on GitHub","reconciledAt":"2026-01-01T00:00:00.000Z"}' > "${f}"; }\necho "{}"\n`, { mode: 0o755 });
+  process.env.PATH = `${dir}:${old}`;
+  await runAll({ repo: 'example-org/example-repo', pr: '7', deadline: '20s' }, { ...cfg, interval: 1 });
+  const [pr] = runStatus('example-org/example-repo').prs;
+  assert.equal(pr.phase, 'merged');
+  assert.deepEqual(pick(pr.events.at(-1), ['phase', 'reason']), { phase: 'merged', reason: 'the PR was merged on GitHub' });
+});
+
 test('run ends a PR closed on GitHub as closed, not blocked', async (t) => {
   const state = tempState(t);
   const dir = mkdtempSync(join(tmpdir(), 'prloop-closed-'));
