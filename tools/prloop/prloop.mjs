@@ -1544,7 +1544,8 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
   const event = (st, phase, extra = {}) => {
     Object.assign(st, { phase, updatedAt: new Date().toISOString() }, extra);
     saveState(st);
-    logEvent(st, { phase, ...pick(extra, ['verdict', 'reason', 'status', 'agentLog']) });
+    // saveState kept a merged or closed phase that `run --status` reconciled meanwhile: log that phase, not this stale one.
+    logEvent(st, st.phase === phase ? { phase, ...pick(extra, ['verdict', 'reason', 'status', 'agentLog']) } : pick(st, ['phase', 'reason']));
   };
   const block = (st, reason, next = 'a human decision is needed') => event(st, 'blocked', { reason, next });
   // One resource wait for the whole run: the machine is the same for every PR.
