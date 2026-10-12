@@ -832,7 +832,15 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
     // made while resolving would be committed and pushed unseen.
     const stray = [...git(['diff', '--name-only'], cwd).split('\n'), ...git(['ls-files', '--others', '--exclude-standard'], cwd).split('\n')].filter(Boolean);
     if (stray.length) return { verdict: 'conflict', conflicts: [], stray, generated: [], method: rebase ? 'rebase' : 'merge', inProgress: true,
-      next: `stage or remove ${stray.join(', ')} (unstaged or untracked, not part of the sync), then run \`prloop sync <pr> --continue\` again` };
+      next: `stage (if a resolution) or discard ${stray.join(', ')} (unstaged or untracked, not part of the sync), then run \`prloop sync <pr> --continue\` again` };
+    // A staged file is a resolution only if the step itself changes it: the picked commit during a rebase, the base's
+    // side during a merge. Anything else staged would ride along into the pushed commit.
+    const lines = (args) => new Set(git(args, cwd).split('\n').filter(Boolean));
+    const touched = lines(rebase ? ['diff-tree', '--no-commit-id', '--name-only', '-r', '--root', '--no-renames', 'REBASE_HEAD']
+      : ['diff', '--name-only', '--no-renames', 'HEAD...MERGE_HEAD']);
+    const staged = [...lines(['diff', '--cached', '--name-only', '--no-renames', 'HEAD'])].filter((f) => !touched.has(f));
+    if (staged.length) return { verdict: 'conflict', conflicts: [], stray: staged, generated: [], method: rebase ? 'rebase' : 'merge', inProgress: true,
+      next: `unstage and remove ${staged.join(', ')} (\`git restore --staged\`; staged but not changed by the sync), then run \`prloop sync <pr> --continue\` again` };
     merges = rebase && !!git(['rev-list', '--merges', `${target}..${head}`], cwd);
     ok = step(rebase ? ['rebase', '--continue'] : ['commit', '--no-edit']);
   } else {
