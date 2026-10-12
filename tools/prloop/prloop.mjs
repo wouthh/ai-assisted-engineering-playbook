@@ -736,12 +736,15 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
   if (merges) {
     // merge-tree exits 1 on conflicts but still writes a tree; conflicts only in union-resolved files are excluded
     // from the tree comparison, since the rebase resolved them line by line. Instead every line the old head had in
-    // such a file must survive, so lines added only in a merge commit are not dropped.
+    // such a file must survive, with the merged mode, so lines or modes changed only in a merge commit are not dropped.
     const mt = upToDate ? null : spawnSync('git', ['merge-tree', '--write-tree', '--name-only', target, head], { cwd, encoding: 'utf8' });
     const [tree, ...conflicts] = upToDate ? [git(['rev-parse', `${head}^{tree}`], cwd)] : mt.status <= 1 ? mt.stdout.split('\n\n')[0].split('\n').filter(Boolean) : [];
     const same = !!tree && conflicts.every((f) => unioned.has(f))
       && tryGit(['diff', '--quiet', tree, 'HEAD', '--', '.', ...conflicts.map((f) => `:(exclude,literal)${f}`)], cwd) !== null
       && conflicts.every((f) => {
+        // Modes too: a merge-only chmod would otherwise be dropped silently.
+        const mode = (rev) => (tryGit(['ls-tree', rev, '--', f], cwd) ?? '').split(' ')[0];
+        if (mode(tree) !== mode('HEAD')) return false;
         const now = new Set((tryGit(['show', `HEAD:${f}`], cwd) ?? '').split('\n'));
         return (tryGit(['show', `${head}:${f}`], cwd) ?? '').split('\n').every((l) => now.has(l));
       });
