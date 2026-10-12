@@ -1061,7 +1061,6 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
     // commits against each parent, so a move made only in a merge commit counts too (failing closed on false hits).
     // -l0 lifts diff.renameLimit, which otherwise skips copy detection silently on large commits. -C1% pairs a move whose
     // destination was mostly rewritten (the 50% default reports it as an added file), failing closed on chance overlaps.
-    // ponytail: a destination sharing no content with the union file is indistinguishable from an unrelated new file.
     const log = tryGit(['log', '-m', '-z', '--format=', '--name-status', '-C1%', '--find-copies-harder', '-l0', `${mb}..${head}`], cwd);
     if (log === null) return fail(`listing the renames in the PR range failed; merge ${base} by hand`);
     // Trim status tokens only: -z keeps path tokens verbatim, and a path may start or end with whitespace.
@@ -1069,6 +1068,26 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
     for (let i = 0; i < tok.length; i++) {
       const st = tok[i].trim();
       if (/^[RC]\d*$/.test(st)) { moved.add(tok[i + 1]); i += 2; } else if (st === 'D') moved.add(tok[++i]); else if (st) i++;
+    }
+    // Below any similarity threshold (a few moved lines inside a much larger new file), a rename and recreation in one
+    // commit shows as a modified union file next to an added one: count it as moved when that commit added a file
+    // holding a line the union file lost. Each parent of a merge commit is checked, like -m above.
+    // ponytail: a destination sharing no content with the union file is indistinguishable from an unrelated new file.
+    const commits = tryGit(['rev-list', '--parents', `${mb}..${head}`], cwd);
+    if (commits === null) return fail(`listing the PR commits failed; merge ${base} by hand`);
+    for (const [c, ...parents] of commits.split('\n').filter(Boolean).map((l) => l.split(' '))) {
+      for (const p of parents) {
+        const out = tryGit(['diff-tree', '-z', '-r', '--no-renames', '--name-status', p, c], cwd);
+        if (out === null) return fail(`listing the changes of ${short(c)} failed; merge ${base} by hand`);
+        const t = out.split('\0');
+        const added = [], changed = [];
+        for (let i = 0; i + 1 < t.length; i += 2) if (t[i] === 'A') added.push(t[i + 1]); else if (t[i] === 'M') changed.push(t[i + 1]);
+        for (const f of changed.filter((f) => unioned.has(f) && !moved.has(f))) {
+          const kept = new Set((show(c, f) ?? '').split('\n'));
+          const lost = (show(p, f) ?? '').split('\n').filter((l) => l.trim() && !kept.has(l));
+          if (lost.length && added.some((a) => { const s = new Set((show(c, a) ?? '').split('\n')); return lost.some((l) => s.has(l)); })) moved.add(f);
+        }
+      }
     }
     for (const f of unioned) {
       const branchSide = show(head, f), baseSide = show(target, f);

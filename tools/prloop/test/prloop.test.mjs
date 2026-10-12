@@ -734,6 +734,24 @@ test('sync fails closed when a moved union file was rewritten below the default 
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
 });
 
+test('sync fails closed when a moved union file is a tiny part of a much larger new file and was recreated', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  const old = Array.from({ length: 100 }, (_, i) => `row${i}`).join('\n');
+  r.commit('feature', { 'log.csv': `${old}\n` });
+  r.run(r.work, 'mv', 'log.csv', 'big.csv');
+  // 100 moved lines in a 20,000-line file stay below even a 1% copy threshold.
+  const big = `${old}\n${Array.from({ length: 19900 }, (_, i) => `new${i}`).join('\n')}\n`;
+  r.commit('move into a large file and recreate', { 'big.csv': big, 'log.csv': 'other\nunrelated\n' });
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  divergeOnMain(r, { 'log.csv': `${old}\nX\n` });
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true, squash: true }, union: ['*.csv'] });
+  assert.equal(v.verdict, 'error', JSON.stringify(v));
+  assert.match(v.error, /renamed or deleted and then recreated/);
+  assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
+});
+
 test('sync fails closed on a renamed and recreated union file even under a low diff.renameLimit', (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
