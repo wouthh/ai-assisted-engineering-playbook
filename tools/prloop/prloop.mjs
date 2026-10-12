@@ -1266,6 +1266,17 @@ const writeState = (st) => {
   chmodSync(statePath(st.repo, st.pr), 0o600);
 };
 
+// Saves a run's phase change and logs it under one state lock, so a `run --status` reconciliation cannot land between
+// the save and the append and leave this stale phase as the newest event after its merged or closed one.
+export function recordEvent(st, phase, extra = {}) {
+  Object.assign(st, { phase, updatedAt: new Date().toISOString() }, extra);
+  withStateLock(st.repo, st.pr, () => {
+    writeState(st);
+    // writeState kept a merged or closed phase that `run --status` reconciled meanwhile: log that phase, not this stale one.
+    logEvent(st, st.phase === phase ? { phase, ...pick(extra, ['verdict', 'reason', 'status', 'agentLog']) } : pick(st, ['phase', 'reason']));
+  });
+}
+
 // Appends one event to the PR's run log, or to a new log when no run has written this PR yet.
 function logEvent(st, e) {
   mkdirSync(stateDir(), { recursive: true });
@@ -1541,12 +1552,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
   // Rounds and seen findings persist across runs on purpose; `prloop reset-rounds` resets the rounds once.
   const states = prs.map((n) => ({ ...loadState(repo, n), repo, pr: n, log, phase: 'polling', reason: undefined, next: undefined, agentLog: undefined, mergeRetried: undefined }));
   const busy = new Map();
-  const event = (st, phase, extra = {}) => {
-    Object.assign(st, { phase, updatedAt: new Date().toISOString() }, extra);
-    saveState(st);
-    // saveState kept a merged or closed phase that `run --status` reconciled meanwhile: log that phase, not this stale one.
-    logEvent(st, st.phase === phase ? { phase, ...pick(extra, ['verdict', 'reason', 'status', 'agentLog']) } : pick(st, ['phase', 'reason']));
-  };
+  const event = recordEvent;
   const block = (st, reason, next = 'a human decision is needed') => event(st, 'blocked', { reason, next });
   // One resource wait for the whole run: the machine is the same for every PR.
   const wait = {};
