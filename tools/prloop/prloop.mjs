@@ -1088,13 +1088,13 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
           if (after === null || before === null) return fail(`reading union file ${f} in ${short(c)} failed; merge ${base} by hand`);
           const kept = new Set(after.split('\n'));
           const lost = before.split('\n').filter((l) => l.trim() && !kept.has(l));
-          if (!lost.length) continue;
-          for (const a of added) {
-            const blob = show(c, a);
-            if (blob === null) return fail(`reading ${a} in ${short(c)} failed; merge ${base} by hand`);
-            const s = new Set(blob.split('\n'));
-            if (lost.some((l) => s.has(l))) { moved.add(f); break; }
-          }
+          if (!lost.length || !added.length) continue;
+          // git grep streams blobs of any size and skips gitlinks, which hold no lines; exit 1 means no match. It has no
+          // whole-line flag, so each lost line becomes an anchored, escaped pattern.
+          const pat = lost.map((l) => `^${l.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`).join('\n');
+          const g = spawnSync('git', ['grep', '-q', '-E', '-f', '-', c, '--', ...added.map((a) => `:(literal)${a}`)], { cwd, input: pat });
+          if (g.status === 0) moved.add(f);
+          else if (g.status !== 1) return fail(`searching the files ${short(c)} added failed; merge ${base} by hand`);
         }
       }
     }
