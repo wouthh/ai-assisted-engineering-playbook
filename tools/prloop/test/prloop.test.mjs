@@ -1322,8 +1322,14 @@ test('run --status marks PRs merged or closed outside a run, with one GitHub cal
   assert.equal(calls.length, 1);
   assert.match(calls[0], /p7:pullRequest\(number:7\).*p8:.*p9:/);
   assert.doesNotMatch(calls[0], /p10:/);
+  // A supervisor saved newer state for PR 11 meanwhile; reconciliation keeps it and only sets the phase.
+  write(11, 'waiting');
+  const f11 = join(dir, 'example-org__example-repo__11.json');
+  writeFileSync(join(bin, 'gh'), `#!/bin/sh\necho "$*" >> "${bin}/calls.log"\nprintf '%s' '{"repo":"example-org/example-repo","pr":11,"phase":"agent","rounds":3}' > "${f11}"\necho '{"data":{"repository":{"p8":{"state":"OPEN"},"p11":{"state":"CLOSED"}}}}'\n`, { mode: 0o755 });
+  reconcileStates('example-org/example-repo');
+  assert.deepEqual(pick(JSON.parse(readFileSync(f11, 'utf8')), ['phase', 'rounds']), { phase: 'closed', rounds: 3 });
   reconcileStates('example-org/example-repo', [8]); // only the open blocker remains a candidate, and a run skips its own PRs
-  assert.equal(readFileSync(join(bin, 'calls.log'), 'utf8').trim().split('\n').length, 1);
+  assert.equal(readFileSync(join(bin, 'calls.log'), 'utf8').trim().split('\n').length, 2);
 });
 
 test('reset-rounds resets the counter once, logs it, and refuses a second reset', (t) => {
@@ -1452,6 +1458,16 @@ test('run blocks after three GitHub read failures on fresh state', async (t) => 
   const [r] = await runAll({ repo: 'example-org/example-repo', pr: '7', deadline: '20s' }, { ...cfg, interval: 1 });
   assert.equal(r.verdict, 'blocked');
   assert.match(r.reason, /GitHub read failed/);
+});
+
+test('run ends a PR closed on GitHub as closed, not blocked', async (t) => {
+  const state = tempState(t);
+  const dir = mkdtempSync(join(tmpdir(), 'prloop-closed-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  fakeGh(t, dir, { ...fixture(), state: 'CLOSED' });
+  const [r] = await runAll({ repo: 'example-org/example-repo', pr: '7', deadline: '20s' }, { ...cfg, interval: 1 });
+  assert.deepEqual([r.verdict, r.reason, runExitCode([r])], ['closed', 'the PR is closed', 0]);
+  assert.equal(JSON.parse(readFileSync(join(state, 'example-org__example-repo__7.json'), 'utf8')).phase, 'closed');
 });
 
 test('value options need a value; only --help and --status are flags', () => {
