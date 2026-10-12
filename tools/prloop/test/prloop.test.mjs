@@ -2260,16 +2260,28 @@ test('sync fails closed when regenerate leaves uncommitted changes inside a subm
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
 });
 
-test('sync regenerates with the command the synced .prloop.json declares, never the branch\'s stale one', (t) => {
+test('sync never runs a regenerate command the base introduced; it runs once the branch declares it', (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   r.commit('feature', { 'gen.txt': 'feature\n' });
   r.run(r.work, 'push', '-q', 'origin', 'feat');
-  divergeOnMain(r, { 'gen.txt': 'base\n', '.prloop.json': '{"generated":["gen.txt"],"regenerate":"echo synced > gen.txt"}\n' });
-  const head = r.run(r.work, 'rev-parse', 'HEAD');
-  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true }, generated: ['gen.txt'], regenerate: 'echo stale > ran.txt' });
-  assert.equal(v.verdict, 'synced', JSON.stringify(v));
+  const config = '{"generated":["gen.txt"],"regenerate":"echo synced > gen.txt; echo ran > ran.txt"}\n';
+  divergeOnMain(r, { 'gen.txt': 'base\n', '.prloop.json': config });
+  let head = r.run(r.work, 'rev-parse', 'HEAD');
+  const args = { cwd: r.work, branch: 'feat', base: 'main', settings: { merge: true }, generated: ['gen.txt'], regenerate: 'echo stale > ran.txt' };
+  let v = syncBranch({ ...args, head });
+  assert.equal(v.verdict, 'error', JSON.stringify(v));
+  assert.match(v.error, /changed regenerate to .*echo synced.*not approved/);
   assert.ok(!existsSync(join(r.work, 'ran.txt')));
+  assert.equal(r.run(r.work, 'rev-parse', 'HEAD'), head);
+  assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
+  assert.equal(r.run(r.work, 'status', '--porcelain'), '');
+  // A fresh run after the branch adopted the inspected command runs it.
+  r.commit('adopt config', { '.prloop.json': config });
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  head = r.run(r.work, 'rev-parse', 'HEAD');
+  v = syncBranch({ ...args, head });
+  assert.equal(v.verdict, 'synced', JSON.stringify(v));
   assert.equal(r.run(r.work, 'cat-file', '-p', 'HEAD:gen.txt'), 'synced');
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), v.head);
 });
