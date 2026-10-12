@@ -604,7 +604,7 @@ test('the local gate requires the PR checkout, a clean tree and a tested pushed 
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   const head = r.run(r.work, 'rev-parse', 'HEAD');
   const s = { branch: 'feat', head };
-  assert.match(localGate(s, r.work).join(), /not marked tested/);
+  assert.match(localGate(s, r.work).join(), /not marked tested.*then `prloop mark-tested`\)/);
   markTested(head, r.work);
   assert.deepEqual(localGate(s, r.work), []);
   writeFileSync(join(r.work, 'app.txt'), 'dirty\n');
@@ -1057,7 +1057,7 @@ test('a head tested by gate A is not tested for gate B: ready --gate B runs B', 
   const a = `echo A >> "${runs}"`, b = `echo B >> "${runs}"`;
   assert.deepEqual(await readyGate(s, { ...cfg, gate: a }, r.work, deps), { ok: true });
   assert.deepEqual(localGate(s, r.work, a), []);
-  assert.match(localGate(s, r.work, b).join(), /not marked tested/); // A's marker is no evidence for B
+  assert.match(localGate(s, r.work, b).join(), /not marked tested.*then `prloop mark-tested --gate "<cmd>"`/); // A's marker is no evidence for B
   assert.deepEqual(await readyGate(s, { ...cfg, gate: b }, r.work, deps), { ok: true });
   assert.equal(readFileSync(runs, 'utf8'), 'A\nB\n');
   assert.deepEqual(localGate(s, r.work, b), []);
