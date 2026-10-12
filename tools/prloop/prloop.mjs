@@ -827,7 +827,16 @@ export function unionLines(baseSide, branchSide) {
   return out.join('\n') + '\n';
 }
 
-// Resolves conflicts that only touch union files; returns the remaining manual conflicts.
+// The final content of a union file after a sync: the base's lines (less any the PR deleted since the merge base), then
+// the PR head's lines new since the merge base that the base lacks. Replaying commit by commit can bring back a line a
+// later PR commit removed (#29); this result holds no line that neither side had.
+export function unionResult(mergeBase, baseSide, branchSide) {
+  const lines = (s) => (s ? s.replace(/\n$/, '').split('\n') : []);
+  const mb = new Set(lines(mergeBase)), base = new Set(lines(baseSide)), head = new Set(lines(branchSide));
+  const out = [...lines(baseSide).filter((l) => !mb.has(l) || head.has(l)), ...lines(branchSide).filter((l) => !mb.has(l) && !base.has(l))];
+  return out.length ? `${out.join('\n')}\n` : '';
+}
+
 const unmerged = (cwd) => git(['diff', '--name-only', '--diff-filter=U'], cwd).split('\n').filter(Boolean);
 
 // Resolves the conflicted union files; returns the remaining manual conflicts (null when nothing is conflicted).
@@ -1021,6 +1030,21 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
     if (!same) {
       git(['reset', '--quiet', '--hard', head], cwd);
       return { verdict: 'error', error: 'linearizing would drop changes made in merge commits: linearize the branch by hand' };
+    }
+  }
+  // Union files get their final content from both sides' end states, not the step-by-step replay (#29).
+  if (unioned.size) {
+    const mb = git(['merge-base', target, head], cwd);
+    const show = (rev, f) => tryGit(['show', `${rev}:${f}`], cwd);
+    for (const f of unioned) {
+      const branchSide = show(head, f), baseSide = show(target, f);
+      if (branchSide === null || baseSide === null) continue;
+      writeFileSync(join(cwd, f), unionResult(show(mb, f) ?? '', baseSide, branchSide));
+      git(['add', '--', f], cwd);
+    }
+    if (tryGit(['diff', '--cached', '--quiet'], cwd) === null && !step(['commit', '--quiet', '-m', `Remove lines the union merge brought back after syncing with ${base}`])) {
+      git(['reset', '--quiet', '--hard', head], cwd);
+      return { verdict: 'error', error: 'committing the corrected union files failed (a commit hook?); run the sync in the checkout to see why' };
     }
   }
   // Once at the end, after every generated conflict took the base side (and always when finishing a resumed sync).
@@ -1254,12 +1278,13 @@ function withStateLock(repo, pr, fn) {
 export const saveState = (st) => withStateLock(st.repo, st.pr, () => writeState(st));
 // `prloop sync` may record a carry-over, and an agent's `prloop ready` a gate run, while a run holds this PR's state in
 // memory: the newer carry and the newer gate run win. A phase that `run --status` reconciled (merged, closed or reopened)
-// after this copy was loaded wins too, so a late agent or gate result of that run cannot report the PR as blocked again.
+// after this copy was loaded wins too, with the phase it saved for a reopen (`beforeClose`), so a late agent or gate
+// result of that run cannot report the PR as blocked again, and a reopened PR still gets its prior phase back.
 const writeState = (st) => {
   const disk = loadState(st.repo, st.pr);
   if (disk.carry && !(st.carry?.at >= disk.carry.at)) st.carry = disk.carry;
   if (disk.lastGate && !(st.lastGate?.end >= disk.lastGate.end)) st.lastGate = disk.lastGate;
-  if (disk.reconciledAt && !(st.reconciledAt >= disk.reconciledAt)) for (const k of ['phase', 'reason', 'next', 'reconciledAt']) st[k] = disk[k];
+  if (disk.reconciledAt && !(st.reconciledAt >= disk.reconciledAt)) for (const k of ['phase', 'reason', 'next', 'beforeClose', 'reconciledAt']) st[k] = disk[k];
   mkdirSync(stateDir(), { recursive: true });
   // Owner-only, like the logs it points to.
   writeFileSync(statePath(st.repo, st.pr), JSON.stringify(st, null, 2), { mode: 0o600 });
