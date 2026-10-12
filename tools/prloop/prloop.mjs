@@ -1048,9 +1048,9 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
     const show = (rev, f) => tryGit(['show', `${rev}:${f}`], cwd);
     const regular = (rev, f) => /^100(644|755) /.test(tryGit(['ls-tree', rev, '--', f], cwd) ?? '');
     const fail = (why) => {
-      // A resumed sync holds a manual resolution: keep it locally instead of discarding it.
+      // A resumed sync holds a manual resolution: keep its commit locally, but drop any partial correction.
+      git(['reset', '--quiet', '--hard', ...(resumed ? [] : [head])], cwd);
       if (resumed) return { verdict: 'error', error: `${why}; the synced branch is local only, at ${short(git(['rev-parse', 'HEAD'], cwd))}` };
-      git(['reset', '--quiet', '--hard', head], cwd);
       return { verdict: 'error', error: why };
     };
     for (const f of unioned) {
@@ -1064,7 +1064,6 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
       git(['add', '--', f], cwd);
     }
     if (tryGit(['diff', '--cached', '--quiet'], cwd) === null && !step(['commit', '--quiet', '-m', `Remove lines the union merge brought back after syncing with ${base}`])) {
-      if (resumed) git(['reset', '--quiet', '--hard'], cwd);
       return fail('committing the corrected union files failed (a commit hook?); run the sync in the checkout to see why');
     }
   }
