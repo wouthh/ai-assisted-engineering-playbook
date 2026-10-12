@@ -1344,7 +1344,7 @@ test('sync compares and merges against the fetched base, not a stale reported ba
 test('sync reports a conflict with the fetched base even when the branch contains the reported base, naming generated files', (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
-  r.commit('feature', { '.gitattributes': 'gen.txt linguist-generated\n', 'gen.txt': 'feature build\n', 'app.txt': 'feature\n' });
+  r.commit('feature', { 'gen.txt': 'feature build\n', 'app.txt': 'feature\n' }); // only the base marks gen.txt generated
   r.run(r.work, 'push', '-q', 'origin', 'feat');
   const baseOid = r.run(r.work, 'rev-parse', 'main'); // the branch already contains it: up to date by GitHub's stale view
   divergeOnMain(r, { '.gitattributes': 'gen.txt linguist-generated\n', 'gen.txt': 'base build\n', 'app.txt': 'base\n' });
@@ -1759,6 +1759,8 @@ test('machine and repository config files: precedence flag, env, repository, mac
   assert.equal(config({}, {}, {}).reviewBeforeGate, false); // undeclared weight: gate before review, as before
   assert.deepEqual(['light', 'heavy', '0.5', 2, undefined].map(gateCost), [0, 1, 0, 2, 1]);
   for (const w of ['medium', '1.5', '0', -1]) assert.throws(() => gateCost(w), /gate-weight/);
+  assert.throws(() => config({ gateWeight: '4' }, {}), /needs more slots than --gate-slots 2/);
+  assert.equal(config({ gateWeight: '4', gateSlots: '4' }, {}).gateCost, 4);
   writeFileSync(join(r.work, '.prloop.json'), JSON.stringify({ union: 'CHANGELOG.md' }));
   assert.throws(() => repoConfig(r.work), /union must be array/);
 });
@@ -2015,4 +2017,19 @@ test('run linearizes once and retries when GitHub refuses a rebase merge of a cl
   assert.equal(res.verdict, 'merged', JSON.stringify(res));
   assert.equal(calls().filter((c) => c.startsWith('pr merge')).length, 1);
   assert.match(readFileSync(JSON.parse(readFileSync(join(state, 'example-org__example-repo__7.json'), 'utf8')).log, 'utf8'), /"phase":"merge_refused"/);
+});
+
+test('pipelined run: a clean review without a worktree to gate it is blocked, not clean', async (t) => {
+  const state = tempState(t);
+  const dir = mkdtempSync(join(tmpdir(), 'prloop-nowt-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const pr = fixture();
+  Object.assign(pr, { headRefName: 'no-such-branch', mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE' });
+  writeFileSync(join(state, 'heads.json'), JSON.stringify({ 'example-org/example-repo#7': { sha: pr.headRefOid, at: at('09:00') } }));
+  request(pr).reactions.nodes.push({ content: 'THUMBS_UP', createdAt: at('10:20'), user: BOT });
+  fakeGh(t, dir, pr);
+  const [res] = await runAll({ repo: 'example-org/example-repo', pr: '7', deadline: '1h' },
+    { ...cfg, agent: 'none', interval: 1, gate: 'true', reviewBeforeGate: true }, { metrics: idle().metrics });
+  assert.equal(res.verdict, 'blocked', JSON.stringify(res));
+  assert.match(res.reason, /to run the gate; pass --worktree/);
 });
