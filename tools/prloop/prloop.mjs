@@ -1057,12 +1057,15 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
     };
     // Paths a PR commit deleted, renamed or copied away: a union file among them may have been recreated as an unrelated
     // file under the same name, so its end states cannot be paired up (#31). -C --find-copies-harder also catches a
-    // rename and recreation in one commit, which plain rename detection reports as a modification.
-    const log = tryGit(['log', '-z', '--format=', '--name-status', '-C', '--find-copies-harder', `${mb}..${head}`], cwd);
+    // rename and recreation in one commit, which plain rename detection reports as a modification. -m diffs merge
+    // commits against each parent, so a move made only in a merge commit counts too (failing closed on false hits).
+    const log = tryGit(['log', '-m', '-z', '--format=', '--name-status', '-C', '--find-copies-harder', `${mb}..${head}`], cwd);
     if (log === null) return fail(`listing the renames in the PR range failed; merge ${base} by hand`);
-    const moved = new Set(), tok = log.split('\0').map((t) => t.trim());
+    // Trim status tokens only: -z keeps path tokens verbatim, and a path may start or end with whitespace.
+    const moved = new Set(), tok = log.split('\0');
     for (let i = 0; i < tok.length; i++) {
-      if (/^[RC]\d*$/.test(tok[i])) { moved.add(tok[i + 1]); i += 2; } else if (tok[i] === 'D') moved.add(tok[++i]); else if (tok[i]) i++;
+      const st = tok[i].trim();
+      if (/^[RC]\d*$/.test(st)) { moved.add(tok[i + 1]); i += 2; } else if (st === 'D') moved.add(tok[++i]); else if (st) i++;
     }
     for (const f of unioned) {
       const branchSide = show(head, f), baseSide = show(target, f);
