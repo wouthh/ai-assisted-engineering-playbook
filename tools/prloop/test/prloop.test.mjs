@@ -718,6 +718,23 @@ test('sync (merge) fails closed when a PR merge commit renamed a union file and 
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
 });
 
+test('sync fails closed on a renamed and recreated union file even under a low diff.renameLimit', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  // A limit below the candidate count makes git skip copy detection silently unless the scan disables it.
+  r.run(r.work, 'config', 'diff.renameLimit', '1');
+  r.commit('feature', { 'log.csv': 'id\na\nY\n', 'b.txt': 'b\n', 'c.txt': 'c\n' });
+  r.run(r.work, 'mv', 'log.csv', 'renamed.csv');
+  r.commit('rename and recreate', { 'renamed.csv': 'id\na\nY\nZ\n', 'log.csv': 'other\nunrelated\n', 'd.txt': 'd\n' });
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  divergeOnMain(r, { 'log.csv': 'id\na\nX\n' });
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true, squash: true }, union: ['*.csv'] });
+  assert.equal(v.verdict, 'error', JSON.stringify(v));
+  assert.match(v.error, /renamed or deleted and then recreated/);
+  assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
+});
+
 test('sync fails closed when a union file whose name ends with a space was renamed and recreated', (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
