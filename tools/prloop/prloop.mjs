@@ -1055,6 +1055,15 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
       if (resumed) return { verdict: 'error', error: `${why}; the synced branch is local only, at ${short(git(['rev-parse', 'HEAD'], cwd))}` };
       return { verdict: 'error', error: why };
     };
+    // Paths a PR commit deleted, renamed or copied away: a union file among them may have been recreated as an unrelated
+    // file under the same name, so its end states cannot be paired up (#31). -C --find-copies-harder also catches a
+    // rename and recreation in one commit, which plain rename detection reports as a modification.
+    const log = tryGit(['log', '-z', '--format=', '--name-status', '-C', '--find-copies-harder', `${mb}..${head}`], cwd);
+    if (log === null) return fail(`listing the renames in the PR range failed; merge ${base} by hand`);
+    const moved = new Set(), tok = log.split('\0').map((t) => t.trim());
+    for (let i = 0; i < tok.length; i++) {
+      if (/^[RC]\d*$/.test(tok[i])) { moved.add(tok[i + 1]); i += 2; } else if (tok[i] === 'D') moved.add(tok[++i]); else if (tok[i]) i++;
+    }
     for (const f of unioned) {
       const branchSide = show(head, f), baseSide = show(target, f);
       // A rebase replays commits: a later one may have renamed or deleted the path, which the end states cannot pair up.
@@ -1064,6 +1073,7 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
       if (![head, target, 'HEAD'].every((rev) => regular(rev, f)) || lstatSync(join(cwd, f), { throwIfNoEntry: false })?.isFile() !== true) {
         return fail(`union file ${f} is no longer a regular file; merge ${base} by hand`);
       }
+      if (moved.has(f)) return fail(`union file ${f} was renamed or deleted and then recreated in this PR; merge ${base} by hand`);
       writeFileSync(join(cwd, f), unionResult(show(mb, f) ?? '', baseSide, branchSide));
       git(['add', '--', f], cwd);
     }
