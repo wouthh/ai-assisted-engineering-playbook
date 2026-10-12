@@ -817,9 +817,14 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
       ? readFileSync(join(rebaseDir, 'head-name'), 'utf8').trim() === `refs/heads/${branch}` && read('orig-head') === head && read('onto') === onto
       : tryGit(['branch', '--show-current'], cwd) === branch && git(['rev-parse', 'HEAD'], cwd) === head && git(['rev-parse', 'MERGE_HEAD'], cwd) === onto;
     if (!ours) return { verdict: 'error', error: `the ${rebase ? 'rebase' : 'merge'} in progress is not a sync of ${branch} at ${short(head)} onto ${target}` };
-    const left = unmerged(cwd).filter((f) => hasMarkers(cwd, f));
-    if (left.length) return { verdict: 'conflict', conflicts: left, generated: [], method: rebase ? 'rebase' : 'merge', inProgress: true,
-      next: 'remove the conflict markers from these files, then run `prloop sync <pr> --continue` again' };
+    // Every resolution is staged explicitly: a binary or modify/delete conflict has no markers, so their absence
+    // proves nothing, and staging Git's default worktree state could accept a deletion or one side unseen.
+    const left = unmerged(cwd);
+    if (left.length) {
+      const marked = left.filter((f) => hasMarkers(cwd, f));
+      return { verdict: 'conflict', conflicts: left, generated: [], method: rebase ? 'rebase' : 'merge', inProgress: true,
+        next: `${marked.length ? `remove the conflict markers from ${marked.join(', ')}, then ` : ''}stage each resolution (\`git add\` or \`git rm\`), then run \`prloop sync <pr> --continue\` again` };
+    }
     git(['add', '-u'], cwd);
     merges = rebase && !!git(['rev-list', '--merges', `${target}..${head}`], cwd);
     ok = step(rebase ? ['rebase', '--continue'] : ['commit', '--no-edit']);
@@ -836,7 +841,8 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
     merges = rebase && !!git(['rev-list', '--merges', `${target}..HEAD`], cwd);
     upToDate = tryGit(['merge-base', '--is-ancestor', target, 'HEAD'], cwd) !== null;
     if (!merges && upToDate) return { verdict: 'up_to_date', head };
-    ok = step(rebase ? ['rebase', target] : ['merge', '--no-edit', target]);
+    // --merge: the apply backend (rebase.backend=apply) keeps its state elsewhere, where --continue would not find it.
+    ok = step(rebase ? ['rebase', '--merge', target] : ['merge', '--no-edit', target]);
   }
   const method = rebase ? 'rebase' : 'merge';
   // During a rebase stage 2 is the base side; during a merge stage 3 is.
@@ -896,6 +902,8 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
   }
   // Once at the end, after every generated conflict took the base side (and always when finishing a resumed sync).
   if (regenerate && (regenerated.size || resumed)) {
+    const untracked = () => git(['ls-files', '-z', '--others', '--exclude-standard'], cwd).split('\0').filter(Boolean);
+    const before = new Set(untracked());
     for (const cmd of [regenerate].flat()) {
       // Output is not reported: like gate output it may hold a secret, and the result reaches agents.
       const r = spawnSync('sh', ['-c', cmd], { cwd, stdio: 'ignore' });
@@ -904,6 +912,8 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
       // A resumed sync holds a manual resolution: keep it locally instead of discarding it.
       if (resumed) return { verdict: 'error', error: `${why}; the synced branch is local only, at ${short(git(['rev-parse', 'HEAD'], cwd))}` };
       git(['reset', '--quiet', '--hard', head], cwd);
+      // Also files the command created, so the checkout is as clean as before; older untracked files stay.
+      for (const f of untracked()) if (!before.has(f)) rmSync(join(cwd, f), { force: true });
       return { verdict: 'error', error: why };
     }
     git(['add', '-A'], cwd);
@@ -1141,7 +1151,7 @@ export const plain = (body) => String(body ?? '').replace(/\n+(AGENTS\.md refere
 // The fix agent sees only this trigger, never the round history.
 export function buildPrompt(t) {
   const data = t.trigger === 'conflict' ? `Conflicted files: ${t.conflicts.join(', ')}${t.generated?.length ? `\nGenerated files among them (regenerate them from their sources after resolving the rest, never merge them by hand): ${t.generated.join(', ')}` : ''}
-Resolve them through prloop, never with a raw \`git rebase\` or \`git merge\`: run \`prloop sync ${t.pr} --continue\`, which leaves the conflicts in the working tree; resolve them there (remove every conflict marker; \`git add\` new files), then run \`prloop sync ${t.pr} --continue\` again, which continues, regenerates generated files when the repository declares \`regenerate\`, commits and pushes. Repeat while it reports more conflicts.`
+Resolve them through prloop, never with a raw \`git rebase\` or \`git merge\`: run \`prloop sync ${t.pr} --continue\`, which leaves the conflicts in the working tree; resolve them there (remove every conflict marker and stage each resolution with \`git add\` or \`git rm\`), then run \`prloop sync ${t.pr} --continue\` again, which continues, regenerates generated files when the repository declares \`regenerate\`, commits and pushes. Repeat while it reports more conflicts.`
     : t.findings?.length ? `Findings:\n${t.findings.map((f) => `- ${f.id} ${f.path ?? ''}:${f.line ?? ''} ${plain(f.body).slice(0, 600)}`).join('\n')}`
       : `Missing: ${(t.missing ?? []).join('; ') || 'a review request on the current head'}`;
   // Neither the output nor its log path: the output may hold a secret, and the agent reads every referenced file.

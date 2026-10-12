@@ -2185,6 +2185,8 @@ for (const settings of [{ merge: true, squash: true }, { merge: false, squash: f
     assert.match(v.next, /conflict markers/);
     assert.equal(syncBranch({ ...args, head: 'f'.repeat(40) }).verdict, 'error'); // not a sync of this head
     writeFileSync(join(r.work, 'app.txt'), 'base and feature\n');
+    assert.match(syncBranch(args).next, /stage each resolution/); // resolved but not staged
+    r.run(r.work, 'add', 'app.txt');
     v = syncBranch(args);
     assert.equal(v.verdict, 'synced', JSON.stringify(v));
     assert.deepEqual([v.resumed, v.unchanged], [true, false]);
@@ -2202,12 +2204,35 @@ test('a failing regenerate command restores the old head and reports no output',
   r.run(r.work, 'push', '-q', 'origin', 'feat');
   divergeOnMain(r, { 'gen.txt': 'base\n' });
   const head = r.run(r.work, 'rev-parse', 'HEAD');
-  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true }, generated: ['gen.txt'], regenerate: ['true', 'echo $((6 * 7)); exit 3'] });
+  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true }, generated: ['gen.txt'], regenerate: ['true', 'echo $((6 * 7)) > new.txt; exit 3'] });
   assert.equal(v.verdict, 'error');
   assert.match(v.error, /exit 3/);
   assert.doesNotMatch(v.error, /42/); // the output is not reported
   assert.equal(r.run(r.work, 'rev-parse', 'HEAD'), head);
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
+  assert.equal(r.run(r.work, 'status', '--porcelain'), ''); // the command's new file is gone too
+});
+
+test('sync --continue refuses a markerless conflict until it is staged, also with the apply rebase backend', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.run(r.work, 'config', 'rebase.backend', 'apply');
+  r.commit('feature', { 'app.txt': 'feature\n' });
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  r.run(r.work, 'switch', '-q', 'main');
+  r.run(r.work, 'rm', '-q', 'app.txt');
+  r.run(r.work, 'commit', '-qm', 'drop app');
+  r.run(r.work, 'push', '-q', 'origin', 'main');
+  r.run(r.work, 'switch', '-q', 'feat');
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  const args = { cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: false, squash: false }, resume: true };
+  assert.equal(syncBranch(args).verdict, 'conflict');
+  const v = syncBranch(args); // modify/delete: no markers, still unresolved
+  assert.deepEqual([v.verdict, v.conflicts], ['conflict', ['app.txt']], JSON.stringify(v));
+  assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
+  r.run(r.work, 'rm', '-q', 'app.txt');
+  assert.equal(syncBranch(args).verdict, 'synced');
+  assert.equal(r.run(r.work, 'ls-tree', '--name-only', 'HEAD'), 'log.csv');
 });
 
 test('.prloop.json validates regenerate and generated, and mark-tested records its gate in the gate cache', (t) => {
