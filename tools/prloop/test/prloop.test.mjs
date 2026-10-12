@@ -718,6 +718,22 @@ test('sync (merge) fails closed when a PR merge commit renamed a union file and 
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
 });
 
+test('sync fails closed when a moved union file was rewritten below the default similarity threshold and recreated', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.commit('feature', { 'log.csv': 'id\na\nY\n' });
+  r.run(r.work, 'mv', 'log.csv', 'renamed.csv');
+  // Shares only the header with the old file, well under git's 50% default, so plain -C reports it as added.
+  r.commit('rename, rewrite and recreate', { 'renamed.csv': 'id\nn1\nn2\nn3\nn4\nn5\nn6\nn7\nn8\n', 'log.csv': 'other\nunrelated\n' });
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  divergeOnMain(r, { 'log.csv': 'id\na\nX\n' });
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true, squash: true }, union: ['*.csv'] });
+  assert.equal(v.verdict, 'error', JSON.stringify(v));
+  assert.match(v.error, /renamed or deleted and then recreated/);
+  assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
+});
+
 test('sync fails closed on a renamed and recreated union file even under a low diff.renameLimit', (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
