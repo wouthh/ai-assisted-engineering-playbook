@@ -1244,7 +1244,23 @@ const loadState = (repo, pr) => {
 };
 // `prloop sync` may record a carry-over, and an agent's `prloop ready` a gate run, while a run holds this PR's state in
 // memory: the newer carry and the newer gate run win.
-const saveState = (st) => {
+// Serializes one state file's read-modify-write across prloop processes with a `<state>.lock` claim holding the
+// writer's PID; a claim of a dead process, or one held past 10s, is taken over.
+function withStateLock(repo, pr, fn) {
+  mkdirSync(stateDir(), { recursive: true });
+  const lock = `${statePath(repo, pr)}.lock`;
+  for (const until = Date.now() + 10e3; ;) {
+    try { writeFileSync(lock, String(process.pid), { flag: 'wx', mode: 0o600 }); break; } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      let pid; try { pid = Number(readFileSync(lock, 'utf8')); } catch { continue; }
+      if ((pid && !alive(pid)) || Date.now() > until) { rmSync(lock, { force: true }); continue; }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+    }
+  }
+  try { return fn(); } finally { rmSync(lock, { force: true }); }
+}
+const saveState = (st) => withStateLock(st.repo, st.pr, () => writeState(st));
+const writeState = (st) => {
   const disk = loadState(st.repo, st.pr);
   if (disk.carry && !(st.carry?.at >= disk.carry.at)) st.carry = disk.carry;
   if (disk.lastGate && !(st.lastGate?.end >= disk.lastGate.end)) st.lastGate = disk.lastGate;
@@ -1342,7 +1358,7 @@ Do these steps in order, in this session:
 Use "blocked" with the reason when disputed findings remain unresolved.
 
 Run \`prloop ready\` and any long test command in the foreground with a timeout of at least ${minutes} minutes. Never background a command; if one is backgrounded anyway, wait for it to finish before ending your turn. Your final message must end with the JSON status line.
-If prloop itself misbehaves (wrong status, refused sync, missed review signal, misleading docs), check that no open issue in wouthh/ai-assisted-engineering-playbook covers it, then file one there with the observed and expected behaviour and a fixture-test idea; never patch the installed prloop, and name the issue number in "reason".
+If prloop itself misbehaves (wrong status, refused sync, missed review signal, misleading docs), never patch the installed prloop and never file an issue in another repository yourself: put the proposed prloop issue (observed and expected behaviour, a fixture-test idea, no project-specific details) in "reason", and the coordinator files it when authorized.
 Never wait for or poll reviews, merge, touch other PRs, rewrite history except through \`prloop sync\`, or retry in a loop. A denied action or a missing tool means stop immediately and report "blocked" with the denied command or missing tool named in "reason".`;
 }
 
@@ -1790,13 +1806,15 @@ export function reconcileStates(repoFilter, skip = []) {
     for (const st of states) {
       const phase = { MERGED: 'merged', CLOSED: 'closed' }[r?.[`p${st.pr}`]?.state];
       if (!phase) continue;
-      // Re-read right before writing: a running supervisor may have saved newer rounds, findings or usage meanwhile.
-      const fresh = { ...loadState(repo, st.pr), repo, pr: st.pr };
-      if (['merged', 'closed'].includes(fresh.phase)) continue;
-      const reason = `the PR was ${phase} on GitHub`;
-      Object.assign(fresh, { phase, reason, next: undefined, updatedAt: new Date().toISOString() });
-      logEvent(fresh, { phase, reason });
-      saveState(fresh);
+      // One locked read-modify-write: a running supervisor may save newer rounds, findings or usage meanwhile.
+      withStateLock(repo, st.pr, () => {
+        const fresh = { ...loadState(repo, st.pr), repo, pr: st.pr };
+        if (['merged', 'closed'].includes(fresh.phase)) return;
+        const reason = `the PR was ${phase} on GitHub`;
+        Object.assign(fresh, { phase, reason, next: undefined, updatedAt: new Date().toISOString() });
+        logEvent(fresh, { phase, reason });
+        writeState(fresh);
+      });
     }
   }
 }

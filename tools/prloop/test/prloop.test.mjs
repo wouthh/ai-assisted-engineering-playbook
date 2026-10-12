@@ -1045,6 +1045,9 @@ test('the fix prompt carries only the trigger data and the contract', () => {
     'Never wait for or poll reviews', 'on its own last line, always, also when you stop early or are blocked',
     'report "blocked" with the denied command or missing tool named', 'never run the full project gate yourself',
     'in the foreground with a timeout of at least 90 minutes', 'Never background a command']) assert.ok(p.includes(part), part);
+  // An external write to the playbook needs the coordinator's authority: the agent only proposes the issue.
+  assert.match(p, /never file an issue in another repository yourself: put the proposed prloop issue/);
+  assert.doesNotMatch(p, /then file one there/);
   assert.match(buildPrompt({ repo: 'o/n', pr: 1, trigger: 'local_review', findings: [], summaries: ['[local review] 1 finding(s) on x.\n- README.md [P3] Stale flag'] }),
     /Reviewer summary[\s\S]*README\.md \[P3\] Stale flag/);
   assert.match(buildPrompt({ repo: 'o/n', pr: 1, trigger: 'conflict', conflicts: ['a.txt'], localReview: true }), /Conflicted files: a\.txt[\s\S]*Do not post a review request/);
@@ -1328,8 +1331,15 @@ test('run --status marks PRs merged or closed outside a run, with one GitHub cal
   writeFileSync(join(bin, 'gh'), `#!/bin/sh\necho "$*" >> "${bin}/calls.log"\nprintf '%s' '{"repo":"example-org/example-repo","pr":11,"phase":"agent","rounds":3}' > "${f11}"\necho '{"data":{"repository":{"p8":{"state":"OPEN"},"p11":{"state":"CLOSED"}}}}'\n`, { mode: 0o755 });
   reconcileStates('example-org/example-repo');
   assert.deepEqual(pick(JSON.parse(readFileSync(f11, 'utf8')), ['phase', 'rounds']), { phase: 'closed', rounds: 3 });
+  // A supervisor holds PR 12's state lock and saves newer rounds after reconciliation has read GitHub: the update waits for it.
+  write(12, 'waiting');
+  const f12 = join(dir, 'example-org__example-repo__12.json');
+  writeFileSync(join(bin, 'gh'), `#!/bin/sh\necho "$*" >> "${bin}/calls.log"\n( sleep 0.5; printf '%s' '{"repo":"example-org/example-repo","pr":12,"phase":"agent","rounds":4}' > "${f12}"; rm -f "${f12}.lock" ) >/dev/null 2>&1 &\necho $! > "${f12}.lock"\necho '{"data":{"repository":{"p8":{"state":"OPEN"},"p12":{"state":"MERGED"}}}}'\n`, { mode: 0o755 });
+  reconcileStates('example-org/example-repo');
+  assert.deepEqual(pick(JSON.parse(readFileSync(f12, 'utf8')), ['phase', 'rounds']), { phase: 'merged', rounds: 4 });
+  assert.equal(existsSync(`${f12}.lock`), false);
   reconcileStates('example-org/example-repo', [8]); // only the open blocker remains a candidate, and a run skips its own PRs
-  assert.equal(readFileSync(join(bin, 'calls.log'), 'utf8').trim().split('\n').length, 2);
+  assert.equal(readFileSync(join(bin, 'calls.log'), 'utf8').trim().split('\n').length, 3);
 });
 
 test('reset-rounds resets the counter once, logs it, and refuses a second reset', (t) => {
