@@ -54,8 +54,8 @@ Per repository: .prloop.json in the repository root may set gate, gateWeight, un
 for --merge repo), reviewBeforeGate, generated (globs), regenerate (a command or a list, which lets sync
 resolve conflicts limited to generated files itself) and gateIrrelevant (globs of paths whose changes need no
 new gate run before --merge); flags and environment override it.
-<state dir>/config.json may list approvedRegenerate: commands the operator approved to run when a
-default-branch base introduces them in regenerate.
+<state dir>/config.json may map approvedRegenerate: {"owner/name": [commands]}, the commands the operator approved
+to run in that repository when a default-branch base introduces them in regenerate.
 
 Gate logs: every gate run writes its output to <state dir>/gates/<repo>__<pr>__<head>__<time>.log (pruned after
 14 days); status, ready and run --status show the last gate's duration, exit status and log path.
@@ -147,16 +147,18 @@ const short = (sha) => (sha ?? '').slice(0, 7);
 
 // Values that one key of a config file may hold; anything else is a usage error, not a silent default.
 const REPO_KEYS = { gate: 'string', gateWeight: 'string|number', union: 'array', merge: 'string', reviewBeforeGate: 'boolean', regenerate: 'string|array', generated: 'array', gateIrrelevant: 'array' };
-const MACHINE_KEYS = { gateSlots: 'number|string', maxLoad: 'number|string', minFreeMem: 'number|string', resourceWait: 'string', gateTmpdir: 'string', approvedRegenerate: 'array' };
+const MACHINE_KEYS = { gateSlots: 'number|string', maxLoad: 'number|string', minFreeMem: 'number|string', resourceWait: 'string', gateTmpdir: 'string', approvedRegenerate: 'object' };
 function readConfigFile(file, keys) {
   if (!file || !existsSync(file)) return {};
   let obj;
   try { obj = JSON.parse(readFileSync(file, 'utf8')); } catch (e) { throw new Error(`${file}: ${e.message}`); }
   if (!obj || typeof obj !== 'object' || Array.isArray(obj)) throw new Error(`${file} must hold a JSON object`);
   for (const [k, v] of Object.entries(obj)) {
-    const type = Array.isArray(v) ? 'array' : typeof v;
+    const type = v === null ? 'null' : Array.isArray(v) ? 'array' : typeof v;
     if (!keys[k]) throw new Error(`${file}: unknown key ${k} (known: ${Object.keys(keys).join(', ')})`);
     if (!keys[k].split('|').includes(type) || (type === 'array' && !v.every((x) => typeof x === 'string'))) throw new Error(`${file}: ${k} must be ${keys[k]}`);
+    // The only object value: string lists keyed by repository.
+    if (type === 'object' && !Object.values(v).every((a) => Array.isArray(a) && a.every((x) => typeof x === 'string'))) throw new Error(`${file}: ${k} must map owner/name to a list of commands`);
   }
   // An empty command list would take the base side of every generated conflict and regenerate nothing.
   const regen = 'regenerate' in obj ? [obj.regenerate].flat() : null;
@@ -165,6 +167,8 @@ function readConfigFile(file, keys) {
 }
 // One machine-wide setting for every prloop process of the user: gate slots and resource limits.
 export const machineConfig = () => readConfigFile(join(stateDir(), 'config.json'), MACHINE_KEYS);
+// The regenerate commands the operator approved for one repository only: a command approved elsewhere proves nothing here.
+export const approvedFor = (map, repo) => Object.entries(map ?? {}).find(([k]) => k.toLowerCase() === String(repo).toLowerCase())?.[1] ?? [];
 // The repository's own declaration of its gate, in the root of the checkout `cwd` belongs to.
 export const repoConfig = (cwd) => { const top = tryGit(['rev-parse', '--show-toplevel'], cwd); return readConfigFile(top && join(top, '.prloop.json'), REPO_KEYS); };
 
@@ -966,7 +970,7 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
   let approved = { generated, regenerate };
   if (headFile !== null) try { approved = JSON.parse(headFile); } catch { approved = {}; }
   // A regenerate committed on the repository's default branch is approved too, but only when the operator listed every
-  // command in the machine config's approvedRegenerate: presence on that branch alone does not prove review.
+  // command for this repository in the machine config's approvedRegenerate: presence on that branch alone does not prove review.
   const baseFile = base === settings.defaultBranch ? tryGit(['show', `${target}:.prloop.json`], cwd) : null;
   let baseRegenerate;
   if (baseFile !== null) try { baseRegenerate = JSON.parse(baseFile).regenerate; if (![baseRegenerate ?? []].flat().every((c) => approvedRegenerate.includes(c))) baseRegenerate = undefined; } catch { /* the invalid synced file fails below */ }
@@ -1048,7 +1052,7 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
     // A command the base introduced is shown and fails closed, so a new base commit never runs unreviewed shell commands.
     const list = (c) => JSON.stringify([c ?? []].flat());
     if (list(approved.regenerate) !== list(final.regenerate) && (baseRegenerate === undefined || list(baseRegenerate) !== list(final.regenerate))) {
-      return fail(`the synced .prloop.json changed regenerate to ${list(final.regenerate)}, which was not approved (neither the PR head declares it nor approvedRegenerate in the machine config lists it for a default-branch base): inspect it, then set the same regenerate in the branch's .prloop.json (commit and push) or add each command to approvedRegenerate, and rerun \`prloop sync\``);
+      return fail(`the synced .prloop.json changed regenerate to ${list(final.regenerate)}, which was not approved (neither the PR head declares it nor approvedRegenerate in the machine config lists it for this repository and a default-branch base): inspect it, then set the same regenerate in the branch's .prloop.json (commit and push) or add each command to this repository's approvedRegenerate entry, and rerun \`prloop sync\``);
     }
     for (const cmd of [final.regenerate].flat()) {
       // Output is not reported: like gate output it may hold a secret, and the result reaches agents.
@@ -1614,7 +1618,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     const lock = takeLock(cwd, `sync of PR #${st.pr}`);
     if (lock.holder) return lockedOut(st, cwd, lock.holder);
     let v;
-    try { v = syncBranch({ cwd, branch: s.branch, base: s.base, baseOid: raw.baseRefOid, head: s.head, settings: raw.repoSettings, union: opts.union, generated: opts.generated, regenerate: opts.regenerate, approvedRegenerate: opts.approvedRegenerate, rebase }); } finally { lock.release(); }
+    try { v = syncBranch({ cwd, branch: s.branch, base: s.base, baseOid: raw.baseRefOid, head: s.head, settings: raw.repoSettings, union: opts.union, generated: opts.generated, regenerate: opts.regenerate, approvedRegenerate: approvedFor(opts.approvedRegenerate, repo), rebase }); } finally { lock.release(); }
     if (v.verdict === 'error') return block(st, `sync failed: ${v.error}`);
     if (v.verdict === 'synced' && v.unchanged && s.verdict === 'clean') {
       st.carry = recordCarry(repo, st.pr, s.head, v);
@@ -1821,7 +1825,7 @@ export async function main(argv) {
     const repoFile = repoConfig(opts.worktree ? resolve(opts.worktree) : process.cwd());
     const machine = machineConfig(), cfg = config(opts, process.env, { machine, repo: repoFile });
     if (!opts.union.length && repoFile.union) opts.union = repoFile.union;
-    Object.assign(opts, { generated: repoFile.generated ?? [], regenerate: repoFile.regenerate, approvedRegenerate: machine.approvedRegenerate ?? [] });
+    Object.assign(opts, { generated: repoFile.generated ?? [], regenerate: repoFile.regenerate, approvedRegenerate: machine.approvedRegenerate });
     // The repository file names the method; merging itself still needs an explicit --merge.
     if (opts.merge === 'repo') opts.merge = repoFile.merge ?? (() => { throw new Error('--merge repo needs "merge" in .prloop.json'); })();
     if (cmd === 'run' && opts.status) return out({ machine: machineLine(cfg), ...runStatus(opts.repo) }, 0);
@@ -1879,7 +1883,7 @@ export async function main(argv) {
       try {
         const pr = fetchPr(repo, prArg);
         const clean = classify(pr, cfg).verdict === 'clean';
-        const v = syncBranch({ cwd, branch: pr.headRefName, base: pr.baseRefName, baseOid: pr.baseRefOid, head: pr.headRefOid, settings: pr.repoSettings, union: opts.union, generated: opts.generated, regenerate: opts.regenerate, approvedRegenerate: opts.approvedRegenerate, resume: !!opts.continue });
+        const v = syncBranch({ cwd, branch: pr.headRefName, base: pr.baseRefName, baseOid: pr.baseRefOid, head: pr.headRefOid, settings: pr.repoSettings, union: opts.union, generated: opts.generated, regenerate: opts.regenerate, approvedRegenerate: approvedFor(opts.approvedRegenerate, repo), resume: !!opts.continue });
         const carry = v.verdict === 'synced' && v.unchanged && clean ? recordCarry(repo, prArg, pr.headRefOid, v) : undefined;
         return out({ pr: Number(prArg), ...v, carry }, v.verdict === 'conflict' ? EXIT.conflict : v.verdict === 'error' ? EXIT.error : 0);
       } finally { lock.release(); }
