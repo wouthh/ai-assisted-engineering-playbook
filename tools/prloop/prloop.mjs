@@ -1524,6 +1524,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
   mkdirSync(stateDir(), { recursive: true });
   pruneAgentLogs();
   const log = join(stateDir(), `run-${new Date().toISOString().replace(/[:.]/g, '-')}.jsonl`);
+  reconcileStates(repo, prs); // this run's own PRs are read live below
   // Rounds and seen findings persist across runs on purpose; `prloop reset-rounds` resets the rounds once.
   const states = prs.map((n) => ({ ...loadState(repo, n), repo, pr: n, log, phase: 'polling', reason: undefined, next: undefined, agentLog: undefined, mergeRetried: undefined }));
   const busy = new Map();
@@ -1748,7 +1749,7 @@ const lastGateSummary = (g) => g && { ...pick(g, ['source', 'cached', 'status', 
 
 const pick = (o, keys) => Object.fromEntries(keys.filter((k) => o[k] !== undefined).map((k) => [k, o[k]]));
 
-// Cheap check-in for a coordinator: state files plus each PR's last few events, no GitHub calls.
+// Cheap check-in for a coordinator: state files plus each PR's last few events, no GitHub calls (`main` reconciles first).
 export function runStatus(repoFilter, last = 5) {
   const dir = stateDir();
   const files = existsSync(dir) ? readdirSync(dir) : [];
@@ -1765,6 +1766,35 @@ export function runStatus(repoFilter, last = 5) {
         updatedAt: st.updatedAt, carry: st.carry, agentLog: st.agentLog, usage: st.usage, lastGate: lastGateSummary(st.lastGate), events: events.slice(-last) };
     });
   return { prs };
+}
+
+// Marks state files of PRs that GitHub reports merged or closed (for example merged by hand outside a run) as
+// `merged` or `closed`, with one GitHub call per repository; open PRs, live blockers included, stay as they are.
+// Best effort: a failed read leaves that repository's states unchanged.
+export function reconcileStates(repoFilter, skip = []) {
+  const dir = stateDir();
+  const byRepo = new Map();
+  for (const f of existsSync(dir) ? readdirSync(dir).filter((x) => /__\d+\.json$/.test(x)) : []) {
+    let st; try { st = JSON.parse(readFileSync(join(dir, f), 'utf8')); } catch { continue; }
+    if (!st.repo || !Number.isInteger(st.pr) || ['merged', 'closed'].includes(st.phase) || skip.includes(st.pr) || (repoFilter && st.repo !== repoFilter)) continue;
+    byRepo.set(st.repo, [...(byRepo.get(st.repo) ?? []), st]);
+  }
+  for (const [repo, states] of byRepo) {
+    const [owner, name] = repo.split('/');
+    let r;
+    try {
+      const q = `query($owner:String!,$name:String!){repository(owner:$owner,name:$name){${states.map((st) => `p${st.pr}:pullRequest(number:${st.pr}){state}`).join(' ')}}}`;
+      r = JSON.parse(ghRetry(['api', 'graphql', '-f', `query=${q}`, '-F', `owner=${owner}`, '-F', `name=${name}`])).data.repository;
+    } catch { continue; }
+    for (const st of states) {
+      const phase = { MERGED: 'merged', CLOSED: 'closed' }[r?.[`p${st.pr}`]?.state];
+      if (!phase) continue;
+      const reason = `the PR was ${phase} on GitHub`;
+      Object.assign(st, { phase, reason, next: undefined, updatedAt: new Date().toISOString() });
+      logEvent(st, { phase, reason });
+      saveState(st);
+    }
+  }
 }
 
 // blocked (also a merge still pending) wins; otherwise the first verdict that still needs action; 0 when all are done.
@@ -1828,7 +1858,7 @@ export async function main(argv) {
     Object.assign(opts, { generated: repoFile.generated ?? [], regenerate: repoFile.regenerate, approvedRegenerate: machine.approvedRegenerate });
     // The repository file names the method; merging itself still needs an explicit --merge.
     if (opts.merge === 'repo') opts.merge = repoFile.merge ?? (() => { throw new Error('--merge repo needs "merge" in .prloop.json'); })();
-    if (cmd === 'run' && opts.status) return out({ machine: machineLine(cfg), ...runStatus(opts.repo) }, 0);
+    if (cmd === 'run' && opts.status) { reconcileStates(opts.repo); return out({ machine: machineLine(cfg), ...runStatus(opts.repo) }, 0); }
     if (cmd === 'run' || cmd === 'ready') {
       const c = selfCheck(SCRIPT_DIR);
       if (c?.warning && (opts.requireCurrent || process.env.PRLOOP_REQUIRE_CURRENT === '1')) return out({ verdict: 'error', error: c.warning }, EXIT.error);

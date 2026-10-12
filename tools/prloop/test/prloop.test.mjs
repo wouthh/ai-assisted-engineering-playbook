@@ -6,7 +6,7 @@ import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import {
-  EXIT, OUTPUT_TAIL, main, approvedFor, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, gateProvenance, treeRss, recordGatePass, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, syncBranch, unionLines, waitFor,
+  EXIT, OUTPUT_TAIL, main, approvedFor, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, gateProvenance, treeRss, recordGatePass, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, reconcileStates, syncBranch, unionLines, waitFor,
 } from '../prloop.mjs';
 
 const pick = (o, keys) => Object.fromEntries(keys.map((k) => [k, o[k]]));
@@ -1301,6 +1301,29 @@ test('run --status ignores repo-less lines in logs the state does not name', (t)
   writeFileSync(join(dir, 'run-2026-01-02T10-00-00-000Z.jsonl'), '{"pr":7,"phase":"other"}\n'); // could be any repo's PR 7
   writeFileSync(join(dir, 'run-2026-01-01T10-00-00-000Z.jsonl'), '{"repo":"example-org/example-repo","pr":7,"phase":"mine"}\n');
   assert.deepEqual(runStatus('example-org/example-repo').prs[0].events.map((e) => e.phase), ['mine']);
+});
+
+test('run --status marks PRs merged or closed outside a run, with one GitHub call per repo, and keeps live blockers', async (t) => {
+  const dir = tempState(t);
+  const bin = mkdtempSync(join(tmpdir(), 'prloop-gh-'));
+  const old = process.env.PATH;
+  t.after(() => { process.env.PATH = old; rmSync(bin, { recursive: true, force: true }); });
+  writeFileSync(join(bin, 'gh'), `#!/bin/sh\necho "$*" >> "${bin}/calls.log"\necho '{"data":{"repository":{"p7":{"state":"MERGED"},"p8":{"state":"OPEN"},"p9":{"state":"CLOSED"}}}}'\n`, { mode: 0o755 });
+  process.env.PATH = `${bin}:${old}`;
+  const write = (pr, phase, reason) => writeFileSync(join(dir, `example-org__example-repo__${pr}.json`), JSON.stringify({ repo: 'example-org/example-repo', pr, phase, reason, rounds: 6 }));
+  write(7, 'blocked', 'max rounds (6) reached');
+  write(8, 'blocked', 'agent made no progress');
+  write(9, 'waiting');
+  write(10, 'merged');
+  assert.equal(await main(['run', '--status', '--repo', 'example-org/example-repo']), 0);
+  const phases = Object.fromEntries(runStatus('example-org/example-repo').prs.map((p) => [p.pr, [p.phase, p.reason]]));
+  assert.deepEqual(phases, { 7: ['merged', 'the PR was merged on GitHub'], 8: ['blocked', 'agent made no progress'], 9: ['closed', 'the PR was closed on GitHub'], 10: ['merged', undefined] });
+  const calls = readFileSync(join(bin, 'calls.log'), 'utf8').trim().split('\n');
+  assert.equal(calls.length, 1);
+  assert.match(calls[0], /p7:pullRequest\(number:7\).*p8:.*p9:/);
+  assert.doesNotMatch(calls[0], /p10:/);
+  reconcileStates('example-org/example-repo', [8]); // only the open blocker remains a candidate, and a run skips its own PRs
+  assert.equal(readFileSync(join(bin, 'calls.log'), 'utf8').trim().split('\n').length, 1);
 });
 
 test('reset-rounds resets the counter once, logs it, and refuses a second reset', (t) => {
