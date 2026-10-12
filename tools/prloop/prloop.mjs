@@ -1342,6 +1342,7 @@ Do these steps in order, in this session:
 Use "blocked" with the reason when disputed findings remain unresolved.
 
 Run \`prloop ready\` and any long test command in the foreground with a timeout of at least ${minutes} minutes. Never background a command; if one is backgrounded anyway, wait for it to finish before ending your turn. Your final message must end with the JSON status line.
+If prloop itself misbehaves (wrong status, refused sync, missed review signal, misleading docs), check that no open issue in wouthh/ai-assisted-engineering-playbook covers it, then file one there with the observed and expected behaviour and a fixture-test idea; never patch the installed prloop, and name the issue number in "reason".
 Never wait for or poll reviews, merge, touch other PRs, rewrite history except through \`prloop sync\`, or retry in a loop. A denied action or a missing tool means stop immediately and report "blocked" with the denied command or missing tool named in "reason".`;
 }
 
@@ -1512,7 +1513,7 @@ export function findWorktree(branch, cwd) {
   return null;
 }
 
-const TERMINAL = new Set(['merged', 'merge_pending', 'clean', 'blocked', 'needs_human', 'needs_agent', 'deadline']);
+const TERMINAL = new Set(['merged', 'closed', 'merge_pending', 'clean', 'blocked', 'needs_human', 'needs_agent', 'deadline']);
 
 // Polls every PR round-robin in one process and spawns at most `--max-agents` agents or local reviews at a time.
 // Exits only when every PR is terminal, printing one summary line per PR.
@@ -1645,7 +1646,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     if (st.head !== s.head) st.gateFailure = undefined;
     st.head = s.head;
     if (s.state === 'MERGED') return event(st, 'merged', { mergeCommit: s.mergeCommit });
-    if (s.state === 'CLOSED') return block(st, 'the PR is closed');
+    if (s.state === 'CLOSED') return event(st, 'closed', { reason: 'the PR is closed', next: undefined });
     // The holder check comes first: a locked fix agent's uncommitted edit or local commit is not a bad checkout.
     const holder = cwd && lockHolder(cwd, null);
     if (holder) return lockedOut(st, cwd, holder);
@@ -1789,10 +1790,13 @@ export function reconcileStates(repoFilter, skip = []) {
     for (const st of states) {
       const phase = { MERGED: 'merged', CLOSED: 'closed' }[r?.[`p${st.pr}`]?.state];
       if (!phase) continue;
+      // Re-read right before writing: a running supervisor may have saved newer rounds, findings or usage meanwhile.
+      const fresh = { ...loadState(repo, st.pr), repo, pr: st.pr };
+      if (['merged', 'closed'].includes(fresh.phase)) continue;
       const reason = `the PR was ${phase} on GitHub`;
-      Object.assign(st, { phase, reason, next: undefined, updatedAt: new Date().toISOString() });
-      logEvent(st, { phase, reason });
-      saveState(st);
+      Object.assign(fresh, { phase, reason, next: undefined, updatedAt: new Date().toISOString() });
+      logEvent(fresh, { phase, reason });
+      saveState(fresh);
     }
   }
 }
