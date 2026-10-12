@@ -54,6 +54,8 @@ Per repository: .prloop.json in the repository root may set gate, gateWeight, un
 for --merge repo), reviewBeforeGate, generated (globs), regenerate (a command or a list, which lets sync
 resolve conflicts limited to generated files itself) and gateIrrelevant (globs of paths whose changes need no
 new gate run before --merge); flags and environment override it.
+<state dir>/config.json may list approvedRegenerate: commands the operator approved to run when a
+default-branch base introduces them in regenerate.
 
 Gate logs: every gate run writes its output to <state dir>/gates/<repo>__<pr>__<head>__<time>.log (pruned after
 14 days); status, ready and run --status show the last gate's duration, exit status and log path.
@@ -145,7 +147,7 @@ const short = (sha) => (sha ?? '').slice(0, 7);
 
 // Values that one key of a config file may hold; anything else is a usage error, not a silent default.
 const REPO_KEYS = { gate: 'string', gateWeight: 'string|number', union: 'array', merge: 'string', reviewBeforeGate: 'boolean', regenerate: 'string|array', generated: 'array', gateIrrelevant: 'array' };
-const MACHINE_KEYS = { gateSlots: 'number|string', maxLoad: 'number|string', minFreeMem: 'number|string', resourceWait: 'string', gateTmpdir: 'string' };
+const MACHINE_KEYS = { gateSlots: 'number|string', maxLoad: 'number|string', minFreeMem: 'number|string', resourceWait: 'string', gateTmpdir: 'string', approvedRegenerate: 'array' };
 function readConfigFile(file, keys) {
   if (!file || !existsSync(file)) return {};
   let obj;
@@ -876,7 +878,7 @@ const hasMarkers = (cwd, f) => { try { return MARKER.test(readFileSync(join(cwd,
 // With `regenerate`, conflicts limited to generated files take the base side and the command runs once at the end.
 // `resume` (`sync --continue`) leaves manual conflicts in the working tree instead of aborting, and on the next call
 // continues the sync in progress: the caller resolved them by hand.
-export function syncBranch({ cwd, branch, base, baseOid, head, settings, union = [], generated = [], regenerate, remote = 'origin', rebase: forceRebase = false, resume = false }) {
+export function syncBranch({ cwd, branch, base, baseOid, head, settings, union = [], generated = [], regenerate, approvedRegenerate = [], remote = 'origin', rebase: forceRebase = false, resume = false }) {
   // A fork PR's branch usually tracks its own remote; push there, not to the base repository.
   const headRemote = tryGit(['config', `branch.${branch}.remote`], cwd) || remote;
   // Sync to the fetched base branch: GitHub's baseRefOid can lag far behind it, and a branch that contains that
@@ -963,10 +965,11 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
   const headFile = tryGit(['show', `${head}:.prloop.json`], cwd);
   let approved = { generated, regenerate };
   if (headFile !== null) try { approved = JSON.parse(headFile); } catch { approved = {}; }
-  // A regenerate committed on the repository's default branch reached it through a reviewed merge: it is approved too.
+  // A regenerate committed on the repository's default branch is approved too, but only when the operator listed every
+  // command in the machine config's approvedRegenerate: presence on that branch alone does not prove review.
   const baseFile = base === settings.defaultBranch ? tryGit(['show', `${target}:.prloop.json`], cwd) : null;
   let baseRegenerate;
-  if (baseFile !== null) try { baseRegenerate = JSON.parse(baseFile).regenerate; } catch { /* the invalid synced file fails below */ }
+  if (baseFile !== null) try { baseRegenerate = JSON.parse(baseFile).regenerate; if (![baseRegenerate ?? []].flat().every((c) => approvedRegenerate.includes(c))) baseRegenerate = undefined; } catch { /* the invalid synced file fails below */ }
   const unioned = new Set(), regenerated = new Set();
   for (let i = 0; !ok && i < 200; i++) {
     const conflicted = unmerged(cwd);
@@ -1045,7 +1048,7 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
     // A command the base introduced is shown and fails closed, so a new base commit never runs unreviewed shell commands.
     const list = (c) => JSON.stringify([c ?? []].flat());
     if (list(approved.regenerate) !== list(final.regenerate) && (baseRegenerate === undefined || list(baseRegenerate) !== list(final.regenerate))) {
-      return fail(`the synced .prloop.json changed regenerate to ${list(final.regenerate)}, which was not approved (neither the PR head nor a default-branch base declares it): inspect it, set the same regenerate in the branch's .prloop.json (commit and push), then rerun \`prloop sync\``);
+      return fail(`the synced .prloop.json changed regenerate to ${list(final.regenerate)}, which was not approved (neither the PR head declares it nor approvedRegenerate in the machine config lists it for a default-branch base): inspect it, then set the same regenerate in the branch's .prloop.json (commit and push) or add each command to approvedRegenerate, and rerun \`prloop sync\``);
     }
     for (const cmd of [final.regenerate].flat()) {
       // Output is not reported: like gate output it may hold a secret, and the result reaches agents.
@@ -1611,7 +1614,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     const lock = takeLock(cwd, `sync of PR #${st.pr}`);
     if (lock.holder) return lockedOut(st, cwd, lock.holder);
     let v;
-    try { v = syncBranch({ cwd, branch: s.branch, base: s.base, baseOid: raw.baseRefOid, head: s.head, settings: raw.repoSettings, union: opts.union, generated: opts.generated, regenerate: opts.regenerate, rebase }); } finally { lock.release(); }
+    try { v = syncBranch({ cwd, branch: s.branch, base: s.base, baseOid: raw.baseRefOid, head: s.head, settings: raw.repoSettings, union: opts.union, generated: opts.generated, regenerate: opts.regenerate, approvedRegenerate: opts.approvedRegenerate, rebase }); } finally { lock.release(); }
     if (v.verdict === 'error') return block(st, `sync failed: ${v.error}`);
     if (v.verdict === 'synced' && v.unchanged && s.verdict === 'clean') {
       st.carry = recordCarry(repo, st.pr, s.head, v);
@@ -1816,9 +1819,9 @@ export async function main(argv) {
       return out({ verdict: 'ok', tested, ...(gatePassedHead ? { gatePassedHead, source: 'self' } : {}) }, 0);
     }
     const repoFile = repoConfig(opts.worktree ? resolve(opts.worktree) : process.cwd());
-    const cfg = config(opts, process.env, { machine: machineConfig(), repo: repoFile });
+    const machine = machineConfig(), cfg = config(opts, process.env, { machine, repo: repoFile });
     if (!opts.union.length && repoFile.union) opts.union = repoFile.union;
-    Object.assign(opts, { generated: repoFile.generated ?? [], regenerate: repoFile.regenerate });
+    Object.assign(opts, { generated: repoFile.generated ?? [], regenerate: repoFile.regenerate, approvedRegenerate: machine.approvedRegenerate ?? [] });
     // The repository file names the method; merging itself still needs an explicit --merge.
     if (opts.merge === 'repo') opts.merge = repoFile.merge ?? (() => { throw new Error('--merge repo needs "merge" in .prloop.json'); })();
     if (cmd === 'run' && opts.status) return out({ machine: machineLine(cfg), ...runStatus(opts.repo) }, 0);
@@ -1876,7 +1879,7 @@ export async function main(argv) {
       try {
         const pr = fetchPr(repo, prArg);
         const clean = classify(pr, cfg).verdict === 'clean';
-        const v = syncBranch({ cwd, branch: pr.headRefName, base: pr.baseRefName, baseOid: pr.baseRefOid, head: pr.headRefOid, settings: pr.repoSettings, union: opts.union, generated: opts.generated, regenerate: opts.regenerate, resume: !!opts.continue });
+        const v = syncBranch({ cwd, branch: pr.headRefName, base: pr.baseRefName, baseOid: pr.baseRefOid, head: pr.headRefOid, settings: pr.repoSettings, union: opts.union, generated: opts.generated, regenerate: opts.regenerate, approvedRegenerate: opts.approvedRegenerate, resume: !!opts.continue });
         const carry = v.verdict === 'synced' && v.unchanged && clean ? recordCarry(repo, prArg, pr.headRefOid, v) : undefined;
         return out({ pr: Number(prArg), ...v, carry }, v.verdict === 'conflict' ? EXIT.conflict : v.verdict === 'error' ? EXIT.error : 0);
       } finally { lock.release(); }

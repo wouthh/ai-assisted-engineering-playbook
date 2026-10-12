@@ -2286,16 +2286,16 @@ test('sync never runs a regenerate command the base introduced; it runs once the
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), v.head);
 });
 
-for (const defaultBranch of ['main', 'trunk']) {
-  test(`sync ${defaultBranch === 'main' ? 'runs' : 'refuses'} a regenerate merged on a ${defaultBranch === 'main' ? 'default' : 'non-default'} base without a branch commit`, (t) => {
+for (const [defaultBranch, approvedRegenerate, runs] of [['main', ['echo synced > gen.txt'], true], ['main', [], false], ['main', ['echo other'], false], ['trunk', ['echo synced > gen.txt'], false]]) {
+  test(`sync ${runs ? 'runs' : 'refuses'} a regenerate merged on a ${defaultBranch === 'main' ? 'default' : 'non-default'} base with approvedRegenerate ${JSON.stringify(approvedRegenerate)}`, (t) => {
     const r = gitRepo();
     t.after(() => rmSync(r.dir, { recursive: true, force: true }));
     r.commit('feature', { 'gen.txt': 'feature\n' });
     r.run(r.work, 'push', '-q', 'origin', 'feat');
     divergeOnMain(r, { 'gen.txt': 'base\n', '.prloop.json': '{"generated":["gen.txt"],"regenerate":"echo synced > gen.txt"}\n' });
     const head = r.run(r.work, 'rev-parse', 'HEAD');
-    const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true, defaultBranch }, generated: ['gen.txt'] });
-    if (defaultBranch === 'main') {
+    const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true, defaultBranch }, generated: ['gen.txt'], approvedRegenerate });
+    if (runs) {
       assert.equal(v.verdict, 'synced', JSON.stringify(v));
       assert.deepEqual(v.regenerated, ['gen.txt']);
       assert.equal(r.run(r.work, 'cat-file', '-p', 'HEAD:gen.txt'), 'synced');
