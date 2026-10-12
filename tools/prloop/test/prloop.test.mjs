@@ -687,6 +687,34 @@ test('sync --continue never writes a final union file through a symlink a later 
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
 });
 
+test('sync --continue drops a partial union correction when a later union file became a symlink', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  const outside = join(r.dir, 'outside.txt');
+  writeFileSync(outside, 'keep\n');
+  r.commit('feature', { 'a.csv': 'id\na\nY\nb\n' });
+  r.commit('feature fix', { 'a.csv': 'id\na\nX\n' });
+  r.commit('feature log', { 'log.csv': 'id\na\nfeature\n' });
+  rmSync(join(r.work, 'log.csv'));
+  symlinkSync(outside, join(r.work, 'log.csv'));
+  r.run(r.work, 'add', '-A');
+  r.run(r.work, 'commit', '-qm', 'link');
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  divergeOnMain(r, { 'a.csv': 'id\na\nX\nb\n', 'log.csv': 'id\na\nbase\n' });
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  const args = { cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: false, squash: false }, union: ['*.csv'], resume: true };
+  assert.equal(syncBranch(args).verdict, 'conflict');
+  rmSync(join(r.work, 'log.csv~HEAD'), { force: true });
+  rmSync(join(r.work, 'log.csv'), { force: true });
+  symlinkSync(outside, join(r.work, 'log.csv'));
+  r.run(r.work, 'add', '-A');
+  const v = syncBranch(args);
+  assert.equal(v.verdict, 'error', JSON.stringify(v));
+  assert.match(v.error, /no longer a regular file.*local only/);
+  assert.equal(r.run(r.work, 'status', '--porcelain'), '');
+  assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
+});
+
 test('sync refuses to resolve a union file that is a symlink', (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
