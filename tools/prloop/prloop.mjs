@@ -902,6 +902,12 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
   const rebaseDir = resolve(cwd, git(['rev-parse', '--git-path', 'rebase-merge'], cwd));
   const inRebase = existsSync(rebaseDir), inMerge = tryGit(['rev-parse', '-q', '--verify', 'MERGE_HEAD'], cwd) !== null;
   const resumed = resume && (inRebase || inMerge);
+  // Union files resolved before a pause for manual conflicts: a resumed sync must still correct them from the end states.
+  const unionState = resolve(cwd, git(['rev-parse', '--git-path', 'prloop-sync-unioned'], cwd));
+  const key = { head, onto: tryGit(['rev-parse', target], cwd) };
+  let saved = [];
+  if (resumed) try { const s = JSON.parse(readFileSync(unionState, 'utf8')); if (s.head === key.head && s.onto === key.onto) saved = s.files; } catch { /* none saved */ }
+  else rmSync(unionState, { force: true });
   let rebase, merges, upToDate = false, ok;
   if (resumed) {
     // Only a sync of this branch at the PR head onto the fetched base may be continued.
@@ -983,7 +989,7 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
   const baseFile = base === settings.defaultBranch ? tryGit(['show', `${target}:.prloop.json`], cwd) : null;
   let baseRegenerate;
   if (baseFile !== null) try { baseRegenerate = JSON.parse(baseFile).regenerate; if (![baseRegenerate ?? []].flat().every((c) => approvedRegenerate.includes(c))) baseRegenerate = undefined; } catch { /* the invalid synced file fails below */ }
-  const unioned = new Set(), regenerated = new Set();
+  const unioned = new Set(saved), regenerated = new Set();
   for (let i = 0; !ok && i < 200; i++) {
     const conflicted = unmerged(cwd);
     if (!conflicted.length) break; // the step failed for another reason
@@ -995,8 +1001,11 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
     const manual = unmerged(cwd).length ? resolveUnion(cwd, union, baseStage) : [];
     conflicted.filter((f) => !gen.includes(f) && !manual.includes(f)).forEach((f) => unioned.add(f));
     if (manual.length) {
-      if (resume) return { verdict: 'conflict', conflicts: manual, generated: gen, method, inProgress: true,
-        next: `resolve these conflicts in the working tree${gen.length ? ' (the generated files already take the base side and are regenerated at the end)' : ''}, then run \`prloop sync <pr> --continue\`` };
+      if (resume) {
+        writeFileSync(unionState, JSON.stringify({ ...key, files: [...unioned] }));
+        return { verdict: 'conflict', conflicts: manual, generated: gen, method, inProgress: true,
+          next: `resolve these conflicts in the working tree${gen.length ? ' (the generated files already take the base side and are regenerated at the end)' : ''}, then run \`prloop sync <pr> --continue\`` };
+      }
       step([rebase ? 'rebase' : 'merge', '--abort']);
       const named = now.regenerate ? gen : generatedFiles(cwd, manual, [target, head], now.generated ?? []);
       return { verdict: 'conflict', conflicts: manual, generated: named, method,
@@ -1010,6 +1019,7 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
     step([rebase ? 'rebase' : 'merge', '--abort']);
     return { verdict: 'error', error: `${method} failed` };
   }
+  rmSync(unionState, { force: true });
   // A rebase drops merge commits, including edits made only in them: push only when the result equals merging the base.
   if (merges) {
     // merge-tree exits 1 on conflicts but still writes a tree; conflicts only in union-resolved or regenerated files are
