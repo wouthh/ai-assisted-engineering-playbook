@@ -32,6 +32,8 @@ git diff --check
 git diff --cached --check
 ```
 
+`.prloop.json` declares the same commands joined with `&&` as the prloop gate (`light` weight, `rebase` merges) and is a working example of [per-repository prloop config](tools/prloop/README.md#per-repository-config-prloopjson). Keep it in step with this list.
+
 Inspect the complete staged diff before committing. Do not add generated reports, local repositories, tokens, or execution logs.
 
 ## Default delivery and guidance maintenance
