@@ -139,6 +139,8 @@ const sh = (cmd, args, opts = {}) =>
   execFileSync(cmd, args, { encoding: 'utf8', maxBuffer: 64 << 20, stdio: ['ignore', 'pipe', 'pipe'], ...opts }).trim();
 const git = (args, cwd) => sh('git', args, { cwd });
 const tryGit = (args, cwd) => { try { return git(args, cwd); } catch { return null; } };
+// Verbatim output, for blob contents whose edge whitespace matters; null when git fails.
+const tryGitRaw = (args, cwd) => { try { return execFileSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 64 << 20, stdio: ['ignore', 'pipe', 'pipe'] }); } catch { return null; } };
 // Explicit flags so user or repository config cannot hide untracked files or dirty submodules.
 // --no-optional-locks: a status check must not refresh and rewrite the index (see git-status "Background refresh").
 const dirty = (cwd) => git(['--no-optional-locks', 'status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none'], cwd) !== '';
@@ -1084,7 +1086,8 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
         for (let i = 0; i + 1 < t.length; i += 2) if (t[i] === 'A') added.push(t[i + 1]); else if (t[i] === 'M') changed.push(t[i + 1]);
         for (const f of changed.filter((f) => unioned.has(f) && !moved.has(f))) {
           // An unreadable blob (git failed, or it exceeds the output buffer) fails closed instead of reading as empty.
-          const after = show(c, f), before = show(p, f);
+          // Read untrimmed, so an indented first line or a last line with trailing spaces still matches its moved copy.
+          const after = tryGitRaw(['show', `${c}:${f}`], cwd), before = tryGitRaw(['show', `${p}:${f}`], cwd);
           if (after === null || before === null) return fail(`reading union file ${f} in ${short(c)} failed; merge ${base} by hand`);
           const kept = new Set(after.split('\n'));
           const lost = before.split('\n').filter((l) => l.trim() && !kept.has(l));

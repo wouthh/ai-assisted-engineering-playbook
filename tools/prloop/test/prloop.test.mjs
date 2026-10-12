@@ -752,6 +752,22 @@ test('sync fails closed when a moved union file is a tiny part of a much larger 
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
 });
 
+test('sync fails closed when an indented first union line moved into a much larger new file and the file was recreated', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.commit('feature', { 'log.csv': '  - item\n' });
+  // One indented line in 1,000 stays below the 1% copy threshold, so only the added-file search pairs the move.
+  const big = `  - item\n${Array.from({ length: 999 }, (_, i) => `new${i}`).join('\n')}\n`;
+  r.commit('move into a large file and recreate', { 'big.csv': big, 'log.csv': 'other\nunrelated\n' });
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  divergeOnMain(r, { 'log.csv': '  - item\nX\n' });
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true, squash: true }, union: ['*.csv'] });
+  assert.equal(v.verdict, 'error', JSON.stringify(v));
+  assert.match(v.error, /renamed or deleted and then recreated/);
+  assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
+});
+
 test('sync still unions a trimmed union file when the same commit added a submodule entry', (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
