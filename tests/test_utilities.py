@@ -1829,6 +1829,13 @@ class GuidanceConsistencyTests(unittest.TestCase):
                 self.assertIn("Never supervise it through a detached process plus a `pgrep -f` watcher", text)
                 self.assertIn("clear that PR's state file before rerunning, instead of spending `prloop reset-rounds`", text)
 
+    def test_template_fix_agent_gate_rule_allows_capped_subagents(self) -> None:
+        text = (ROOT / "templates/AGENTS.template.md").read_text(encoding="utf-8")
+        fix_agent = text.split("### Fix agent", 1)[1]
+        self.assertIn("never background a command", fix_agent)
+        self.assertRegex(fix_agent, r"Exception: a subagent whose tooling caps one command[^\n]*runs `prloop ready` as a background job and waits for it to exit")
+        self.assertIn("the exception in the fix-agent step 5 below", text.split("### Fix agent", 1)[0])
+
     def test_gate_tmpdir_scope_matches_across_guidance(self) -> None:
         for path in ("docs/review-wait-loop.md", "templates/AGENTS.template.md", "tools/prloop/README.md"):
             with self.subTest(path=path):
