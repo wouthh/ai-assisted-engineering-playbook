@@ -1763,6 +1763,14 @@ ${body ?? `echo '{"type":"result","subtype":"error_max_turns","is_error":true,"r
   return { res, r };
 }
 
+test('run keeps a successful agent\'s reason, such as a proposed prloop issue, in the run log', async (t) => {
+  const { res } = await runNoResultAgent(t, true, { body: `echo '{"status":"requested","head":"x","fixed":["T1"],"disputed":[],"reason":"proposed prloop issue: status stale"}'` });
+  assert.equal(res.verdict, 'clean', JSON.stringify(res));
+  const e = runStatus('example-org/example-repo').prs[0].events.find((x) => x.phase === 'agent_reason');
+  assert.equal(e?.reason, 'proposed prloop issue: status stale', JSON.stringify(e));
+  assert.equal(e.status, 'requested');
+});
+
 test('run blocks with the session error and keeps the agent log when an agent ends without a result line', async (t) => {
   const { res, r } = await runNoResultAgent(t, false);
   assert.equal(res.verdict, 'blocked', JSON.stringify(res));

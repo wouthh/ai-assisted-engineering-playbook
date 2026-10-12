@@ -1615,7 +1615,9 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
       return event(st, 'needs_human', { status: result.status, reason: `disputed findings: ${result.disputed.join(', ')}`, next: 'decide the disputed threads' });
     }
     if (result.status === 'blocked') return fail(`agent: ${result.reason ?? 'blocked'}`);
-    if (!progressed()) return fail(`agent made no progress (${result.status}): no commit, resolved thread, request or gate`);
+    if (!progressed()) return fail(`agent made no progress (${result.status}): no commit, resolved thread, request or gate${result.reason ? ` (agent: ${result.reason})` : ''}`);
+    // A successful agent's reason may hold a proposed prloop issue: keep it in the run log for the coordinator.
+    if (result.reason) logEvent(st, { phase: 'agent_reason', status: result.status, reason: String(result.reason).slice(0, 2000), agentLog });
     event(st, 'polling', { status: result.status });
   }
 
