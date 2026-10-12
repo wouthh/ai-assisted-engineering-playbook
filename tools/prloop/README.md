@@ -44,7 +44,7 @@ A repository declares its own gate in `.prloop.json` at its root, so a coordinat
 | Key | |
 |---|---|
 | `gate` | The full validation command (`--gate`, `PRLOOP_GATE`). |
-| `gateWeight` | `light` (a short gate: no slot while load allows), `heavy` (one slot), or a slot count (`2`; a number below 1 counts as light). Unset means one slot. `--gate-weight`, `PRLOOP_GATE_WEIGHT`. |
+| `gateWeight` | `light` (a short gate: no slot while load allows), `heavy` (one slot), or a slot count (`2`, at most `--gate-slots`; a number below 1 counts as light). Unset means one slot. `--gate-weight`, `PRLOOP_GATE_WEIGHT`. |
 | `union` | Globs that `sync` merges as a union (`--union`). |
 | `merge` | The merge method used by `run --merge repo`. Merging itself still needs that explicit flag. |
 | `reviewBeforeGate` | [Pipelined review](#pipelined-review); defaults to on for a declared heavy gate (`heavy` or a slot count of 1 or more), off otherwise. `--review-before-gate true\|false`, `PRLOOP_REVIEW_BEFORE_GATE`. |
