@@ -2127,3 +2127,108 @@ test('pipelined run: a clean review without a worktree to gate it is blocked, no
   assert.equal(res.verdict, 'blocked', JSON.stringify(res));
   assert.match(res.reason, /to run the gate; pass --worktree/);
 });
+
+// ---------- generated-file conflicts and sync --continue ----------
+
+for (const settings of [{ merge: true, squash: true }, { merge: false, squash: false }]) {
+  const method = settings.merge ? 'merge' : 'rebase';
+
+  test(`sync (${method}) resolves conflicts limited to generated files: base side, one regenerate, commit, push`, (t) => {
+    const r = gitRepo();
+    t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+    const runs = join(r.dir, 'regen-runs');
+    const regenerate = `cat app.txt log.csv > gen.txt && echo run >> "${runs}"`;
+    r.commit('feature 1', { 'gen.txt': 'feature 1\n', 'app.txt': 'one\nfeature\n' });
+    r.commit('feature 2', { 'gen.txt': 'feature 2\n' });
+    r.run(r.work, 'push', '-q', 'origin', 'feat');
+    divergeOnMain(r, { 'gen.txt': 'base build\n', 'log.csv': 'id\na\nbase\n' });
+    const head = r.run(r.work, 'rev-parse', 'HEAD');
+    const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings, generated: ['*.txt'], regenerate });
+    assert.equal(v.verdict, 'synced', JSON.stringify(v));
+    assert.deepEqual(v.regenerated, ['gen.txt']);
+    assert.equal(v.unchanged, false);
+    assert.equal(readFileSync(runs, 'utf8'), 'run\n'); // once, at the end
+    assert.equal(r.run(r.work, 'cat-file', '-p', 'HEAD:gen.txt'), 'one\nfeature\nid\na\nbase');
+    assert.match(r.run(r.work, 'log', '-1', '--format=%s'), /^Regenerate generated files/);
+    assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), v.head);
+    assert.equal(r.run(r.work, 'status', '--porcelain'), '');
+  });
+
+  test(`sync (${method}) still aborts and reports when a generated conflict comes with a manual one`, (t) => {
+    const r = gitRepo();
+    t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+    r.commit('feature', { 'gen.txt': 'feature\n', 'app.txt': 'feature\n' });
+    r.run(r.work, 'push', '-q', 'origin', 'feat');
+    divergeOnMain(r, { '.gitattributes': 'gen.txt linguist-generated\n', 'gen.txt': 'base\n', 'app.txt': 'base\n' });
+    const head = r.run(r.work, 'rev-parse', 'HEAD');
+    const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings, regenerate: 'true' });
+    assert.equal(v.verdict, 'conflict', JSON.stringify(v));
+    assert.deepEqual([v.conflicts, v.generated], [['app.txt'], ['gen.txt']]); // the attribute marks it generated
+    assert.match(v.next, /prloop sync <pr> --continue/);
+    assert.equal(r.run(r.work, 'rev-parse', 'HEAD'), head);
+    assert.equal(r.run(r.work, 'status', '--porcelain'), '');
+  });
+
+  test(`sync --continue (${method}) leaves manual conflicts in place, then continues, regenerates and pushes`, (t) => {
+    const r = gitRepo();
+    t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+    r.commit('feature', { 'gen.txt': 'feature\n', 'app.txt': 'feature\n', 'log.csv': 'id\na\nfeature\n' });
+    r.run(r.work, 'push', '-q', 'origin', 'feat');
+    divergeOnMain(r, { 'gen.txt': 'base\n', 'app.txt': 'base\n', 'log.csv': 'id\na\nbase\n' });
+    const head = r.run(r.work, 'rev-parse', 'HEAD');
+    const args = { cwd: r.work, branch: 'feat', base: 'main', head, settings, union: ['*.csv'], generated: ['gen.txt'], regenerate: 'cp app.txt gen.txt', resume: true };
+    let v = syncBranch(args);
+    assert.equal(v.verdict, 'conflict', JSON.stringify(v));
+    assert.deepEqual([v.conflicts, v.generated, v.inProgress], [['app.txt'], ['gen.txt'], true]);
+    v = syncBranch(args); // markers still there
+    assert.equal(v.verdict, 'conflict', JSON.stringify(v));
+    assert.match(v.next, /conflict markers/);
+    assert.equal(syncBranch({ ...args, head: 'f'.repeat(40) }).verdict, 'error'); // not a sync of this head
+    writeFileSync(join(r.work, 'app.txt'), 'base and feature\n');
+    v = syncBranch(args);
+    assert.equal(v.verdict, 'synced', JSON.stringify(v));
+    assert.deepEqual([v.resumed, v.unchanged], [true, false]);
+    assert.equal(r.run(r.work, 'cat-file', '-p', 'HEAD:gen.txt'), 'base and feature');
+    assert.equal(r.run(r.work, 'cat-file', '-p', 'HEAD:log.csv'), 'id\na\nbase\nfeature');
+    assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), v.head);
+    assert.equal(r.run(r.work, 'status', '--porcelain'), '');
+  });
+}
+
+test('a failing regenerate command restores the old head and reports no output', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.commit('feature', { 'gen.txt': 'feature\n' });
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  divergeOnMain(r, { 'gen.txt': 'base\n' });
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true }, generated: ['gen.txt'], regenerate: ['true', 'echo $((6 * 7)); exit 3'] });
+  assert.equal(v.verdict, 'error');
+  assert.match(v.error, /exit 3/);
+  assert.doesNotMatch(v.error, /42/); // the output is not reported
+  assert.equal(r.run(r.work, 'rev-parse', 'HEAD'), head);
+  assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
+});
+
+test('.prloop.json validates regenerate and generated, and mark-tested records its gate in the gate cache', (t) => {
+  tempState(t);
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  for (const [bad, re] of [[{ regenerate: 3 }, /regenerate must be string\|array/], [{ regenerate: [1] }, /regenerate must be/], [{ generated: 'x' }, /generated must be array/]]) {
+    writeFileSync(join(r.work, '.prloop.json'), JSON.stringify(bad));
+    assert.throws(() => repoConfig(r.work), re);
+  }
+  writeFileSync(join(r.work, '.prloop.json'), JSON.stringify({ gate: 'make check', regenerate: ['make gen'], generated: ['dist/**'] }));
+  assert.deepEqual(repoConfig(r.work).regenerate, ['make gen']);
+  r.commit('config', {});
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  const res = spawnSync(process.execPath, [PRLOOP, 'mark-tested'], { cwd: r.work, encoding: 'utf8', env: (({ PRLOOP_GATE, ...env }) => ({ ...env, PRLOOP_LOCK_TOKEN: '' }))(process.env) });
+  assert.equal(JSON.parse(res.stdout).gatePassedHead, head, res.stdout + res.stderr);
+  assert.equal(gatePassed('make check', r.work), head);
+});
+
+test('the conflict prompt sends the agent through prloop sync --continue, never a raw rebase', () => {
+  const p = buildPrompt({ trigger: 'conflict', conflicts: ['app.txt'], pr: 7, repo: 'o/r', gate: 'make test' });
+  assert.match(p, /never with a raw `git rebase`/);
+  assert.match(p, /`prloop sync 7 --continue`/);
+});
