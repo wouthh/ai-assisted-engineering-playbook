@@ -181,6 +181,9 @@ export function config(opts, env = process.env, { machine = {}, repo = {} } = {}
   if (!/^\d+$/.test(maxLocal)) throw new Error(`--max-local-reviews must be a nonnegative integer, not ${maxLocal}`);
   const mode = String(opts.reviewer ?? env.PRLOOP_REVIEWER ?? 'auto');
   const gateWeight = opts.gateWeight ?? env.PRLOOP_GATE_WEIGHT ?? repo.gateWeight;
+  const gateSlots = positiveInt('gate-slots', opts.gateSlots ?? env.PRLOOP_GATE_SLOTS ?? machine.gateSlots ?? 2);
+  // A gate that needs more slots than the pool has could never run as declared.
+  if (gateCost(gateWeight) > gateSlots) throw new Error(`--gate-weight ${gateWeight} needs more slots than --gate-slots ${gateSlots}`);
   return {
     mode,
     // Anchored: any account whose login merely contains the bot's name could otherwise approve.
@@ -203,7 +206,7 @@ export function config(opts, env = process.env, { machine = {}, repo = {} } = {}
     deadline: parseDuration(opts.deadline ?? '6h', 'deadline'),
     maxRounds: positiveInt('max-rounds', opts.maxRounds ?? 6),
     maxAgents: positiveInt('max-agents', opts.maxAgents ?? 2),
-    gateSlots: positiveInt('gate-slots', opts.gateSlots ?? env.PRLOOP_GATE_SLOTS ?? machine.gateSlots ?? 2),
+    gateSlots,
     maxLoad: positiveNumber('max-load', opts.maxLoad ?? env.PRLOOP_MAX_LOAD ?? machine.maxLoad),
     minFreeMem: parseSize(opts.minFreeMem ?? env.PRLOOP_MIN_FREE_MEM ?? machine.minFreeMem),
     resourceWait: parseDuration(opts.resourceWait ?? env.PRLOOP_RESOURCE_WAIT ?? machine.resourceWait ?? '30m', 'resource-wait'),
@@ -776,9 +779,9 @@ export function patchId(cwd, base, head, unioned = []) {
   return text ? sh('git', ['patch-id', '--stable'], { cwd, input: `${text}\n`, stdio: ['pipe', 'pipe', 'pipe'] }).split(' ')[0] || null : null;
 }
 
-// Conflicted files the repository marks generated (`linguist-generated` in .gitattributes): regenerate, don't hand-merge.
-const generatedFiles = (cwd, files) => (files.length ? tryGit(['check-attr', 'linguist-generated', '--', ...files], cwd) ?? '' : '')
-  .split('\n').flatMap((l) => { const m = /^(.*): linguist-generated: (set|true)$/.exec(l); return m ? [m[1]] : []; });
+// Conflicted files that either side marks generated (`linguist-generated` in its .gitattributes): regenerate, don't hand-merge.
+const generatedFiles = (cwd, files, revs) => files.filter((f) => revs.some((rev) =>
+  /: linguist-generated: (set|true)$/.test(tryGit(['check-attr', `--source=${rev}`, 'linguist-generated', '--', f], cwd) ?? '')));
 
 // `rebase` forces a rebase (and linearizing), for `run --merge rebase`; otherwise the repository's merge settings decide.
 export function syncBranch({ cwd, branch, base, baseOid, head, settings, union = [], remote = 'origin', rebase: forceRebase = false }) {
@@ -811,7 +814,7 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
     if (!manual.length) conflicted.forEach((f) => unioned.add(f));
     if (manual.length) {
       step([rebase ? 'rebase' : 'merge', '--abort']);
-      const generated = generatedFiles(cwd, manual);
+      const generated = generatedFiles(cwd, manual, [target, head]);
       return { verdict: 'conflict', conflicts: manual, generated, method: rebase ? 'rebase' : 'merge',
         next: `resolve these conflicts by hand${generated.length ? ` (regenerate ${generated.join(', ')} from their sources instead of merging them)` : ''}, then run your gate and push` };
     }
@@ -1430,6 +1433,8 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     }
     if (s.verdict === 'pending') return st.phase === 'waiting' ? undefined : event(st, 'waiting', { verdict: 'pending' });
     if (s.verdict === 'unavailable') return block(st, `cloud reviewer unavailable: ${s.unavailableReason}`, 'retry later or use --reviewer auto or local');
+    // Pipelined review: a clean review alone is not done; without a worktree prloop cannot run the gate.
+    if (s.verdict === 'clean' && cfg.reviewBeforeGate && cfg.gate && !cwd) return block(st, `no worktree has ${s.branch} checked out to run the gate; pass --worktree`);
     if (s.verdict === 'clean' && !opts.merge) return event(st, 'clean', { next: 'the current head is reviewed clean; merge when authorized' });
     if (s.verdict === 'clean') {
       if (s.unresolvedThreads.length) return; // classify reports findings in that case; defensive
