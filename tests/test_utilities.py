@@ -1848,6 +1848,7 @@ class GuidanceConsistencyTests(unittest.TestCase):
                 text = (ROOT / path).read_text(encoding="utf-8")
                 self.assertIn("locally run real instance", text)
                 self.assertIn("Checks that authenticate to a hosted provider, including its sandbox or test tenant, and checks with production credentials stay out of the routine gate and behind separate approval.", text)
+                self.assertIn("A hosted-only API with no official emulator or self-hostable implementation is covered in the routine gate by local contract tests", text)
 
 if __name__ == "__main__":
     unittest.main()
