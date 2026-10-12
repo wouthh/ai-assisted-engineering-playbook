@@ -969,9 +969,10 @@ async function runReviewer(cfg, prompt, cwd, keep) {
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 
-export function localReviewPrompt(s) {
-  // Diff from the reported base commit: the remote branch may carry commits that the PR still includes.
-  return `Review pull request #${s.pr}: the changes in \`git diff ${s.baseOid ?? `origin/${s.base}`}...HEAD\` at head ${s.head}.
+// `base` is the merge base of the fetched base branch and HEAD: GitHub's baseRefOid can lag behind a base that sync
+// already merged, and diffing from it would show those base commits as PR changes.
+export function localReviewPrompt(s, base = `origin/${s.base}`) {
+  return `Review pull request #${s.pr}: the changes in \`git diff ${base}...HEAD\` at head ${s.head}.
 Do not modify any file. Report only real defects (bugs, security, data loss, broken contracts), not style.
 Return JSON {"findings":[{"path","line","severity":"P0".."P3","body"}]} with "line" in the new file (0 if none) and an empty array when there are no issues.`;
 }
@@ -988,7 +989,7 @@ export async function localReview(repo, s, cfg, cwd, onLog = () => {}) {
   // Fail closed: a missing or stale base would make an empty diff look like a clean review.
   const baseError = fetchBase(cwd, s.base, s.baseOid);
   if (baseError) return { verdict: 'blocked', pr: s.pr, head: s.head, reason: `local review: ${baseError}` };
-  const prompt = localReviewPrompt(s);
+  const prompt = localReviewPrompt(s, git(['merge-base', `origin/${s.base}`, 'HEAD'], cwd));
   let findings, agentLog;
   const keep = (r) => onLog(agentLog = saveAgentLog(repo, s.pr, r), r);
   try { findings = await runReviewer(cfg, prompt, cwd, keep); } catch (e) {
@@ -1022,7 +1023,7 @@ const saveState = (st) => {
   const disk = loadState(st.repo, st.pr).carry;
   if (disk && !(st.carry?.at >= disk.at)) st.carry = disk;
   mkdirSync(stateDir(), { recursive: true });
-  // Owner-only: the state holds gate output, which may carry a secret the gate printed.
+  // Owner-only, like the logs it points to.
   writeFileSync(statePath(st.repo, st.pr), JSON.stringify(st, null, 2), { mode: 0o600 });
   chmodSync(statePath(st.repo, st.pr), 0o600);
 };
@@ -1077,7 +1078,8 @@ export function buildPrompt(t) {
   const data = t.trigger === 'conflict' ? `Conflicted files: ${t.conflicts.join(', ')}${t.generated?.length ? `\nGenerated files among them (regenerate them from their sources after resolving the rest, never merge them by hand): ${t.generated.join(', ')}` : ''}`
     : t.findings?.length ? `Findings:\n${t.findings.map((f) => `- ${f.id} ${f.path ?? ''}:${f.line ?? ''} ${plain(f.body).slice(0, 600)}`).join('\n')}`
       : `Missing: ${(t.missing ?? []).join('; ') || 'a review request on the current head'}`;
-  const failure = t.gateFailure ? `\nThe full gate failed on head ${t.gateFailure.head}; its last lines:\n${t.gateFailure.tail.slice(-3000)}` : '';
+  // Only the log path: the gate output may hold a secret, which stays in the owner-only local log.
+  const failure = t.gateFailure ? `\nThe full gate failed on head ${t.gateFailure.head}; its last lines are in the owner-only local log ${t.gateFailure.log} (it may hold secrets: rerun the failing step locally, and never quote a secret)` : '';
   const summary = t.summaries?.length ? `\nReviewer summary for this head (may hold findings that are not threads):\n${t.summaries.map(plain).join('\n').slice(0, 1500)}` : '';
   const request = t.localReview
     ? 'Do not post a review request: prloop reviews this PR locally once `prloop ready` passes.'
@@ -1171,6 +1173,11 @@ export function saveAgentLog(repo, pr, r, now = Date.now()) {
   const final = r.final !== r.stdout ? `\n## final message\n${r.final}` : '';
   writeFileSync(file, `# exit status ${r.status}\n## stdout\n${r.stdout}\n## stderr\n${r.stderr}${final}\n`, { mode: 0o600 });
   return file;
+}
+
+// Saves a failed gate's output tail owner-only next to the agent logs; fix prompts get only the path.
+export function saveGateLog(repo, pr, tail, now = Date.now()) {
+  return saveAgentLog(repo, pr, { status: 'gate failed', stdout: tail, stderr: '', final: tail }, now);
 }
 
 // Run on startup of `run` and `wait`: deletes agent logs older than 14 days.
@@ -1416,7 +1423,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
       let g;
       try { g = await readyGate(s, cfg, cwd, { metrics, now, log: ({ event: phase, ...e }) => logEvent(st, { phase, ...e }) }); } finally { lock.release(); }
       if (g?.ok) return event(st, 'polling', { verdict: 'gate_passed' });
-      st.gateFailure = { head: s.head, tail: g?.tail ?? 'the worktree no longer matches the PR head' };
+      st.gateFailure = { head: s.head, log: saveGateLog(st.repo, st.pr, g?.tail ?? 'the worktree no longer matches the PR head') };
       return event(st, 'polling', { verdict: 'gate_failed', reason: `gate exited with ${g?.status}` });
     }
     // A later pass of the same gate on this head (an agent's `prloop ready` after a flaky failure) supersedes the failure.
