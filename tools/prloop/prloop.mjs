@@ -717,8 +717,10 @@ function forgetGatePass(key) {
 
 // Whether the pass of `gate` on this clean head is good enough for `run --merge`: run by prloop itself, or self-reported
 // on a head whose diff from a prloop-run pass of the same gate in this repository touches only `irrelevant` globs
-// (the repository's gateIrrelevant). Returns null without a pass, else the entry with ok (and coveredBy).
-export function gateProvenance(gate, cwd, irrelevant = []) {
+// (the repository's gateIrrelevant, read from the checked-out head so a long-running `run` never trusts a stale one;
+// a changed .prloop.json is never irrelevant; an invalid one exempts nothing). Returns null without a pass, else the
+// entry with ok (and coveredBy).
+export function gateProvenance(gate, cwd, irrelevant = (() => { try { return repoConfig(cwd).gateIrrelevant ?? []; } catch { return []; } })()) {
   const key = gateKey(gate, cwd), e = gateEntry(gate, cwd, key);
   if (!e) return null;
   if (e.source === 'prloop') return { ...e, ok: true };
@@ -732,7 +734,7 @@ export function gateProvenance(gate, cwd, irrelevant = []) {
     // top-level path, so a changed submodule is never irrelevant.
     const parts = raw.split('\0').filter(Boolean), changes = [];
     for (let i = 0; i + 1 < parts.length; i += 2) changes.push({ modes: parts[i].slice(1).split(' ', 2), path: parts[i + 1] });
-    if (changes.every((c) => !c.modes.includes('160000') && res.some((r) => r.test(c.path)))) return { ...e, ok: true, coveredBy: sha };
+    if (changes.every((c) => !c.modes.includes('160000') && c.path !== '.prloop.json' && res.some((r) => r.test(c.path)))) return { ...e, ok: true, coveredBy: sha };
   }
   return { ...e, ok: false };
 }
@@ -1006,6 +1008,14 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
   // Once at the end, after every generated conflict took the base side (and always when finishing a resumed sync).
   // The commands come from the synced .prloop.json, so a base that changed them never runs the branch's stale ones.
   const final = synced();
+  // Always, regenerate or not: an invalid synced .prloop.json is never pushed.
+  if (final.invalid) {
+    const why = `the synced .prloop.json is invalid (${final.invalid}): fix it on ${base}, then rerun \`prloop sync\``;
+    // A resumed sync holds a manual resolution: keep it locally instead of discarding it.
+    if (resumed) return { verdict: 'error', error: `${why}; the synced branch is local only, at ${short(git(['rev-parse', 'HEAD'], cwd))}` };
+    git(['reset', '--quiet', '--hard', '--recurse-submodules', head], cwd);
+    return { verdict: 'error', error: why };
+  }
   if ((regenerate || final.regenerate) && (regenerated.size || resumed)) {
     // Ignored files too: generators often write ignored build output, which a failed run must not leave behind.
     // Nested submodules too, which a top-level reset or listing does not descend into.
@@ -1020,7 +1030,6 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
       for (const f of untracked()) if (!before.has(f)) rmSync(join(cwd, f), { force: true });
       return { verdict: 'error', error: why };
     };
-    if (final.invalid) return fail(`the synced .prloop.json is invalid (${final.invalid}): fix it on ${base}, then rerun \`prloop sync\``);
     if (!final.regenerate) return fail(`the synced .prloop.json no longer declares regenerate: merge ${base} by hand and regenerate ${[...regenerated].join(', ') || 'the generated files'} from their sources`);
     for (const cmd of [final.regenerate].flat()) {
       // Output is not reported: like gate output it may hold a secret, and the result reaches agents.
@@ -1665,7 +1674,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
         note: 'The head is already reviewed clean and only needs the gate: run `prloop ready`, which runs the gate and marks the head tested, then reports that the head is already reviewed clean. That report is expected: skip the review request and report status nothing_to_do.' });
       // A self-reported pass (`mark-tested --gate`) is not merge evidence unless only gate-irrelevant paths changed since a
       // prloop-run pass: prloop reruns the gate itself, once per head (a failure goes to a fix agent).
-      if (cfg.gate && !gateProvenance(cfg.gate, cwd, opts.gateIrrelevant)?.ok) {
+      if (cfg.gate && !gateProvenance(cfg.gate, cwd)?.ok) {
         logEvent(st, { phase: 'gate_unverified', reason: `the gate pass on ${short(s.head)} was not run by prloop; rerunning it before merging` });
         return gateNow(st, s, cwd, true);
       }
@@ -1793,7 +1802,7 @@ export async function main(argv) {
     const repoFile = repoConfig(opts.worktree ? resolve(opts.worktree) : process.cwd());
     const cfg = config(opts, process.env, { machine: machineConfig(), repo: repoFile });
     if (!opts.union.length && repoFile.union) opts.union = repoFile.union;
-    Object.assign(opts, { generated: repoFile.generated ?? [], regenerate: repoFile.regenerate, gateIrrelevant: repoFile.gateIrrelevant ?? [] });
+    Object.assign(opts, { generated: repoFile.generated ?? [], regenerate: repoFile.regenerate });
     // The repository file names the method; merging itself still needs an explicit --merge.
     if (opts.merge === 'repo') opts.merge = repoFile.merge ?? (() => { throw new Error('--merge repo needs "merge" in .prloop.json'); })();
     if (cmd === 'run' && opts.status) return out({ machine: machineLine(cfg), ...runStatus(opts.repo) }, 0);
@@ -1816,7 +1825,7 @@ export async function main(argv) {
       const checkout = !!tryGit(['rev-parse', '--git-dir']);
       const local = checkout ? localGate(s, process.cwd(), cfg.gate) : [];
       const unresolvedThreads = s.unresolvedThreads.map((t) => ({ ...t, body: t.body.slice(0, 300) }));
-      const pass = checkout && cfg.gate ? gateProvenance(cfg.gate, process.cwd(), opts.gateIrrelevant) : null;
+      const pass = checkout && cfg.gate ? gateProvenance(cfg.gate, process.cwd()) : null;
       return out({ ...s, unresolvedThreads, reasons: [...s.reasons, ...local], readyToRequest: s.readyToRequest && !local.length,
         tested: !checkout ? false : cfg.gate ? pass?.head === s.head : isTested(s.head, process.cwd()),
         ...(pass ? { gatePass: pick(pass, ['head', 'source', 'ok', 'coveredBy', 'durationMs', 'log']) } : {}), lastGate: lastGateSummary(loadState(repo, prArg).lastGate) }, 0);
