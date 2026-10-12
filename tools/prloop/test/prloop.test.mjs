@@ -2187,6 +2187,12 @@ for (const settings of [{ merge: true, squash: true }, { merge: false, squash: f
     writeFileSync(join(r.work, 'app.txt'), 'base and feature\n');
     assert.match(syncBranch(args).next, /stage each resolution/); // resolved but not staged
     r.run(r.work, 'add', 'app.txt');
+    writeFileSync(join(r.work, 'log.csv'), 'unrelated edit\n');
+    writeFileSync(join(r.work, 'scratch.txt'), 'secret\n');
+    v = syncBranch(args); // neither the unstaged edit nor the untracked file may be committed
+    assert.deepEqual([v.verdict, v.stray], ['conflict', ['log.csv', 'scratch.txt']], JSON.stringify(v));
+    r.run(r.work, 'checkout', '--', 'log.csv');
+    rmSync(join(r.work, 'scratch.txt'));
     v = syncBranch(args);
     assert.equal(v.verdict, 'synced', JSON.stringify(v));
     assert.deepEqual([v.resumed, v.unchanged], [true, false]);

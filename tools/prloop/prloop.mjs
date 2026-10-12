@@ -828,7 +828,11 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
       return { verdict: 'conflict', conflicts: left, generated: [], method: rebase ? 'rebase' : 'merge', inProgress: true,
         next: `${marked.length ? `remove the conflict markers from ${marked.join(', ')}, then ` : ''}stage each resolution (\`git add\` or \`git rm\`), then run \`prloop sync <pr> --continue\` again` };
     }
-    git(['add', '-u'], cwd);
+    // Nothing else may ride along: an unstaged edit or a new untracked file (which a regenerate would `git add -A`)
+    // made while resolving would be committed and pushed unseen.
+    const stray = [...git(['diff', '--name-only'], cwd).split('\n'), ...git(['ls-files', '--others', '--exclude-standard'], cwd).split('\n')].filter(Boolean);
+    if (stray.length) return { verdict: 'conflict', conflicts: [], stray, generated: [], method: rebase ? 'rebase' : 'merge', inProgress: true,
+      next: `stage or remove ${stray.join(', ')} (unstaged or untracked, not part of the sync), then run \`prloop sync <pr> --continue\` again` };
     merges = rebase && !!git(['rev-list', '--merges', `${target}..${head}`], cwd);
     ok = step(rebase ? ['rebase', '--continue'] : ['commit', '--no-edit']);
   } else {
