@@ -231,7 +231,7 @@ export function config(opts, env = process.env, { machine = {}, repo = {} } = {}
 
 // ---------- GitHub reads ----------
 
-const PR_QUERY = `query($owner:String!,$name:String!,$pr:Int!){viewer{login} repository(owner:$owner,name:$name){
+const PR_QUERY = `query($owner:String!,$name:String!,$pr:Int!){viewer{login} repository(owner:$owner,name:$name){defaultBranchRef{name}
   mergeCommitAllowed squashMergeAllowed rebaseMergeAllowed
   pullRequest(number:$pr){number url state headRefName reactions(last:50){pageInfo{hasPreviousPage} nodes{content createdAt user{login}}} baseRefName baseRefOid headRefOid mergeable mergeStateStatus mergeCommit{oid}
     timelineItems(last:1,itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT]){nodes{... on HeadRefForcePushedEvent{createdAt}}}
@@ -261,7 +261,7 @@ export function fetchPr(repo, pr) {
   const { viewer, repository: r } = JSON.parse(out).data;
   if (!r?.pullRequest) throw new Error(`PR ${repo}#${pr} not found`);
   return { ...r.pullRequest, viewer, headSeenAt: headSeenAt(`${repo}#${pr}`, r.pullRequest.headRefOid), carry: loadState(repo, pr).carry,
-    repoSettings: { merge: r.mergeCommitAllowed, squash: r.squashMergeAllowed, rebase: r.rebaseMergeAllowed } };
+    repoSettings: { merge: r.mergeCommitAllowed, squash: r.squashMergeAllowed, rebase: r.rebaseMergeAllowed, defaultBranch: r.defaultBranchRef?.name } };
 }
 
 // When prloop saw this PR's current head become its head. GitHub exposes no push time, and a
@@ -963,6 +963,10 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
   const headFile = tryGit(['show', `${head}:.prloop.json`], cwd);
   let approved = { generated, regenerate };
   if (headFile !== null) try { approved = JSON.parse(headFile); } catch { approved = {}; }
+  // A regenerate committed on the repository's default branch reached it through a reviewed merge: it is approved too.
+  const baseFile = base === settings.defaultBranch ? tryGit(['show', `${target}:.prloop.json`], cwd) : null;
+  let baseRegenerate;
+  if (baseFile !== null) try { baseRegenerate = JSON.parse(baseFile).regenerate; } catch { /* the invalid synced file fails below */ }
   const unioned = new Set(), regenerated = new Set();
   for (let i = 0; !ok && i < 200; i++) {
     const conflicted = unmerged(cwd);
@@ -1040,8 +1044,8 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
     if (!final.regenerate) return fail(`the synced .prloop.json no longer declares regenerate: merge ${base} by hand and regenerate ${[...regenerated].join(', ') || 'the generated files'} from their sources`);
     // A command the base introduced is shown and fails closed, so a new base commit never runs unreviewed shell commands.
     const list = (c) => JSON.stringify([c ?? []].flat());
-    if (list(approved.regenerate) !== list(final.regenerate)) {
-      return fail(`the synced .prloop.json changed regenerate to ${list(final.regenerate)}, which was not approved: inspect it, set the same regenerate in the branch's .prloop.json (commit and push), then rerun \`prloop sync\``);
+    if (list(approved.regenerate) !== list(final.regenerate) && (baseRegenerate === undefined || list(baseRegenerate) !== list(final.regenerate))) {
+      return fail(`the synced .prloop.json changed regenerate to ${list(final.regenerate)}, which was not approved (neither the PR head nor a default-branch base declares it): inspect it, set the same regenerate in the branch's .prloop.json (commit and push), then rerun \`prloop sync\``);
     }
     for (const cmd of [final.regenerate].flat()) {
       // Output is not reported: like gate output it may hold a secret, and the result reaches agents.
