@@ -2274,6 +2274,21 @@ test('sync regenerates with the command the synced .prloop.json declares, never 
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), v.head);
 });
 
+test('sync never pushes an invalid synced .prloop.json, even without regenerate', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.commit('feature', { 'app.txt': 'feature\n' });
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  divergeOnMain(r, { 'base.txt': 'base\n', '.prloop.json': '{"bogus":1}\n' });
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true } });
+  assert.equal(v.verdict, 'error', JSON.stringify(v));
+  assert.match(v.error, /synced \.prloop\.json is invalid/);
+  assert.equal(r.run(r.work, 'rev-parse', 'HEAD'), head);
+  assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
+  assert.equal(r.run(r.work, 'status', '--porcelain'), '');
+});
+
 test('sync never regenerates with the branch\'s command once the base deleted .prloop.json', (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
@@ -2456,6 +2471,19 @@ test('gate provenance: a self-reported pass counts for a merge only after gate-i
   recordGatePass(gate, r.work);
   assert.deepEqual(pick(gateProvenance(gate, r.work, irrelevant), ['source', 'ok', 'coveredBy']), { source: 'self', ok: true, coveredBy: ran });
   assert.equal(gateProvenance(gate, r.work).ok, false); // without gateIrrelevant every path counts
+  // Without an explicit list the checked-out head's .prloop.json applies, never a stale startup value; a changed
+  // .prloop.json itself is never irrelevant, so a head that adds the exemption is not covered by it.
+  r.commit('exempt docs', { '.prloop.json': '{"gateIrrelevant":["docs/**","*.md",".prloop.json"]}\n' });
+  recordGatePass(gate, r.work);
+  assert.equal(gateProvenance(gate, r.work).ok, false);
+  await readyGate({ branch: 'feat', head: r.run(r.work, 'rev-parse', 'HEAD') }, { ...cfg, gate, forceGate: true }, r.work, deps);
+  r.commit('more docs', { 'docs/b.txt': 'z\n' });
+  recordGatePass(gate, r.work);
+  assert.equal(gateProvenance(gate, r.work).ok, true);
+  r.commit('narrow', { '.prloop.json': '{"gateIrrelevant":[]}\n' });
+  r.commit('docs again', { 'docs/c.txt': 'w\n' });
+  recordGatePass(gate, r.work);
+  assert.equal(gateProvenance(gate, r.work).ok, false);
   r.commit('code', { 'app.txt': 'changed\n' });
   recordGatePass(gate, r.work);
   assert.equal(gateProvenance(gate, r.work, irrelevant).ok, false);
