@@ -767,6 +767,30 @@ test('sync still unions a trimmed union file when the same commit added a submod
   assert.equal(r.run(r.work, 'show', 'HEAD:log.csv'), 'id\na\nX');
 });
 
+test('sync still finds a moved union line when the same commit added more paths than fit in one argv', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.commit('feature', { 'log.csv': 'id\na\nY\n' });
+  mkdirSync(join(r.work, 'zz'));
+  // One shared line in 1,000 stays below the 1% copy threshold, so only the added-file search pairs the move.
+  writeFileSync(join(r.work, 'zz', 'moved.txt'), `Y\n${Array.from({ length: 999 }, (_, i) => `new${i}`).join('\n')}\n`);
+  writeFileSync(join(r.work, 'log.csv'), 'id\nb\n');
+  r.run(r.work, 'add', '.');
+  // About 3 MB of empty-file paths, over the usual 2 MB ARG_MAX; the moved line sits in the last added path.
+  const empty = r.run(r.work, 'hash-object', '-w', '--stdin');
+  const pad = 'p'.repeat(90);
+  const info = Array.from({ length: 30000 }, (_, i) => `100644 ${empty}\tbulk/${pad}${i}\n`).join('');
+  execFileSync('git', ['update-index', '--index-info'], { cwd: r.work, input: info });
+  r.run(r.work, 'commit', '-qm', 'vendor files, move a line out and trim');
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  divergeOnMain(r, { 'log.csv': 'id\na\nX\n' });
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true, squash: true }, union: ['*.csv'] });
+  assert.equal(v.verdict, 'error', JSON.stringify(v));
+  assert.match(v.error, /renamed or deleted and then recreated/);
+  assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
+});
+
 test('sync fails closed when searching the files added next to a modified union file fails', (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));

@@ -1091,10 +1091,15 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
           if (!lost.length || !added.length) continue;
           // git grep streams blobs of any size and skips gitlinks, which hold no lines; exit 1 means no match. It has no
           // whole-line flag, so each lost line becomes an anchored, escaped pattern.
+          // The paths go in batches of at most 64 KiB of argv, so a commit adding many files stays under ARG_MAX.
           const pat = lost.map((l) => `^${l.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`).join('\n');
-          const g = spawnSync('git', ['grep', '-q', '-E', '-f', '-', c, '--', ...added.map((a) => `:(literal)${a}`)], { cwd, input: pat });
-          if (g.status === 0) moved.add(f);
-          else if (g.status !== 1) return fail(`searching the files ${short(c)} added failed; merge ${base} by hand`);
+          for (let i = 0; i < added.length && !moved.has(f);) {
+            const batch = [];
+            for (let n = 0; i < added.length && (!batch.length || n < 65536); i++) { batch.push(`:(literal)${added[i]}`); n += added[i].length + 12; }
+            const g = spawnSync('git', ['grep', '-q', '-E', '-f', '-', c, '--', ...batch], { cwd, input: pat });
+            if (g.status === 0) moved.add(f);
+            else if (g.status !== 1) return fail(`searching the files ${short(c)} added failed; merge ${base} by hand`);
+          }
         }
       }
     }
