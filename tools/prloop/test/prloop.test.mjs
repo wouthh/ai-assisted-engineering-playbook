@@ -2204,13 +2204,15 @@ test('a failing regenerate command restores the old head and reports no output',
   r.run(r.work, 'push', '-q', 'origin', 'feat');
   divergeOnMain(r, { 'gen.txt': 'base\n' });
   const head = r.run(r.work, 'rev-parse', 'HEAD');
-  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true }, generated: ['gen.txt'], regenerate: ['true', 'echo $((6 * 7)) > new.txt; exit 3'] });
+  writeFileSync(join(r.work, '.git', 'info', 'exclude'), '*.out\n');
+  writeFileSync(join(r.work, 'old.out'), 'kept\n');
+  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true }, generated: ['gen.txt'], regenerate: ['echo x > build.out', 'echo $((6 * 7)) > new.txt; exit 3'] });
   assert.equal(v.verdict, 'error');
   assert.match(v.error, /exit 3/);
   assert.doesNotMatch(v.error, /42/); // the output is not reported
   assert.equal(r.run(r.work, 'rev-parse', 'HEAD'), head);
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
-  assert.equal(r.run(r.work, 'status', '--porcelain'), ''); // the command's new file is gone too
+  assert.equal(r.run(r.work, 'status', '--porcelain', '--ignored'), '!! old.out'); // new files are gone, ignored ones too
 });
 
 test('sync --continue refuses a markerless conflict until it is staged, also with the apply rebase backend', (t) => {
@@ -2239,7 +2241,7 @@ test('.prloop.json validates regenerate and generated, and mark-tested records i
   tempState(t);
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
-  for (const [bad, re] of [[{ regenerate: 3 }, /regenerate must be string\|array/], [{ regenerate: [1] }, /regenerate must be/], [{ generated: 'x' }, /generated must be array/]]) {
+  for (const [bad, re] of [[{ regenerate: 3 }, /regenerate must be string\|array/], [{ regenerate: [1] }, /regenerate must be/], [{ regenerate: [] }, /non-blank/], [{ regenerate: ['make', ' '] }, /non-blank/], [{ regenerate: '' }, /non-blank/], [{ generated: 'x' }, /generated must be array/]]) {
     writeFileSync(join(r.work, '.prloop.json'), JSON.stringify(bad));
     assert.throws(() => repoConfig(r.work), re);
   }
