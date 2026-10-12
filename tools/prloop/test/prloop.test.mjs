@@ -2033,6 +2033,30 @@ test('run linearizes once and retries when GitHub refuses a rebase merge of a cl
   assert.match(readFileSync(JSON.parse(readFileSync(join(state, 'example-org__example-repo__7.json'), 'utf8')).log, 'utf8'), /"phase":"merge_refused"/);
 });
 
+test('run blocks without linearizing when GitHub refuses a rebase merge for another reason', async (t) => {
+  const state = tempState(t);
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.commit('feature', { 'app.txt': 'feature\n' });
+  divergeOnMain(r, { 'other.txt': 'base\n' });
+  r.run(r.work, 'merge', '-q', '--no-edit', 'main');
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  markTested(head, r.work);
+  writeFileSync(join(state, 'heads.json'), JSON.stringify({ 'example-org/example-repo#7': { sha: head, at: at('09:00') } }));
+  const pr = fixture();
+  Object.assign(pr, { headRefName: 'feat', headRefOid: head, mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE' });
+  request(pr).reactions.nodes.push({ content: 'THUMBS_UP', createdAt: at('10:20'), user: BOT });
+  const calls = fakeGh(t, r.dir, pr);
+  const gh = join(r.dir, 'bin', 'gh');
+  writeFileSync(gh, readFileSync(gh, 'utf8').replace('"pr merge") ', '"pr merge") echo "HTTP 502: Bad Gateway" >&2; exit 1; '));
+  const [res] = await runAll({ repo: 'example-org/example-repo', pr: '7', worktree: r.work, merge: 'rebase', deadline: '1h' }, { ...cfg, agent: 'none', interval: 1 }, { metrics: idle().metrics });
+  assert.equal(res.verdict, 'blocked', JSON.stringify(res));
+  assert.match(res.reason, /HTTP 502/);
+  assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head); // nothing rewritten or pushed
+  assert.equal(calls().filter((c) => c.startsWith('pr merge')).length, 1);
+});
+
 test('pipelined run: a clean review without a worktree to gate it is blocked, not clean', async (t) => {
   const state = tempState(t);
   const dir = mkdtempSync(join(tmpdir(), 'prloop-nowt-'));
