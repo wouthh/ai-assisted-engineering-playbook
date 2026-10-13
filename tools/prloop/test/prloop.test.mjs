@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import {
   EXIT, OUTPUT_TAIL, main, errorFrame, reviewerEvents, recordReviewerEvents, reviewerDecision, approvedFor, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, permissionDenied, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, sweepTmp, tmpLine, reclaimTmp, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, recordEvent, saveState, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, gateProvenance, treeRss, recordGatePass, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, reconcileStates, syncBranch, unionLines, unionResult, waitFor,
+  MERGEABILITY_WAIT,
 } from '../prloop.mjs';
 
 const pick = (o, keys) => Object.fromEntries(keys.map((k) => [k, o[k]]));
@@ -2197,6 +2198,33 @@ test('run carries a clean verdict across a sync that leaves the PR unchanged', a
   const st = JSON.parse(readFileSync(join(state, 'example-org__example-repo__7.json'), 'utf8'));
   assert.deepEqual([st.carry.from, st.carry.to], [head, synced]);
   assert.ok(calls().every((c) => c.startsWith('api graphql')), 'no review request or other write');
+});
+
+test('run never reports clean while GitHub mergeability is UNKNOWN: it polls, then syncs and reports the conflict', async (t) => {
+  const state = tempState(t);
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.commit('feature', { 'app.txt': 'feature\n' });
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  divergeOnMain(r, { 'app.txt': 'base\n' }); // the base moved and now conflicts with the reviewed head
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  writeFileSync(join(state, 'heads.json'), JSON.stringify({ 'example-org/example-repo#7': { sha: head, at: at('09:00') } }));
+  writeFileSync(join(state, 'example-org__example-repo__7.json'), JSON.stringify({ repo: 'example-org/example-repo', pr: 7, phase: 'clean', head, rounds: 1, seen: {} }));
+  const pr = fixture();
+  Object.assign(pr, { headRefName: 'feat', headRefOid: head, mergeStateStatus: 'UNKNOWN', mergeable: 'UNKNOWN' });
+  request(pr).reactions.nodes.push({ content: 'THUMBS_UP', createdAt: at('10:20'), user: BOT });
+  const calls = fakeGh(t, r.dir, pr);
+  // Each clock read advances half the wait: the first poll only starts waiting, a later one has waited long enough.
+  let clock = Date.now();
+  const now = () => (clock += MERGEABILITY_WAIT / 2);
+  const [res] = await runAll({ repo: 'example-org/example-repo', pr: '7', worktree: r.work, deadline: '1h' }, { ...cfg, agent: 'none', interval: 1 }, { metrics: idle().metrics, now });
+  assert.equal(res.verdict, 'conflict', JSON.stringify(res));
+  assert.equal(res.head, head);
+  assert.match(res.reason, /conflicts with main: app\.txt/);
+  assert.match(res.prompt, /app\.txt/);
+  assert.equal(r.run(r.work, 'rev-parse', 'HEAD'), head, 'the aborted sync left the checkout as it was');
+  assert.ok(calls().filter((c) => c.startsWith('api graphql')).length >= 2, 'it polled again before deciding');
+  assert.ok(calls().every((c) => c.startsWith('api graphql')), 'no merge or review request');
 });
 
 // A PR with one unresolved finding and a fake `claude` whose JSON wrapper reports error_max_turns and no result line.

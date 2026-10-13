@@ -1906,6 +1906,9 @@ export function findWorktree(branch, cwd) {
   return null;
 }
 
+// How long `run` polls GitHub's UNKNOWN mergeability on a clean head before syncing locally to decide.
+export const MERGEABILITY_WAIT = 120_000;
+
 const TERMINAL = new Set(['merged', 'closed', 'merge_pending', 'clean', 'blocked', 'needs_human', 'needs_agent', 'deadline']);
 
 // Polls every PR round-robin in one process and spawns at most `--max-agents` agents or local reviews at a time.
@@ -1920,7 +1923,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
   const log = join(stateDir(), `run-${new Date().toISOString().replace(/[:.]/g, '-')}.jsonl`);
   reconcileStates(repo, prs); // this run's own PRs are read live below
   // Rounds and seen findings persist across runs on purpose; `prloop reset-rounds` resets the rounds once.
-  const states = prs.map((n) => ({ ...loadState(repo, n), repo, pr: n, log, phase: 'polling', reason: undefined, next: undefined, agentLog: undefined, mergeRetried: undefined }));
+  const states = prs.map((n) => ({ ...loadState(repo, n), repo, pr: n, log, phase: 'polling', reason: undefined, next: undefined, agentLog: undefined, mergeRetried: undefined, unknownSince: undefined }));
   const busy = new Map();
   const event = recordEvent;
   const block = (st, reason, next = 'a human decision is needed') => event(st, 'blocked', { reason, next });
@@ -1955,7 +1958,8 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     }
     const t = { ...v, repo, pr: st.pr, branch: s.branch, head: s.head, cwd, gate: cfg.gate, agentTimeout: cfg.agentTimeout, reviewBeforeGate: cfg.reviewBeforeGate, localReview: cfg.mode === 'local' || !!v.localReview, requestBody: s.rerequestBody };
     const prompt = buildPrompt(t);
-    if (cfg.agent === 'none') return event(st, 'needs_agent', { verdict: v.verdict, prompt, next: 'spawn an agent with this prompt, then rerun prloop run' });
+    if (cfg.agent === 'none') return event(st, 'needs_agent', { verdict: v.verdict, prompt, next: 'spawn an agent with this prompt, then rerun prloop run',
+      ...(v.conflicts?.length ? { reason: `conflicts with ${s.base}: ${v.conflicts.join(', ')}` } : {}) });
     event(st, 'agent', { verdict: v.verdict });
     // With a configured gate, progress is that gate's pass: a generic marker may come from another gate.
     const tested = (sha) => (cfg.gate ? gatePassed(cfg.gate, cwd) === sha : isTested(sha, cwd));
@@ -2048,6 +2052,16 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     // state before a merge; an unchanged patch carries the clean review, so this costs no new review.
     if (s.mergeState === 'BEHIND' || s.mergeState === 'DIRTY' || s.mergeable === 'CONFLICTING') {
       if (!cwd) return block(st, `PR is ${s.mergeState} and no worktree has ${s.branch}; pass --worktree`);
+      const v = syncPr(st, s, raw, cwd, slot);
+      if (v?.verdict !== 'up_to_date') return v;
+    }
+    // GitHub computes mergeability lazily and reports UNKNOWN right after the base or head moved. `clean` is terminal,
+    // so never report or merge it on an unknown state: poll for up to MERGEABILITY_WAIT, then let the local sync decide.
+    if (s.mergeable !== 'UNKNOWN' && s.mergeState !== 'UNKNOWN') st.unknownSince = undefined;
+    else if (s.verdict === 'clean') {
+      st.unknownSince ??= now();
+      if (now() - st.unknownSince < MERGEABILITY_WAIT) return;
+      if (!cwd) return block(st, `GitHub mergeability stayed UNKNOWN and no worktree has ${s.branch}; pass --worktree`);
       const v = syncPr(st, s, raw, cwd, slot);
       if (v?.verdict !== 'up_to_date') return v;
     }
