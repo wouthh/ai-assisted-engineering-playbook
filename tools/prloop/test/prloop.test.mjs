@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -1282,36 +1282,44 @@ test('--gate-tmpdir gives each gate a private TMPDIR and removes it afterwards',
   assert.deepEqual(readdirSync(join(dir, 'tmp')), []);
 });
 
+const ns = (() => { try { return readlinkSync('/proc/self/ns/pid').replace(/\D/g, ''); } catch { return ''; } })();
+
 test('the tmp sweep removes scratch of dead owners and old unowned leftovers, never a live owner\'s', (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'prloop-sweep-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const mk = (name, old = false) => { mkdirSync(join(dir, name, 'sub'), { recursive: true }); if (old) utimesSync(join(dir, name), 0, 0); return name; };
-  const live = mk(`prloop-gate-${process.pid}.${procStart(process.pid) ?? ''}-Abc123`);
-  const dead = mk(`prloop-gate-${deadPid()}.-Def456`);
-  const reused = mk(`prloop-agent-${process.pid}.1-Ghi789`); // our PID, but another process's start time
+  const live = mk(`prloop-gate-${process.pid}.${procStart(process.pid) ?? ''}.${ns}-Abc123`);
+  const dead = mk(`prloop-gate-${deadPid()}..${ns}-Def456`);
+  const reused = mk(`prloop-agent-${process.pid}.1.${ns}-Ghi789`); // our PID, but another process's start time
+  // a dead-looking owner in another PID namespace (a sandboxed agent's gate) cannot be checked, so it stays
+  const foreign = mk(`prloop-gate-${deadPid()}..${ns}9-Stu901`);
   const legacyOld = mk('prloop-agent-out-Jkl012', true), legacyNew = mk('prloop-review-Mno345');
   const other = mk('prloop-gate-tmp', true); // not a prloop scratch name: a configured gate tmpdir is never swept
   writeFileSync(join(dir, 'prloop-gate-Pqr678'), ''); // not a directory
-  assert.deepEqual(sweepTmp(dir, { dryRun: true }), { dir, live: 2, stale: 3, removed: 0 });
-  assert.equal(readdirSync(dir).length, 7);
-  assert.deepEqual(sweepTmp(dir), { dir, live: 2, stale: 0, removed: 3 });
-  assert.deepEqual(readdirSync(dir).sort(), [live, legacyNew, other, 'prloop-gate-Pqr678'].sort());
+  assert.deepEqual(sweepTmp(dir, { dryRun: true }), { dir, live: 3, stale: 3, removed: 0 });
+  assert.equal(readdirSync(dir).length, 8);
+  assert.deepEqual(sweepTmp(dir), { dir, live: 3, stale: 0, removed: 3 });
+  assert.deepEqual(readdirSync(dir).sort(), [live, foreign, legacyNew, other, 'prloop-gate-Pqr678'].sort());
   assert.ok(![dead, reused, legacyOld].some((d) => existsSync(join(dir, d))));
-  assert.match(tmpLine({ gateTmpdir: dir }), new RegExp(`^prloop temp dirs in ${dir}: 2 in use, 0 left over by dead owners`));
+  assert.match(tmpLine({ gateTmpdir: dir }), new RegExp(`^prloop temp dirs in ${dir}: 3 in use, 0 left over by dead owners`));
 });
 
-test('a run\'s agent never reclaims temp dirs: its sandbox may not see the run\'s live owners', (t) => {
-  const dir = mkdtempSync(join(tmpdir(), 'prloop-reclaim-'));
-  const state = mkdtempSync(join(tmpdir(), 'prloop-reclaim-state-'));
-  const xdg = process.env.XDG_STATE_HOME;
-  process.env.XDG_STATE_HOME = state;
-  t.after(() => { if (xdg === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = xdg; rmSync(dir, { recursive: true, force: true }); rmSync(state, { recursive: true, force: true }); });
-  const name = `prloop-gate-${deadPid()}.-Abc123`;
-  mkdirSync(join(dir, name));
-  reclaimTmp({ gateTmpdir: dir }, { PRLOOP_QUEUE_FILE: join(state, 'queued-x') });
-  assert.ok(existsSync(join(dir, name)));
-  reclaimTmp({ gateTmpdir: dir }, {});
-  assert.equal(existsSync(join(dir, name)), false);
+test('a gate\'s whole process tree stops when prloop is killed with SIGKILL', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'prloop-sigkill-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const pidFile = join(dir, 'grandchild');
+  const script = `const { runGate, config } = await import(${JSON.stringify(new URL('../prloop.mjs', import.meta.url).href)});
+await runGate(${JSON.stringify(`sleep 30 & echo "$!" > "${pidFile}"; wait`)}, ${JSON.stringify(dir)},
+  { ...config({}, {}), gateCost: 0 }, { metrics: () => ({ load: 0, cores: 8, freeMem: 2 ** 34, totalMem: 2 ** 35 }) });`;
+  const p = spawn(process.execPath, ['--input-type=module', '-e', script], { stdio: 'ignore' });
+  const exited = new Promise((done) => p.on('exit', (code, sig) => done(sig)));
+  for (let i = 0; i < 100 && !existsSync(pidFile); i++) await new Promise((r) => setTimeout(r, 20));
+  const pid = Number(readFileSync(pidFile, 'utf8').trim());
+  p.kill('SIGKILL');
+  assert.equal(await exited, 'SIGKILL');
+  let gone = false;
+  for (let i = 0; i < 100 && !gone; i++) { await new Promise((r) => setTimeout(r, 20)); try { process.kill(pid, 0); } catch { gone = true; } }
+  assert.ok(gone, 'the watcher stops the orphaned gate group');
 });
 
 test('a second signal kills a gate group that ignores TERM at once', async (t) => {
@@ -2503,7 +2511,7 @@ test('ready holds the worktree lock while its gate runs, so run waits for it', (
   assert.equal(lockHolder(r.work, null), null); // released when ready ends
 });
 
-test('a gate that outlives a killed ready keeps the worktree lock, so run still waits for it', (t) => {
+test('a SIGKILLed ready\'s gate is stopped by the watcher, which frees the worktree lock the gate adopted', (t) => {
   tempState(t);
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
@@ -2511,13 +2519,17 @@ test('a gate that outlives a killed ready keeps the worktree lock, so run still 
   const pr = fixture();
   Object.assign(pr, { headRefName: 'feat', headRefOid: r.run(r.work, 'rev-parse', 'HEAD'), mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE' });
   fakeGh(t, r.dir, pr);
-  const held = join(r.dir, 'held.json');
-  // The gate SIGKILLs its ready (after ready has recorded the gate shell), then reads the lock while it still runs.
-  const gate = `sleep 1; kill -9 $PPID; "${process.execPath}" "${PRLOOP}" lock-status . > "${held}.tmp"; mv "${held}.tmp" "${held}"`;
+  // The gate SIGKILLs its ready (after ready has recorded the gate shell) and would sleep on; the watcher stops it.
+  const gate = 'sleep 1; kill -9 $PPID; sleep 30';
   spawnSync(process.execPath, [PRLOOP, 'ready', '7', '--repo', 'example-org/example-repo', '--gate', gate],
     { cwd: r.work, encoding: 'utf8', stdio: 'ignore', env: { ...process.env, PRLOOP_LOCK_TOKEN: '', PRLOOP_GATE_SLOTS: '64', PRLOOP_MAX_LOAD: '100000', PRLOOP_MIN_FREE_MEM: '1K' } });
-  for (let i = 0; i < 100 && !existsSync(held); i++) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
-  assert.deepEqual(pick(JSON.parse(readFileSync(held, 'utf8')), ['locked']), { locked: true });
+  let held;
+  for (let i = 0; i < 100; i++) {
+    held = JSON.parse(spawnSync(process.execPath, [PRLOOP, 'lock-status', '.'], { cwd: r.work, encoding: 'utf8', env: { ...process.env, PRLOOP_LOCK_TOKEN: '' } }).stdout);
+    if (!held.locked) break;
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+  }
+  assert.equal(held.locked, false);
 });
 
 test('ready rereads the PR after its gate: a head pushed meanwhile is not reported ready', (t) => {
