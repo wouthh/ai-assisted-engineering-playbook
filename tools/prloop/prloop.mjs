@@ -341,6 +341,8 @@ const namesHead = (named, head, cfg) => (named.length === 40 ? named === head : 
 //   measured from the request time so re-running `wait` does not restart the clock;
 // - outdated threads stay unresolved until someone resolves them: an outdated anchor is not a fix.
 export function classify(pr, cfg, nowMs = Date.now()) {
+  // A null thread could be an unresolved one, so a partial thread list fails closed instead of reading as no threads.
+  if (pr.reviewThreads.nodes.includes(null)) throw new Error('GitHub returned an unreadable review thread: prloop cannot see them all, so it fails closed');
   dropNullNodes(pr);
   const head = pr.headRefOid;
   // GitHub exposes no push time: take the latest of the commit date, the last force-push and when prloop
