@@ -2034,19 +2034,26 @@ export async function main(argv) {
     }
     if (cmd === 'ready') {
       pruneAgentLogs();
-      let s = classify(fetchPr(repo, prArg), cfg);
-      const gate = await readyGate(s, cfg, process.cwd(), { repo });
-      if (gate?.cached) console.error(`gate already passed for head ${gate.cached} (${gate.run.source ?? 'unknown'} pass)`);
-      const lastGate = lastGateSummary(gate?.run ?? loadState(repo, prArg).lastGate);
-      if (gate && !gate.ok) return out({ ready: false, pr: s.pr, head: s.head, gate: 'failed', exitCode: gate.status, tail: gate.tail, lastGate,
-        next: 'rerun the failing tests or step with its focused command, fix until it passes, then run `prloop ready` again' }, EXIT.blocked);
-      // Waiting for admission or a slot can outlast a push from elsewhere: judge the PR as it is now, not the gated snapshot.
-      if (gate && !gate.deferred) s = classify(fetchPr(repo, prArg), cfg);
-      // A deferred gate (pipelined review) runs after the request: an untested head does not block the request.
-      const missing = [...s.reasons, ...localGate(s, process.cwd(), cfg.gate)].filter((r) => !(gate?.deferred && r.includes('not marked tested')));
-      const pipelined = gate?.deferred ? { gate: 'deferred', next: 'post the review request; the full gate runs next, in parallel (`prloop run` runs it, or call `prloop ready` again after the request)' }
-        : gate && cfg.reviewBeforeGate ? { gate: 'passed' } : {};
-      return out({ ready: !missing.length, pr: s.pr, head: s.head, missing, trigger: cfg.trigger, ...pipelined, ...(lastGate ? { lastGate } : {}) }, missing.length ? EXIT.blocked : 0);
+      // Hold the worktree lock for the whole gate unless the caller's token owns it, so `run` waits instead of spawning
+      // a fix agent (and charging a round) for a head this ready is still gating.
+      const cwd = process.cwd(), token = process.env.PRLOOP_LOCK_TOKEN, dir = lockDir(cwd);
+      const lock = !dir || (token && lockClaims(dir).some((c) => c.token === token)) ? { release() {} } : takeLock(cwd, `ready of PR #${prArg}`);
+      if (lock.holder) return out({ verdict: 'error', error: lockMessage(cwd, lock.holder) }, EXIT.error);
+      try {
+        let s = classify(fetchPr(repo, prArg), cfg);
+        const gate = await readyGate(s, cfg, cwd, { repo });
+        if (gate?.cached) console.error(`gate already passed for head ${gate.cached} (${gate.run.source ?? 'unknown'} pass)`);
+        const lastGate = lastGateSummary(gate?.run ?? loadState(repo, prArg).lastGate);
+        if (gate && !gate.ok) return out({ ready: false, pr: s.pr, head: s.head, gate: 'failed', exitCode: gate.status, tail: gate.tail, lastGate,
+          next: 'rerun the failing tests or step with its focused command, fix until it passes, then run `prloop ready` again' }, EXIT.blocked);
+        // Waiting for admission or a slot can outlast a push from elsewhere: judge the PR as it is now, not the gated snapshot.
+        if (gate && !gate.deferred) s = classify(fetchPr(repo, prArg), cfg);
+        // A deferred gate (pipelined review) runs after the request: an untested head does not block the request.
+        const missing = [...s.reasons, ...localGate(s, process.cwd(), cfg.gate)].filter((r) => !(gate?.deferred && r.includes('not marked tested')));
+        const pipelined = gate?.deferred ? { gate: 'deferred', next: 'post the review request; the full gate runs next, in parallel (`prloop run` runs it, or call `prloop ready` again after the request)' }
+          : gate && cfg.reviewBeforeGate ? { gate: 'passed' } : {};
+        return out({ ready: !missing.length, pr: s.pr, head: s.head, missing, trigger: cfg.trigger, ...pipelined, ...(lastGate ? { lastGate } : {}) }, missing.length ? EXIT.blocked : 0);
+      } finally { lock.release(); }
     }
     if (cmd === 'wait') {
       pruneAgentLogs();
