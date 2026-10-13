@@ -65,4 +65,8 @@ Without merge authority, leave the clean PR for human review. When merging is au
 
 When the task has an active written plan or tracker, keep it current as work progresses: mark finished steps done and add new work and follow-ups. With an explicit issue-write grant (publication authority for a PR does not include it), keep the relevant issues on each affected repository in sync with it: every open follow-up has an issue and a plan row, every deferred finding becomes an issue, work in progress is linked both ways (`Fixes #<n>` in the PR body, the PR link commented on the issue), and after a merge confirm the issue closed and mark the plan row done. Without that grant, record the needed issue changes in the plan or handoff and route them for a decision instead of writing them.
 
+## Task-end cleanup
+
+When the task ends or fails, remove everything temporary it created before handing back: scratch directories, worktrees of merged or closed PRs, test containers and their volumes, and background processes it started. Remove only what the task owns; prefer a temporary directory that the system clears on reboot for work that does not need to survive one, and mind its size when that directory is memory-backed.
+
 Stop when the remaining blocker requires product intent, new authority, unavailable infrastructure, or an external decision. Report the exact boundary so the next run can continue without repeating completed work.
