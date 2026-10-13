@@ -2262,6 +2262,8 @@ test('permission denials come from structured output; text only without a wrappe
   assert.equal(permissionDenied({ final: 'the "permission denied" error is fixed', stderr: '' }, ok), false); // codex with a result line
   assert.equal(permissionDenied({ final: 'stopped', stderr: 'sandbox: permission denied' }, null), true); // codex without one
   assert.equal(permissionDenied({ final: '{"error":"permission denied"}', stderr: '' }, null), true); // JSON that is not a CLI wrapper
+  const quoted = { ...JSON.parse(readFileSync(new URL('./claude-wrapper.json', import.meta.url), 'utf8')), result: 'fixed the permission denied error' };
+  assert.equal(permissionDenied({ final: JSON.stringify(quoted), stderr: '' }, null), false); // a result wrapper without the array
 });
 
 test('run blocks with the session error and keeps the agent log when an agent ends without a result line', async (t) => {
