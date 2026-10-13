@@ -1638,12 +1638,12 @@ export function parseAgentResult(text) {
 // Why a session ended without a result line: what the CLI JSON wrapper reports (error subtype, API error status,
 // permission denials, terminal reason), else the tail of the final message.
 const tail = (t) => String(t ?? '').trim().slice(-300);
-// A permission denial is decided on structured output only: the claude CLI wrapper's `permission_denials`, else the
+// A permission denial is decided on structured output only: the claude CLI wrapper's `permission_denials` array, else the
 // result line (its `blocked` status names a refused step). Prose that merely quotes "permission denied" never blocks.
 // Text is searched only when there is neither, such as a codex session that ended without a result line.
 export function permissionDenied(r, result) {
-  const w = cliWrapper(r.final);
-  if (w) return !!w.permission_denials?.length;
+  const denials = cliWrapper(r.final)?.permission_denials; // other JSON objects are not a wrapper
+  if (Array.isArray(denials)) return denials.length > 0;
   return !result && DENIED.test(`${r.final}\n${r.stderr}`);
 }
 

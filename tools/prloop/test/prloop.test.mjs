@@ -2261,6 +2261,7 @@ test('permission denials come from structured output; text only without a wrappe
   assert.equal(permissionDenied({ final: JSON.stringify({ result: 'done', permission_denials: [{ tool_name: 'Write' }] }), stderr: '' }, ok), true);
   assert.equal(permissionDenied({ final: 'the "permission denied" error is fixed', stderr: '' }, ok), false); // codex with a result line
   assert.equal(permissionDenied({ final: 'stopped', stderr: 'sandbox: permission denied' }, null), true); // codex without one
+  assert.equal(permissionDenied({ final: '{"error":"permission denied"}', stderr: '' }, null), true); // JSON that is not a CLI wrapper
 });
 
 test('run blocks with the session error and keeps the agent log when an agent ends without a result line', async (t) => {
