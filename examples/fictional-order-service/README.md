@@ -78,7 +78,7 @@ The resource defaults apply without extra flags: the gate takes one of two machi
 
 ## 6. Delivery and rollback
 
-This example has no deployment. In a real repository, leave the PR for human review unless merging is authorized. Then merge through GitHub only after the exact validated head has a clean review and all other gates pass; re-query before merging and verify the live target afterward. The task has no written plan or tracker and no issue-write grant, so it changes no issues; a deferred finding would go into the handoff for a decision.
+This example has no deployment. In a real repository, leave the PR for human review unless merging is authorized. Then merge through GitHub only after the exact validated head has a clean review and all other gates pass; re-query before merging and verify the live target afterward. The task has no written plan or tracker and no issue-write grant, so it changes no issues; a deferred finding would go into the handoff for a decision. Before handing back, the task removes its own scratch directory and the worktree of its merged or closed PR; it started no test containers or background processes.
 
 Rollback would use a normal revert pull request. If real orders had already been routed for review, operational reconciliation would be required before reverting behavior; the Git revert alone would not undo those decisions.
 
