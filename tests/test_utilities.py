@@ -1866,6 +1866,22 @@ class GuidanceConsistencyTests(unittest.TestCase):
                 self.assertNotIn("runs the gate directly, once per tree", text)
                 self.assertIn("runs the gate directly, once per exact clean head (again after fixes or any new commit, even one that leaves the tree unchanged)", text)
 
+    def test_prloop_ready_gate_is_keyed_to_exact_head(self) -> None:
+        # The gate cache is keyed by HEAD, so no guidance may say `prloop ready` gates once per tree.
+        for path in ("templates/AGENTS.template.md", "tools/prloop/README.md", "tools/prloop/prloop.mjs", "docs/review-wait-loop.md"):
+            with self.subTest(path=path):
+                text = (ROOT / path).read_text(encoding="utf-8")
+                self.assertNotRegex(text, r"once per (clean )?tree|full gate per tree")
+        template = (ROOT / "templates/AGENTS.template.md").read_text(encoding="utf-8")
+        self.assertIn("`prloop ready <pr>` runs the gate once per exact clean head", template)
+
+    def test_deferred_gate_request_checks_automatic_review_first(self) -> None:
+        # A deferred gate must not lead to a duplicate request while an automatic review cycle runs.
+        text = (ROOT / "templates/AGENTS.template.md").read_text(encoding="utf-8")
+        delivery = text.split("## Delivery", 1)[1].split("\n## ", 1)[0]
+        self.assertNotIn("post the review request, then", delivery)
+        self.assertRegex(delivery, r"\"gate\": \"deferred\"`[^.]*request review as in step 4 \(only when no automatic cycle is already running\)")
+
     def test_gate_tmpdir_scope_matches_across_guidance(self) -> None:
         for path in ("docs/review-wait-loop.md", "templates/AGENTS.template.md", "tools/prloop/README.md"):
             with self.subTest(path=path):
