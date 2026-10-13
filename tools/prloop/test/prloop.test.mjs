@@ -6,7 +6,7 @@ import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import {
-  EXIT, OUTPUT_TAIL, main, reviewerEvents, recordReviewerEvents, reviewerDecision, approvedFor, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, sweepTmp, tmpLine, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, recordEvent, saveState, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, gateProvenance, treeRss, recordGatePass, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, reconcileStates, syncBranch, unionLines, unionResult, waitFor,
+  EXIT, OUTPUT_TAIL, main, reviewerEvents, recordReviewerEvents, reviewerDecision, approvedFor, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, sweepTmp, tmpLine, reclaimTmp, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, recordEvent, saveState, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, gateProvenance, treeRss, recordGatePass, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, reconcileStates, syncBranch, unionLines, unionResult, waitFor,
 } from '../prloop.mjs';
 
 const pick = (o, keys) => Object.fromEntries(keys.map((k) => [k, o[k]]));
@@ -1298,6 +1298,42 @@ test('the tmp sweep removes scratch of dead owners and old unowned leftovers, ne
   assert.deepEqual(readdirSync(dir).sort(), [live, legacyNew, other, 'prloop-gate-Pqr678'].sort());
   assert.ok(![dead, reused, legacyOld].some((d) => existsSync(join(dir, d))));
   assert.match(tmpLine({ gateTmpdir: dir }), new RegExp(`^prloop temp dirs in ${dir}: 2 in use, 0 left over by dead owners`));
+});
+
+test('a run\'s agent never reclaims temp dirs: its sandbox may not see the run\'s live owners', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'prloop-reclaim-'));
+  const state = mkdtempSync(join(tmpdir(), 'prloop-reclaim-state-'));
+  const xdg = process.env.XDG_STATE_HOME;
+  process.env.XDG_STATE_HOME = state;
+  t.after(() => { if (xdg === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = xdg; rmSync(dir, { recursive: true, force: true }); rmSync(state, { recursive: true, force: true }); });
+  const name = `prloop-gate-${deadPid()}.-Abc123`;
+  mkdirSync(join(dir, name));
+  reclaimTmp({ gateTmpdir: dir }, { PRLOOP_QUEUE_FILE: join(state, 'queued-x') });
+  assert.ok(existsSync(join(dir, name)));
+  reclaimTmp({ gateTmpdir: dir }, {});
+  assert.equal(existsSync(join(dir, name)), false);
+});
+
+test('a second signal kills a gate group that ignores TERM at once', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'prloop-sig2-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const pidFile = join(dir, 'grandchild');
+  const script = `const { runGate, config } = await import(${JSON.stringify(new URL('../prloop.mjs', import.meta.url).href)});
+await runGate(${JSON.stringify(`trap '' TERM; sleep 30 & echo "$! $TMPDIR" > "${pidFile}"; wait`)}, ${JSON.stringify(dir)},
+  { ...config({}, {}), gateCost: 0, gateTmpdir: ${JSON.stringify(join(dir, 'tmp'))} }, { metrics: () => ({ load: 0, cores: 8, freeMem: 2 ** 34, totalMem: 2 ** 35 }) });`;
+  const p = spawn(process.execPath, ['--input-type=module', '-e', script], { stdio: 'ignore' });
+  const exited = new Promise((done) => p.on('exit', (code) => done(code)));
+  for (let i = 0; i < 100 && !existsSync(pidFile); i++) await new Promise((r) => setTimeout(r, 20));
+  const [pid, gateTmp] = readFileSync(pidFile, 'utf8').trim().split(' ');
+  const started = Date.now();
+  p.kill('SIGTERM');
+  await new Promise((r) => setTimeout(r, 200));
+  p.kill('SIGINT');
+  assert.equal(await exited, 130);
+  assert.ok(Date.now() - started < 3e3); // well inside the 5s grace
+  await new Promise((r) => setTimeout(r, 100));
+  assert.throws(() => process.kill(Number(pid), 0), { code: 'ESRCH' }); // the TERM-ignoring grandchild is gone
+  assert.equal(existsSync(gateTmp), false);
 });
 
 test('a gate\'s whole process tree stops when prloop gets SIGTERM, and its TMPDIR is removed', async (t) => {
