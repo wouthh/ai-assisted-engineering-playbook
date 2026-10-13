@@ -4,7 +4,7 @@
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { appendFileSync, chmodSync, closeSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
-import { availableParallelism, freemem, homedir, loadavg, tmpdir, totalmem } from 'node:os';
+import { availableParallelism, constants as osConstants, freemem, homedir, loadavg, tmpdir, totalmem } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -628,7 +628,7 @@ export async function runGate(gate, cwd, cfg, deps = {}) {
   let tmp, out, sampler;
   try {
     const env = { ...process.env };
-    if (cfg.gateTmpdir) { mkdirSync(cfg.gateTmpdir, { recursive: true }); env.TMPDIR = tmp = mkdtempSync(join(cfg.gateTmpdir, 'prloop-gate-')); }
+    if (cfg.gateTmpdir) env.TMPDIR = tmp = scratch(cfg, 'prloop-gate-');
     if (deps.logFile) out = openSync(deps.logFile, 'w', 0o600);
     let gatePid, peakLoad = 0, peakRss = null;
     const sample = () => {
@@ -650,7 +650,7 @@ export async function runGate(gate, cwd, cfg, deps = {}) {
   } finally {
     clearInterval(sampler);
     if (out !== undefined) closeSync(out);
-    if (tmp) rmSync(tmp, { recursive: true, force: true });
+    if (tmp) dropScratch(tmp);
     release();
   }
 }
@@ -1311,7 +1311,7 @@ async function runReviewer(cfg, prompt, cwd, keep) {
     if (r.status !== 0) throw new Error(`claude reviewer exited with ${r.status}: ${(r.stderr ?? '').slice(-300)}`);
     const out = JSON.parse(r.stdout);
     return parseReview(out.structured_output ?? out.result);
-  } finally { rmSync(dir, { recursive: true, force: true }); }
+  } finally { dropScratch(dir); }
 }
 
 // `base` is the merge base of the fetched base branch and HEAD: GitHub's baseRefOid can lag behind a base that sync
@@ -1654,11 +1654,13 @@ export function pruneAgentLogs(now = Date.now()) {
 // child cannot exhaust the heap; callers use only the tail (failure reports, the agent's final JSON line).
 export const OUTPUT_TAIL = 4 << 20;
 const keepTail = (s) => (s.length > 2 * OUTPUT_TAIL ? s.slice(-OUTPUT_TAIL) : s);
-// With `timeout` the child leads its own process group, and the whole group is killed once it has used up that
-// budget. Time during which `paused()` is true (the agent's gate is queued) does not count.
+// Every child (gate shell, agent) leads its own process group, so a timeout, or prloop itself getting SIGINT or SIGTERM,
+// stops the whole tree (test workers, services) with killGroup, not just the shell. With `timeout` the group is
+// stopped once it has used up that budget. Time during which `paused()` is true (the agent's gate is queued) does not count.
 // `out` (a file descriptor) also receives every byte of stdout and stderr, untrimmed.
 const spawnAsync = (cmd, args, cwd, { env = process.env, lock, onSpawn = lock?.adopt, timeout, paused = () => false, out } = {}) => new Promise((done) => {
-  const c = spawn(cmd, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], detached: !!timeout, env: lock?.token ? { ...env, PRLOOP_LOCK_TOKEN: lock.token } : env });
+  const c = spawn(cmd, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], detached: true, env: lock?.token ? { ...env, PRLOOP_LOCK_TOKEN: lock.token } : env });
+  if (c.pid) { groups.add(c.pid); trapSignals(); }
   if (c.pid && onSpawn) onSpawn(c.pid);
   let timedOut = false, timer, left = timeout, last = Date.now();
   // ponytail: sampled at least every second, so a queue that starts or ends between samples is off by up to a second.
@@ -1668,16 +1670,46 @@ const spawnAsync = (cmd, args, cwd, { env = process.env, lock, onSpawn = lock?.a
     last = t;
     if (left > 0) { timer = setTimeout(tick, Math.min(left, 1000)); return; }
     timedOut = true;
-    try { process.kill(-c.pid, 'SIGKILL'); } catch { c.kill('SIGKILL'); }
+    killGroup(c.pid);
   };
   if (timeout && c.pid) timer = setTimeout(tick, Math.min(timeout, 1000));
   let stdout = '', stderr = '';
   c.stdout.on('data', (d) => { if (out !== undefined) writeSync(out, d); stdout = keepTail(stdout + d); });
   c.stderr.on('data', (d) => { if (out !== undefined) writeSync(out, d); stderr = keepTail(stderr + d); });
   const tail = (s) => s.slice(-OUTPUT_TAIL);
-  c.on('error', (e) => { clearTimeout(timer); done({ status: 1, stdout: tail(stdout), stderr: `${tail(stderr)}${e.message}` }); });
-  c.on('close', (code) => { clearTimeout(timer); done({ status: code ?? 1, stdout: tail(stdout), stderr: tail(stderr), ...(timedOut ? { timedOut } : {}) }); });
+  c.on('error', (e) => { clearTimeout(timer); groups.delete(c.pid); done({ status: 1, stdout: tail(stdout), stderr: `${tail(stderr)}${e.message}` }); });
+  c.on('close', (code) => { clearTimeout(timer); groups.delete(c.pid); done({ status: code ?? 1, stdout: tail(stdout), stderr: tail(stderr), ...(timedOut ? { timedOut } : {}) }); });
 });
+
+// Process groups of running children; scratch dirs this process owns.
+const groups = new Set(), owned = new Set();
+export const KILL_GRACE = 5e3;
+// TERM to the whole group, KILL after `grace` if any member is still there. Resolves once the group is gone or killed.
+export function killGroup(pid, grace = KILL_GRACE) {
+  const sig = (s) => { try { process.kill(-pid, s); return true; } catch { return false; } };
+  if (!sig('SIGTERM')) return Promise.resolve();
+  const until = Date.now() + grace;
+  return new Promise((done) => {
+    const t = setInterval(() => {
+      if (sig(0) && Date.now() < until) return;
+      sig('SIGKILL');
+      clearInterval(t);
+      done();
+    }, 50);
+  });
+}
+// On SIGINT or SIGTERM prloop stops every child group and removes its scratch before exiting with 128+signal.
+// A second signal during the grace period falls through to the default action.
+let trapped = false;
+function trapSignals() {
+  if (trapped) return;
+  trapped = true;
+  for (const name of ['SIGINT', 'SIGTERM']) process.once(name, async () => {
+    await Promise.all([...groups].map((p) => killGroup(p)));
+    for (const d of owned) rmSync(d, { recursive: true, force: true });
+    process.exit(128 + osConstants.signals[name]);
+  });
+}
 
 // The agent's own `prloop ready` gets this run's effective gate and limits, so it shares the same slot pool and weight.
 // Claude Code moves a Bash command to the background after its default timeout, and a -p session then ends
@@ -1689,11 +1721,53 @@ export const agentEnv = (cfg, env = process.env) => {
   const out = { ...env, ...Object.fromEntries(Object.entries(limits).filter(([, v]) => v !== undefined).map(([k, v]) => [k, String(v)])) };
   return cfg.agent === 'claude' ? { ...out, BASH_DEFAULT_TIMEOUT_MS: String(cfg.agentTimeout), BASH_MAX_TIMEOUT_MS: String(cfg.agentTimeout) } : out;
 };
-// Scratch for prloop and its agents: under --gate-tmpdir when set (a small /tmp fills up), else the system tmpdir.
+// Scratch for prloop, its gates and its agents: under --gate-tmpdir when set (a small /tmp fills up), else the system
+// tmpdir. The name records the owner (<prefix><pid>.<start>-XXXXXX), so sweepTmp can reclaim it after a killed prloop.
+const tmpRoot = (cfg) => cfg.gateTmpdir ?? tmpdir();
 const scratch = (cfg, prefix) => {
-  if (cfg.gateTmpdir) mkdirSync(cfg.gateTmpdir, { recursive: true });
-  return mkdtempSync(join(cfg.gateTmpdir ?? tmpdir(), prefix));
+  mkdirSync(tmpRoot(cfg), { recursive: true });
+  const d = mkdtempSync(join(tmpRoot(cfg), `${prefix}${process.pid}.${procStart(process.pid) ?? ''}-`));
+  owned.add(d);
+  return d;
 };
+const dropScratch = (d) => { rmSync(d, { recursive: true, force: true }); owned.delete(d); };
+const TMP_NAME = /^prloop-(?:gate|agent|agent-out|review)-(?:(\d+)\.(\d*)-)?[A-Za-z0-9]{6}$/;
+const LEGACY_TMP_AGE = 24 * 36e5;
+// Removes this user's prloop scratch dirs under `dir` whose owner process is gone; a live owner's dir is never touched.
+// With `dryRun` it only counts. Returns { dir, live, stale, removed }.
+export function sweepTmp(dir, { dryRun = false, now = Date.now() } = {}) {
+  const r = { dir, live: 0, stale: 0, removed: 0 };
+  let names;
+  try { names = readdirSync(dir); } catch { return r; }
+  for (const f of names) {
+    const m = TMP_NAME.exec(f);
+    let st;
+    try { st = m && lstatSync(join(dir, f)); } catch { continue; }
+    if (!st?.isDirectory() || (process.getuid && st.uid !== process.getuid())) continue;
+    // ponytail: a name without an owner predates owner pids; this age rule is a one-time cleanup of those leftovers,
+    // drop it once no installation has any left.
+    const stale = m[1] ? !alive(Number(m[1]), m[2] || null) : now - st.mtimeMs > LEGACY_TMP_AGE;
+    if (!stale) r.live++;
+    else if (dryRun) r.stale++;
+    else { rmSync(join(dir, f), { recursive: true, force: true }); r.removed++; }
+  }
+  return r;
+}
+const sweepFile = () => join(stateDir(), 'tmp-sweep.json');
+// Run by `run` and `ready` at start; remembers the last reclaim for `run --status`.
+function reclaimTmp(cfg) {
+  const r = sweepTmp(tmpRoot(cfg));
+  if (!r.removed) return;
+  logStderr({ event: 'reclaimed_tmp', dir: r.dir, removed: r.removed });
+  mkdirSync(stateDir(), { recursive: true });
+  writeFileSync(sweepFile(), JSON.stringify({ at: new Date().toISOString(), dir: r.dir, removed: r.removed }));
+}
+export function tmpLine(cfg) {
+  const r = sweepTmp(tmpRoot(cfg), { dryRun: true });
+  let last;
+  try { last = JSON.parse(readFileSync(sweepFile(), 'utf8')); } catch {}
+  return `prloop temp dirs in ${r.dir}: ${r.live} in use, ${r.stale} left over by dead owners (removed at the next run or ready)${last ? `; last reclaim removed ${last.removed} at ${last.at}` : ''}`;
+}
 // With --gate-tmpdir, each agent run gets its own TMPDIR there too (agents may run tests), removed when it ends.
 async function spawnAgent(cmd, args, cwd, cfg) {
   const env = { ...agentEnv(cfg) };
@@ -1701,7 +1775,7 @@ async function spawnAgent(cmd, args, cwd, cfg) {
   mkdirSync(join(stateDir(), 'agents'), { recursive: true, mode: 0o700 });
   const queue = env.PRLOOP_QUEUE_FILE = join(stateDir(), 'agents', `queued-${randomUUID()}`);
   try { return await spawnAsync(cmd, args, cwd, { lock: cfg.lock, timeout: cfg.agentTimeout, env, paused: () => queuedNow(queue) }); }
-  finally { if (tmp) rmSync(tmp, { recursive: true, force: true }); rmSync(queue, { force: true }); }
+  finally { if (tmp) dropScratch(tmp); rmSync(queue, { force: true }); }
 }
 
 // A timed-out agent that printed nothing was most likely stuck on one command; say so instead of an empty log.
@@ -1716,7 +1790,7 @@ async function runFixAgent(cfg, prompt, cwd) {
       const r = await spawnAgent('codex', ['exec', '--sandbox', 'workspace-write', '-c', 'sandbox_workspace_write.network_access=true', '-o', join(dir, 'last.txt'),
         ...(cfg.model ? ['-m', cfg.model] : []), ...(cfg.effort ? ['-c', `model_reasoning_effort=${cfg.effort}`] : []), prompt], cwd, cfg);
       return { ...r, final: existsSync(join(dir, 'last.txt')) ? readFileSync(join(dir, 'last.txt'), 'utf8') : r.stdout };
-    } finally { rmSync(dir, { recursive: true, force: true }); }
+    } finally { dropScratch(dir); }
   }
   const r = await spawnAgent('claude', ['-p', prompt, '--model', cfg.model ?? 'claude-opus-5-5', '--effort', cfg.effort ?? 'medium',
     '--permission-mode', 'auto', '--output-format', 'json'], cwd, cfg);
@@ -2118,11 +2192,12 @@ export async function main(argv) {
     Object.assign(opts, { generated: repoFile.generated ?? [], regenerate: repoFile.regenerate, approvedRegenerate: machine.approvedRegenerate });
     // The repository file names the method; merging itself still needs an explicit --merge.
     if (opts.merge === 'repo') opts.merge = repoFile.merge ?? (() => { throw new Error('--merge repo needs "merge" in .prloop.json'); })();
-    if (cmd === 'run' && opts.status) { reconcileStates(opts.repo); return out({ machine: machineLine(cfg), ...runStatus(opts.repo) }, 0); }
+    if (cmd === 'run' && opts.status) { reconcileStates(opts.repo); return out({ machine: machineLine(cfg), tmp: tmpLine(cfg), ...runStatus(opts.repo) }, 0); }
     if (cmd === 'run' || cmd === 'ready') {
       const c = selfCheck(SCRIPT_DIR);
       if (c?.warning && (opts.requireCurrent || process.env.PRLOOP_REQUIRE_CURRENT === '1')) return out({ verdict: 'error', error: c.warning }, EXIT.error);
       if (c) logStderr({ event: 'self_check', ...c });
+      reclaimTmp(cfg);
     }
     if (cmd === 'run') {
       if (!opts.repo || !opts.pr) throw new Error('run needs --repo owner/name and --pr N[,N...]');
