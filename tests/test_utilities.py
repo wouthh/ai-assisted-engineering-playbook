@@ -1849,6 +1849,13 @@ class GuidanceConsistencyTests(unittest.TestCase):
                 self.assertNotRegex(text, r"rerun the (relevant )?focused[/ ](and )?full gates")
                 self.assertRegex(text, r"rerun the (relevant )?focused tests[^.]*push, run the full gate on the pushed head")
 
+    def test_template_delivery_runs_existing_pr_full_gate_after_push(self) -> None:
+        # prloop ready rejects a local head that differs from the PR head, so existing-PR work pushes first.
+        text = (ROOT / "templates/AGENTS.template.md").read_text(encoding="utf-8")
+        delivery = text.split("## Delivery", 1)[1].split("\n## ", 1)[0]
+        self.assertRegex(delivery, r"after pushing to an existing PR \(through `prloop ready`")
+        self.assertIn("run focused checks, push, run the full gate on the pushed head", delivery)
+
     def test_gate_tmpdir_scope_matches_across_guidance(self) -> None:
         for path in ("docs/review-wait-loop.md", "templates/AGENTS.template.md", "tools/prloop/README.md"):
             with self.subTest(path=path):
