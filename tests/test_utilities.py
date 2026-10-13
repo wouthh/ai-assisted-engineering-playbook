@@ -1857,5 +1857,11 @@ class GuidanceConsistencyTests(unittest.TestCase):
                 self.assertIn("keeps any emulator integration tests for what it does model and covers the missing capability with local contract tests", text)
                 self.assertIn("Do not count emulator runs as permission coverage when the emulator does not enforce permissions", text)
 
+    def test_template_plan_issue_sync_requires_issue_write_authority(self) -> None:
+        text = (ROOT / "templates/AGENTS.template.md").read_text(encoding="utf-8")
+        step = next(line for line in text.splitlines() if line.startswith("9. "))
+        self.assertIn("With issue-write authority (step 3's publication authority or an explicit grant), keep the relevant issues", step)
+        self.assertIn("Without that authority, record the needed issue changes in the plan or handoff and route them for a decision instead of writing them.", step)
+
 if __name__ == "__main__":
     unittest.main()
