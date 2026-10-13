@@ -1862,6 +1862,9 @@ class GuidanceConsistencyTests(unittest.TestCase):
         # A deferred prloop ready result has not run the gate, so it cannot count as validation.
         self.assertRegex(step4, r"reports `\"gate\": \"deferred\"`[^.]*the gate has not run yet[^.]*before treating the head as validated")
         self.assertIn('handle a `"gate": "deferred"` result as in step 4', step6)
+        wait_loop = (ROOT / "docs/review-wait-loop.md").read_text(encoding="utf-8")
+        self.assertNotIn("gate through `prloop ready`, reply and resolve", wait_loop)
+        self.assertIn("each agent does one step (fix, reply and resolve, gate through `prloop ready`, request)", wait_loop)
         walkthrough = (ROOT / "examples/fictional-order-service/README.md").read_text(encoding="utf-8")
         self.assertIn("push, reply on and resolve the addressed threads, run the full gate on the pushed head (with `prloop ready 12`", walkthrough)
 
