@@ -1870,5 +1870,18 @@ class GuidanceConsistencyTests(unittest.TestCase):
         walkthrough = (ROOT / "examples/fictional-order-service/README.md").read_text(encoding="utf-8")
         self.assertIn("no issue-write grant", walkthrough)
 
+    def test_task_end_cleanup_is_mirrored_in_loop_and_walkthrough(self) -> None:
+        text = (ROOT / "templates/AGENTS.template.md").read_text(encoding="utf-8")
+        step = next(line for line in text.splitlines() if line.startswith("10. "))
+        rule = "When the task ends or fails, remove everything temporary it created before handing back"
+        self.assertIn(rule, step)
+        self.assertIn("Remove only what the task owns", step)
+        loop = (ROOT / "docs/implementation-loop.md").read_text(encoding="utf-8")
+        self.assertIn("## Task-end cleanup", loop)
+        self.assertIn(rule, loop)
+        self.assertIn("Remove only what the task owns", loop)
+        walkthrough = (ROOT / "examples/fictional-order-service/README.md").read_text(encoding="utf-8")
+        self.assertIn("removes its own scratch directory and the worktree of its merged or closed PR", walkthrough)
+
 if __name__ == "__main__":
     unittest.main()
