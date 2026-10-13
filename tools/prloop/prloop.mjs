@@ -1638,6 +1638,15 @@ export function parseAgentResult(text) {
 // Why a session ended without a result line: what the CLI JSON wrapper reports (error subtype, API error status,
 // permission denials, terminal reason), else the tail of the final message.
 const tail = (t) => String(t ?? '').trim().slice(-300);
+// A permission denial is decided on structured output only: the claude CLI wrapper's `permission_denials`, else the
+// result line (its `blocked` status names a refused step). Prose that merely quotes "permission denied" never blocks.
+// Text is searched only when there is neither, such as a codex session that ended without a result line.
+export function permissionDenied(r, result) {
+  const w = cliWrapper(r.final);
+  if (w) return !!w.permission_denials?.length;
+  return !result && DENIED.test(`${r.final}\n${r.stderr}`);
+}
+
 export function agentFailure(text) {
   const w = cliWrapper(text);
   if (!w) return `the agent output had no parseable result line; it ended: ${tail(text) || '(empty)'}`;
@@ -1928,7 +1937,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     const fail = (reason) => event(st, 'blocked', { reason, next: `a human decision is needed; the agent output is in ${agentLog}`, agentLog });
     if (r.timedOut) return fail(timeoutReason(r, cfg));
     const result = parseAgentResult(r.final);
-    if (DENIED.test(`${r.final}\n${r.stderr}`)) return fail('the agent reported a permission denial');
+    if (permissionDenied(r, result)) return fail('the agent reported a permission denial');
     if (r.status !== 0) return fail(`the agent exited with status ${r.status}: ${cliWrapper(r.final) ? agentFailure(r.final) : tail(r.stderr)}`);
     const progressed = () => {
       const after = classify(fetchPr(repo, st.pr), { ...cfg, cwd });
