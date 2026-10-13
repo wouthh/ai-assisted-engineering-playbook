@@ -1847,7 +1847,7 @@ class GuidanceConsistencyTests(unittest.TestCase):
             with self.subTest(path=path):
                 text = (ROOT / path).read_text(encoding="utf-8")
                 self.assertNotRegex(text, r"rerun the (relevant )?focused[/ ](and )?full gates")
-                self.assertRegex(text, r"rerun the (relevant )?focused tests[^.]*push, run the full gate on the pushed head")
+                self.assertRegex(text, r"rerun the (relevant )?focused tests[^.]*push,[^.]*run the full gate on the pushed head")
 
     def test_validation_step_gates_existing_pr_after_push(self) -> None:
         # Before a PR exists the gate runs directly; once one exists it runs through prloop ready on the pushed head.
@@ -1855,7 +1855,10 @@ class GuidanceConsistencyTests(unittest.TestCase):
         self.assertRegex(step4, r"before a PR exists, run it directly once[^.]*once a PR exists, push first and gate the pushed head \(through `prloop ready`")
         delivery = (ROOT / "AGENTS.md").read_text(encoding="utf-8").split("## Default delivery", 1)[1]
         self.assertNotIn("validate/push", delivery)
-        self.assertIn("push, gate the pushed head through `prloop ready`", delivery)
+        # prloop ready blocks on unresolved threads, so addressed threads are resolved before it runs.
+        self.assertIn("push, reply and resolve addressed threads, gate the pushed head through `prloop ready`", delivery)
+        step6 = (ROOT / "docs/implementation-loop.md").read_text(encoding="utf-8").split("## 6.", 1)[1].split("\n## ", 1)[0]
+        self.assertRegex(step6, r"resolve the addressed thread, and run the full gate on the pushed head \(through `prloop ready`")
 
     def test_template_delivery_runs_existing_pr_full_gate_after_push(self) -> None:
         # prloop ready rejects a local head that differs from the PR head, so existing-PR work pushes first.
