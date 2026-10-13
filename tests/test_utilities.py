@@ -1855,6 +1855,16 @@ class GuidanceConsistencyTests(unittest.TestCase):
         delivery = text.split("## Delivery", 1)[1].split("\n## ", 1)[0]
         self.assertRegex(delivery, r"after pushing to an existing PR \(through `prloop ready`")
         self.assertIn("run focused checks, push, run the full gate on the pushed head", delivery)
+        # A deferred gate (heavy gate or reviewBeforeGate) has not run, so it cannot count as validation yet.
+        self.assertRegex(delivery, r"reports `\"gate\": \"deferred\"`[^.]*the gate has not run yet[^.]*before recording the gate as passed")
+
+    def test_direct_gate_is_keyed_to_exact_head(self) -> None:
+        # A metadata-only amend or rebase changes the head without changing the tree; that head still needs its own run.
+        for path in ("templates/AGENTS.template.md", "tools/prloop/README.md"):
+            with self.subTest(path=path):
+                text = (ROOT / path).read_text(encoding="utf-8")
+                self.assertNotIn("runs the gate directly, once per tree", text)
+                self.assertIn("runs the gate directly, once per exact clean head (again after fixes or any new commit, even one that leaves the tree unchanged)", text)
 
     def test_gate_tmpdir_scope_matches_across_guidance(self) -> None:
         for path in ("docs/review-wait-loop.md", "templates/AGENTS.template.md", "tools/prloop/README.md"):
