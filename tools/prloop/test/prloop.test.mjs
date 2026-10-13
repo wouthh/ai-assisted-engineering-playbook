@@ -6,7 +6,7 @@ import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import {
-  EXIT, OUTPUT_TAIL, main, approvedFor, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, recordEvent, saveState, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, gateProvenance, treeRss, recordGatePass, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, reconcileStates, syncBranch, unionLines, unionResult, waitFor,
+  EXIT, OUTPUT_TAIL, main, reviewerEvents, recordReviewerEvents, reviewerDecision, approvedFor, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, recordEvent, saveState, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, gateProvenance, treeRss, recordGatePass, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, reconcileStates, syncBranch, unionLines, unionResult, waitFor,
 } from '../prloop.mjs';
 
 const pick = (o, keys) => Object.fromEntries(keys.map((k) => [k, o[k]]));
@@ -3167,4 +3167,208 @@ test('run still gives an unavailable head one local review at the round cap', as
   assert.doesNotMatch(String(res.reason), /max rounds/);
   assert.equal(runs, 1);
   assert.equal(st.rounds, 6);
+});
+
+// ---------- reviewer quota memory (#44) ----------
+
+const ERROR = "Codex couldn't complete this request. Try again later.";
+const ms = (hhmm) => Date.parse(at(hhmm));
+const H = 36e5;
+const noRequest = (pr) => { pr.comments.nodes = pr.comments.nodes.filter((c) => c.id !== 'IC_req'); return pr; };
+const sharedFile = (state) => JSON.parse(readFileSync(join(state, 'reviewer-state.json'), 'utf8'));
+const decide = (pr, nowMs, c = cfg) => reviewerDecision(pr, classify(pr, c, nowMs), c, nowMs);
+
+// A PR in a real worktree served by a fake `gh`, whose `pr comment` (a retry) swaps in `afterComment` when given.
+async function runReviewerCase(t, { mutate, nowMs, extra = {}, afterComment, shared }) {
+  const state = tempState(t);
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  writeFileSync(join(state, 'heads.json'), JSON.stringify({ 'example-org/example-repo#7': { sha: head, at: at('09:00') } }));
+  if (shared) writeFileSync(join(state, 'reviewer-state.json'), JSON.stringify(shared));
+  const pr = fixture();
+  Object.assign(pr, { headRefName: 'feat', headRefOid: head, mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE' });
+  mutate(pr);
+  const calls = fakeGh(t, r.dir, pr);
+  if (afterComment) {
+    const next = afterComment(structuredClone(pr));
+    writeFileSync(join(r.dir, 'after.json'), JSON.stringify({ data: { viewer: { login: 'example-dev' }, repository: { mergeCommitAllowed: true, squashMergeAllowed: true, rebaseMergeAllowed: true, pullRequest: next } } }));
+    writeFileSync(join(r.dir, 'bin', 'gh'), `#!/bin/sh
+if [ "$1" = api ]; then echo "api $2"; else echo "$*"; fi >> "${r.dir}/calls.log"
+case "$1 $2" in
+  "pr comment") cp "${r.dir}/after.json" "${r.dir}/pr.json" ;;
+  *) cat "${r.dir}/pr.json" ;;
+esac
+`, { mode: 0o755 });
+  }
+  const [res] = await runAll({ repo: 'example-org/example-repo', pr: '7', worktree: r.work, deadline: '1h' },
+    { ...cfg, agent: 'none', interval: 1, deadline: 3000, ...extra }, { metrics: idle().metrics, now: () => nowMs });
+  const phases = runStatus('example-org/example-repo').prs[0].events.map((e) => e.phase);
+  return { res, phases, calls: calls(), state };
+}
+const posted = (calls) => calls.some((c) => c.startsWith('pr comment'));
+
+test('reviewer memory 1: eyes on the current head means wait, and no trigger is posted', async (t) => {
+  tempState(t);
+  const pr = fixture();
+  request(pr).reactions.nodes.push({ content: 'EYES', createdAt: at('10:05'), user: BOT });
+  pr.comments.nodes.push(botComment('IC_q', QUOTA, '09:30')); // even with a recent quota reply on record
+  assert.deepEqual(decide(pr, ms('10:06')), { action: 'wait' });
+  const { res, phases, calls } = await runReviewerCase(t, { nowMs: ms('10:06'), mutate: (p) => request(p).reactions.nodes.push({ content: 'EYES', createdAt: at('10:05'), user: BOT }) });
+  assert.equal(res.verdict, 'deadline', JSON.stringify(res));
+  assert.ok(phases.includes('waiting') && !phases.includes('local_review') && !phases.includes('needs_agent'), phases.join());
+  assert.ok(!posted(calls));
+});
+
+test('reviewer memory 2: a quota reply under 16 h old blocks the request, runs a local review and is recorded', async (t) => {
+  const state = tempState(t);
+  const pr = noRequest(fixture());
+  pr.comments.nodes.push(botComment('IC_q', QUOTA, '09:30')); // the newest bot message, before this head
+  const d = decide(pr, ms('10:10'));
+  assert.equal(d.action, 'local');
+  assert.equal(d.blockedAt, '2026-01-01T09:30:00.000Z');
+  assert.equal(sharedFile(state)['chatgpt-codex-connector'].blockedAt, '2026-01-01T09:30:00.000Z');
+  const { res, phases, calls } = await runReviewerCase(t, { nowMs: ms('10:10'), mutate: (p) => noRequest(p).comments.nodes.push(botComment('IC_q', QUOTA, '09:30')) });
+  assert.ok(phases.includes('reviewer_quota') && phases.includes('local_review'), phases.join());
+  assert.match(res.reason, /--agent none runs no local reviewer/); // the local path, not a fix agent posting a request
+  assert.ok(!posted(calls));
+});
+
+test('reviewer memory 3: the same quota reply over 16 h old no longer blocks: a normal request follows', async (t) => {
+  tempState(t);
+  const pr = noRequest(fixture());
+  pr.comments.nodes.push(botComment('IC_q', QUOTA, '09:30'));
+  assert.equal(decide(pr, ms('09:30') + 17 * H), null);
+  const { res } = await runReviewerCase(t, { nowMs: ms('09:30') + 17 * H, mutate: (p) => noRequest(p).comments.nodes.push(botComment('IC_q', QUOTA, '09:30')) });
+  assert.equal(res.verdict, 'not_requested', JSON.stringify(res)); // handed to a fix agent that posts the request
+  assert.match(res.prompt, /not_requested/);
+});
+
+test('reviewer memory 4: a newer successful review or thumbs-up, here or on another PR, clears the block', (t) => {
+  const state = tempState(t);
+  const pr = noRequest(fixture());
+  pr.comments.nodes.push(botComment('IC_q', QUOTA, '09:30'));
+  const reviewed = structuredClone(pr);
+  reviewed.reviews.nodes.push({ id: 'R_ok', body: 'Looks fine.', state: 'COMMENTED', submittedAt: at('09:45'), author: BOT, commit: { oid: 'f'.repeat(40) } });
+  assert.equal(decide(reviewed, ms('10:10')), null); // this PR
+  const thumbs = structuredClone(pr);
+  thumbs.comments.nodes.push({ ...botComment('IC_x', '@codex review', '09:40'), author: { login: 'example-dev' }, reactions: { nodes: [{ content: 'THUMBS_UP', createdAt: at('09:41'), user: BOT }] } });
+  assert.equal(decide(thumbs, ms('10:10')), null);
+  rmSync(join(state, 'reviewer-state.json'));
+  assert.equal(decide(pr, ms('10:10')).action, 'local');
+  // Another PR's loop saw a newer success: the shared state unblocks this one.
+  recordReviewerEvents([{ login: BOT.login, kind: 'ok', at: '2026-01-01T09:50:00.000Z' }], cfg);
+  assert.equal(decide(pr, ms('10:10')), null);
+});
+
+test('reviewer memory 5: the shared state alone blocks under 16 h and falls back to a local review', async (t) => {
+  tempState(t);
+  recordReviewerEvents([{ login: BOT.login, kind: 'quota', at: '2026-01-01T09:30:00.000Z' }], cfg);
+  const pr = noRequest(fixture()); // no quota reply on this PR; its only bot signal is an older 👍 at 09:01
+  assert.equal(decide(pr, ms('10:10')).action, 'local');
+  assert.equal(decide(pr, ms('09:30') + 16 * H), null);
+  const { phases, calls } = await runReviewerCase(t, { nowMs: ms('10:10'), mutate: noRequest,
+    shared: { [BOT.login]: { blockedAt: '2026-01-01T09:30:00.000Z' } } });
+  assert.ok(phases.includes('local_review'), phases.join());
+  assert.ok(!posted(calls));
+});
+
+test('reviewer memory 6: a shared block with a newer okAt is not blocked', (t) => {
+  tempState(t);
+  recordReviewerEvents([{ login: BOT.login, kind: 'quota', at: '2026-01-01T09:30:00.000Z' }, { login: BOT.login, kind: 'ok', at: '2026-01-01T09:40:00.000Z' }], cfg);
+  assert.equal(decide(noRequest(fixture()), ms('10:10')), null);
+});
+
+test('reviewer memory 7: a newer event replaces an older one in the shared state, never the reverse', (t) => {
+  const state = tempState(t);
+  const rec = (kind, at) => recordReviewerEvents([{ login: BOT.login, kind, at }], cfg);
+  rec('quota', '2026-01-01T10:00:00.000Z');
+  rec('quota', '2026-01-01T09:00:00.000Z');
+  rec('ok', '2026-01-01T08:00:00.000Z');
+  assert.deepEqual(sharedFile(state)[BOT.login], { blockedAt: '2026-01-01T10:00:00.000Z', okAt: '2026-01-01T08:00:00.000Z' });
+  const merged = rec('quota', '2026-01-01T11:00:00.000Z');
+  assert.deepEqual(merged, { blockedAt: '2026-01-01T11:00:00.000Z', okAt: '2026-01-01T08:00:00.000Z' });
+  // Logins the reviewer regex does not match are kept but never read for this reviewer.
+  recordReviewerEvents([{ login: 'other-bot', kind: 'quota', at: '2026-01-01T12:00:00.000Z' }], cfg);
+  assert.equal(rec('ok', '2026-01-01T07:00:00.000Z').blockedAt, '2026-01-01T11:00:00.000Z');
+});
+
+test('reviewer memory 8: concurrent writers keep the shared file valid JSON with every newest value', async (t) => {
+  const state = tempState(t);
+  const mod = JSON.stringify(new URL('../prloop.mjs', import.meta.url).href);
+  const writer = (i) => new Promise((done, fail) => {
+    const code = `import { recordReviewerEvents, config } from ${mod}; const c = config({}, {});
+      for (let k = 0; k < 25; k++) recordReviewerEvents([{ login: 'bot-${i}', kind: k % 2 ? 'ok' : 'quota', at: new Date(Date.UTC(2026, 0, 1, 0, k)).toISOString() }], c);`;
+    const p = spawn(process.execPath, ['--input-type=module', '-e', code], { env: process.env, stdio: ['ignore', 'ignore', 'pipe'] });
+    let err = '';
+    p.stderr.on('data', (b) => { err += b; });
+    p.on('exit', (c) => (c === 0 ? done() : fail(new Error(err))));
+  });
+  await Promise.all([0, 1, 2, 3].map(writer));
+  const all = sharedFile(state);
+  for (const i of [0, 1, 2, 3]) assert.deepEqual(all[`bot-${i}`], { blockedAt: '2026-01-01T00:24:00.000Z', okAt: '2026-01-01T00:23:00.000Z' });
+  assert.deepEqual(readdirSync(state).filter((f) => f.endsWith('.tmp')), []);
+});
+
+test('reviewer memory 9: events come from issue comments, reviews and thread comments; bad timestamps are ignored', () => {
+  const pr = noRequest(fixture());
+  pr.reactions = { nodes: [{ content: 'THUMBS_UP', createdAt: 'not-a-date', user: BOT }] };
+  pr.comments.nodes.push(botComment('IC_q', QUOTA, '09:30'), { ...botComment('IC_bad', QUOTA, '09:31'), createdAt: undefined },
+    botComment('IC_err', ERROR, '09:32'));
+  pr.reviews.nodes.push({ id: 'R1', body: QUOTA, state: 'COMMENTED', submittedAt: at('09:40'), author: BOT },
+    { id: 'R2', body: 'Dismissed', state: 'DISMISSED', submittedAt: at('09:41'), author: BOT },
+    { id: 'R3', body: 'No date', state: 'COMMENTED', submittedAt: null, author: BOT });
+  pr.reviewThreads.nodes.push(thread('T1', at('09:50')), thread('T2', 'yesterday'), thread('T3', at('09:55'), 'Human note', { login: 'example-dev' }));
+  assert.deepEqual(reviewerEvents(pr, cfg).map((e) => `${e.kind}@${e.at.slice(11, 16)}`).sort(),
+    ['ok@09:01', 'ok@09:50', 'quota@09:30', 'quota@09:40']);
+});
+
+test('reviewer memory 10: other reviewer errors back off 2, 5 and 10 minutes, at most 3 retries, then local or blocked', async (t) => {
+  tempState(t);
+  // k errors, each answering its own request after the head.
+  const errors = (k) => {
+    const pr = noRequest(fixture());
+    for (let i = 0; i < k; i++) {
+      const hm = (m) => `${10 + Math.floor(m / 60)}:${String(m % 60).padStart(2, '0')}`; // minutes after 10:00
+      pr.comments.nodes.push({ ...botComment(`IC_r${i}`, '@codex review', hm(10 + i * 20)), author: { login: 'example-dev' } }, botComment(`IC_e${i}`, ERROR, hm(11 + i * 20)));
+    }
+    return pr;
+  };
+  assert.deepEqual(decide(errors(1), ms('10:12')), { action: 'backoff', n: 1, wait: 60e3 });
+  assert.deepEqual(decide(errors(1), ms('10:13')), { action: 'retry', n: 1 });
+  assert.deepEqual(decide(errors(2), ms('10:35')), { action: 'backoff', n: 2, wait: 60e3 });
+  assert.deepEqual(decide(errors(2), ms('10:36')), { action: 'retry', n: 2 });
+  assert.deepEqual(decide(errors(3), ms('11:00')), { action: 'backoff', n: 3, wait: 60e3 });
+  assert.deepEqual(decide(errors(3), ms('11:01')), { action: 'retry', n: 3 });
+  assert.equal(decide(errors(4), ms('12:00')).action, 'local');
+  assert.equal(decide(errors(4), ms('12:00'), { ...cfg, mode: 'cloud' }).action, 'blocked');
+  assert.deepEqual(decide(errors(1), ms('10:12'), config({ reviewerBackoff: '30s' }, {})), { action: 'retry', n: 1 });
+  // run posts the retry itself, without a fix agent or a round, then sees the new request reviewed clean.
+  const { res, calls } = await runReviewerCase(t, { nowMs: ms('10:13'), mutate: (p) => { const e = errors(1); p.comments = e.comments; },
+    afterComment: (p) => { p.comments.nodes.push({ ...botComment('IC_r9', '@codex review', '10:13'), author: { login: 'example-dev' }, reactions: { nodes: [{ content: 'THUMBS_UP', createdAt: at('10:14'), user: BOT }] } }); return p; } });
+  assert.equal(calls.filter((c) => c.startsWith('pr comment')).length, 1);
+  assert.equal(res.verdict, 'clean', JSON.stringify(res));
+  assert.equal(res.rounds, 0);
+});
+
+test('reviewer memory 11: cloud mode with a quota block blocks without a local fallback', async (t) => {
+  tempState(t);
+  const shared = { [BOT.login]: { blockedAt: '2026-01-01T09:30:00.000Z' } };
+  writeFileSync(join(process.env.XDG_STATE_HOME, 'prloop', 'reviewer-state.json'), JSON.stringify(shared));
+  assert.equal(decide(noRequest(fixture()), ms('10:10'), { ...cfg, mode: 'cloud' }).action, 'blocked');
+  const { res, phases, calls } = await runReviewerCase(t, { nowMs: ms('10:10'), mutate: noRequest, shared, extra: { mode: 'cloud' } });
+  assert.equal(res.verdict, 'blocked');
+  assert.match(res.reason, /quota used up at 2026-01-01T09:30/);
+  assert.match(res.next, /rerun after 2026-01-02T01:30/);
+  assert.ok(!phases.includes('local_review') && !posted(calls), phases.join());
+});
+
+test('reviewer memory options: window and backoff come from flags, environment or the machine file', () => {
+  assert.equal(cfg.quotaWindow, 16 * H);
+  assert.deepEqual(cfg.reviewerBackoff, [2 * 6e4, 5 * 6e4, 10 * 6e4]);
+  assert.equal(config({}, {}, { machine: { quotaWindow: '8h' } }).quotaWindow, 8 * H);
+  assert.equal(config({}, { PRLOOP_QUOTA_WINDOW: '4h' }, { machine: { quotaWindow: '8h' } }).quotaWindow, 4 * H);
+  assert.deepEqual(config({ reviewerBackoff: '1m, 3m' }, {}).reviewerBackoff, [6e4, 18e4]);
+  assert.throws(() => config({ reviewerBackoff: '1m,0' }, {}), /reviewer-backoff/);
 });

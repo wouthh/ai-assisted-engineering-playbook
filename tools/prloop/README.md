@@ -19,7 +19,7 @@ The installed copy should be a checkout that tracks the published `main`; change
 
 ## Sharing one machine
 
-Several `prloop` processes, their agents and gates, and unrelated work often share one machine. Resource awareness is on by default. These limits are one machine-wide setting: set them once in `${XDG_STATE_HOME:-~/.local/state}/prloop/config.json`, which every `prloop` process of the user reads (keys `gateSlots`, `maxLoad`, `minFreeMem`, `resourceWait`, `gateTmpdir`, and `approvedRegenerate`, see [syncing](#syncing-with-the-base); for example `{"gateSlots": 4, "gateTmpdir": "/var/tmp"}`). The environment overrides the file and a flag overrides both. `run` passes its effective gate, gate weight, limits and `reviewBeforeGate` to every agent it spawns, so the agent's own `prloop ready` uses the same values.
+Several `prloop` processes, their agents and gates, and unrelated work often share one machine. Resource awareness is on by default. These limits are one machine-wide setting: set them once in `${XDG_STATE_HOME:-~/.local/state}/prloop/config.json`, which every `prloop` process of the user reads (keys `gateSlots`, `maxLoad`, `minFreeMem`, `resourceWait`, `gateTmpdir`, `quotaWindow` and `reviewerBackoff` (see [reviewer quota memory](#reviewer-quota-memory)), and `approvedRegenerate`, see [syncing](#syncing-with-the-base); for example `{"gateSlots": 4, "gateTmpdir": "/var/tmp"}`). The environment overrides the file and a flag overrides both. `run` passes its effective gate, gate weight, limits and `reviewBeforeGate` to every agent it spawns, so the agent's own `prloop ready` uses the same values.
 
 | Option | Environment | Default | |
 |---|---|---|---|
@@ -216,6 +216,23 @@ A successful sync changes the head, so it clears the tested marker of the old he
 The local review is a separate, read-only agent run (`--agent claude` by default with `--permission-mode dontAsk` and only read and `git diff/log/show` tools; `--agent codex` uses `codex exec --sandbox read-only`), never the run that wrote the fix. It needs the same gate as a request: no unresolved threads, a tested head, and `wait` running inside a clean, pushed checkout of the PR branch. It reviews `git diff <base commit>...HEAD` from the base commit GitHub reports, and returns structured findings (path, line, severity P0-P3, body), which prloop posts with `gh` under your account (only results posted by the authenticated `gh` user count, so a copied prefix from someone else is ignored) as a normal PR review with inline comments, each prefixed `[local review]`; findings outside the diff go in the review body. A clean result posts `[local review] No issues found on <sha>.` The next poll classifies these exactly like bot results.
 
 An unavailable reply never costs a round and never spawns a fix agent to re-request a review: the local review of that head runs first, also at the round cap, so a `max rounds` verdict only follows a real review of the final head.
+
+### Reviewer quota memory
+
+The cloud reviewer's quota belongs to the account, so once it replies that it is out of usage, every other PR would get the same reply (an automatic review on ready included). `run` remembers this across PRs and processes in `${XDG_STATE_HOME:-~/.local/state}/prloop/reviewer-state.json`: per reviewer login, `blockedAt` (the newest quota reply) and `okAt` (the newest successful review, review comment or 👍), both GitHub timestamps. Each poll scans the PR's issue comments and their reactions, PR-body reactions, reviews and review-thread comments by the bot, ignores entries without a valid timestamp, and records what it found; a newer time replaces an older one, never the reverse. The file is rewritten through a temporary file and a rename under a one-slot claim (`reviewer-state.json.lock.d`), so concurrent loops never lose an update or leave a partial file.
+
+Before anything that would request a review (`not_requested`, `timeout`, or a findings round whose agent would request one), in `cloud` and `auto` mode:
+
+1. If the bot is reviewing the current head (👀) or a request is pending, `run` waits and posts nothing.
+2. The newest of the quota reply and the success wins, from this PR's scan and the shared file alike. While the newest event is a quota reply younger than `--quota-window` (16h), the reviewer counts as blocked: `auto` reviews the head locally instead (a fix agent for findings then skips the request), and `cloud` stops the PR as `blocked`, naming when the window ends. A successful review or 👍 seen by any loop unblocks every loop. The window is only a staleness fallback: once the quota reply is older, requests resume normally.
+3. A bot reply that cannot review but names no usage, quota or limit (such as "couldn't complete this request") is a reviewer error, not a quota reply. `run` re-requests the review itself (reposting the previous request body, without a fix agent or a round) after each wait of `--reviewer-backoff` (2m, 5m, 10m): one retry per error, so at most three retries, then `auto` reviews locally and `cloud` blocks.
+
+| Option | Environment | Machine file | Default |
+|---|---|---|---|
+| `--quota-window <dur>` | `PRLOOP_QUOTA_WINDOW` | `quotaWindow` | `16h` |
+| `--reviewer-backoff <list>` | `PRLOOP_REVIEWER_BACKOFF` | `reviewerBackoff` | `2m,5m,10m` (its length is the retry count) |
+
+`wait` and `ready` do not consult this memory: `wait` handles any unavailable reply as described above.
 
 Failsafes: one local review per head, a fetched and verified base branch, at most `--max-local-reviews` (3, a nonnegative integer) per PR, and any reviewer failure, malformed output, change to the checkout or posting error ends in `blocked` with the reason instead of a retry.
 
