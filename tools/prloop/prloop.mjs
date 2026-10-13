@@ -1504,6 +1504,9 @@ export function recordEvent(st, phase, extra = {}) {
   });
 }
 
+// Logs an event that is not a phase change together with the state it changed, under one state lock.
+const logSaved = (st, e) => withStateLock(st.repo, st.pr, () => { logEvent(st, e); writeState(st); });
+
 // Appends one event to the PR's run log, or to a new log when no run has written this PR yet.
 function logEvent(st, e) {
   mkdirSync(stateDir(), { recursive: true });
@@ -2020,10 +2023,14 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     // While the reviewer is quota-blocked (auto), no fix agent posts a request: it reviews locally instead.
     const quotaLocal = cfg.mode === 'auto' && !!d?.blockedAt;
     // Logs, once per block this PR saw, the success that cleared it, so the run log shows why requests resumed.
-    if (d?.blockedAt) st.quotaSeen = d.blockedAt;
-    else if (st.quotaSeen && d?.available?.at >= st.quotaSeen) {
-      logEvent(st, { phase: 'reviewer_available', reason: `a completed review or 👍 at ${d.available.at}${d.available.source ? ` on ${d.available.source}` : ''} cleared the quota reply of ${st.quotaSeen}`, okAt: d.available.at, source: d.available.source });
+    // Each marker change is saved with its event, so a run stopped before its next phase change neither repeats nor loses it.
+    if (d?.blockedAt && st.quotaSeen !== d.blockedAt) {
+      st.quotaSeen = d.blockedAt;
+      saveState(st);
+    } else if (!d?.blockedAt && st.quotaSeen && d?.available?.at >= st.quotaSeen) {
+      const reason = `a completed review or 👍 at ${d.available.at}${d.available.source ? ` on ${d.available.source}` : ''} cleared the quota reply of ${st.quotaSeen}`;
       st.quotaSeen = undefined;
+      logSaved(st, { phase: 'reviewer_available', reason, okAt: d.available.at, source: d.available.source });
     }
     if (gateFailure && s.verdict !== 'findings') {
       if (!cwd) return block(st, `no worktree has ${s.branch} checked out; pass --worktree`);
@@ -2038,7 +2045,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     if (d?.action === 'blocked') return block(st, `cloud reviewer unavailable: ${d.reason}`, d.until ? `rerun after ${d.until}, or use --reviewer auto or local` : 'retry later or use --reviewer auto or local');
     if (d?.action === 'local' && d.blockedAt && st.quotaLogged !== d.blockedAt) {
       st.quotaLogged = d.blockedAt;
-      logEvent(st, { phase: 'reviewer_quota', reason: `${d.reason}; reviewing locally until ${d.until} or a newer successful review` });
+      logSaved(st, { phase: 'reviewer_quota', reason: `${d.reason}; reviewing locally until ${d.until} or a newer successful review` });
     }
     // Quota-blocked or out of retries: review locally, and no fix agent posts a request.
     const rcfg = d?.action === 'local' ? { ...cfg, mode: 'local' } : cfg;
