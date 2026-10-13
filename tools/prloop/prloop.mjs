@@ -303,6 +303,18 @@ export function headSeenAt(key, sha) {
 // ---------- pure classification (tested with fixtures) ----------
 
 const login = (n) => n?.author?.login ?? n?.user?.login ?? '';
+// GitHub returns null for a list node it could not resolve (a deleted comment, a partial response): drop those
+// nodes from every connection in place, so readers only see real nodes. Missing timestamps then compare false.
+const dropNullNodes = (o) => {
+  if (Array.isArray(o)) o.forEach(dropNullNodes);
+  else if (o && typeof o === 'object') {
+    for (const k of Object.keys(o)) {
+      if (k === 'nodes' && Array.isArray(o[k])) o[k] = o[k].filter(Boolean);
+      dropNullNodes(o[k]);
+    }
+  }
+  return o;
+};
 // First meaningful line of a comment, without badges, HTML and markdown emphasis.
 export const title = (s) => ((s ?? '').split('\n')
   .map((l) => l.replace(/!\[[^\]]*\]\([^)]*\)/g, '').replace(/<[^>]+>/g, '').replace(/[*_`#>]/g, '').replace(/\s+/g, ' ').trim())
@@ -329,6 +341,7 @@ const namesHead = (named, head, cfg) => (named.length === 40 ? named === head : 
 //   measured from the request time so re-running `wait` does not restart the clock;
 // - outdated threads stay unresolved until someone resolves them: an outdated anchor is not a fix.
 export function classify(pr, cfg, nowMs = Date.now()) {
+  dropNullNodes(pr);
   const head = pr.headRefOid;
   // GitHub exposes no push time: take the latest of the commit date, the last force-push and when prloop
   // first saw this head, so an older commit that becomes the head cannot inherit earlier signals.
@@ -1377,6 +1390,7 @@ const reviewerKey = (l) => l.replace(/\[bot\]$/i, '');
 // thread comments, an issue comment matching --clean-regex, or a 👍. Any other bot comment (such as the Codex review
 // summary, posted when a review starts) and 👀 are not. Events without a valid timestamp are dropped; errors are not events.
 export function reviewerEvents(pr, cfg) {
+  dropNullNodes(pr);
   const ev = [];
   const add = (n, at, kind) => { const t = iso(at), l = login(n); if (t && kind && cfg.reviewer.test(l)) ev.push({ login: reviewerKey(l), kind, at: t }); };
   const text = (n, at, ok = true) => n?.body && add(n, at, cfg.unavailable.test(n.body) ? (QUOTA.test(n.body) ? 'quota' : null) : ok ? 'ok' : null);
@@ -1423,6 +1437,9 @@ export function recordReviewerEvents(events, cfg, owner, source) {
       }, {});
   });
 }
+
+// The first stack frame of an unexpected error, so a blocked reason names where it crashed.
+export const errorFrame = (e) => { const f = e?.stack?.split('\n').find((l) => /^\s+at /.test(l))?.trim(); return f ? ` (${f})` : ''; };
 
 // What `run` does about the cloud reviewer on this poll, before the usual flow:
 //   wait     the bot is reviewing the head (👀) or a request is pending: post nothing;
@@ -2120,7 +2137,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     for (const st of states) {
       if (TERMINAL.has(st.phase) || busy.has(st.pr)) continue;
       if (Date.now() > deadline) { event(st, 'deadline', { reason: 'overall deadline reached', next: 'rerun prloop run or hand over' }); continue; }
-      const p = step(st).catch((e) => block(st, `prloop error: ${String(e.stderr || e.message).slice(0, 300)}`))
+      const p = step(st).catch((e) => block(st, `prloop error: ${String(e.stderr || e.message).slice(0, 300)}${errorFrame(e)}`))
         .finally(() => busy.delete(st.pr));
       busy.set(st.pr, p);
       if (!['agent', 'local_review', 'gate'].includes(st.phase)) await p; // only agents, local reviews and gates run in parallel

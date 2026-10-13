@@ -6,7 +6,7 @@ import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import {
-  EXIT, OUTPUT_TAIL, main, reviewerEvents, recordReviewerEvents, reviewerDecision, approvedFor, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, permissionDenied, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, sweepTmp, tmpLine, reclaimTmp, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, recordEvent, saveState, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, gateProvenance, treeRss, recordGatePass, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, reconcileStates, syncBranch, unionLines, unionResult, waitFor,
+  EXIT, OUTPUT_TAIL, main, errorFrame, reviewerEvents, recordReviewerEvents, reviewerDecision, approvedFor, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, permissionDenied, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, sweepTmp, tmpLine, reclaimTmp, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, recordEvent, saveState, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, gateProvenance, treeRss, recordGatePass, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, reconcileStates, syncBranch, unionLines, unionResult, waitFor,
 } from '../prloop.mjs';
 
 const pick = (o, keys) => Object.fromEntries(keys.map((k) => [k, o[k]]));
@@ -3671,4 +3671,34 @@ test('reviewer memory 17: a fix agent spawned while blocked (state under `[bot]`
   assert.match(res.prompt, /Do not post a review request/);
   assert.ok(!posted(calls));
   assert.deepEqual(Object.keys(sharedFile(state)[OWNER]), [BOT.login]);
+});
+
+// Null or partial GraphQL nodes (a deleted comment, a review without a submitted time, a thread without comments).
+const withNullNodes = (pr) => {
+  pr.comments.nodes.unshift(null, { id: 'IC_nodate', databaseId: 7, body: 'note', createdAt: null, author: { login: 'example-dev' }, reactions: { nodes: [null] } });
+  pr.reviews.nodes.push(null, { id: 'R_nodate', body: 'No date', state: 'COMMENTED', submittedAt: null, author: BOT, commit: { oid: pr.headRefOid } });
+  pr.reviewThreads.nodes.push(null, { id: 'T_empty', isResolved: false, path: 'src/retry.js', line: 1, comments: { nodes: [] } });
+  return pr;
+};
+
+test('null nodes and missing timestamps are skipped by classify', () => {
+  const s = classify(withNullNodes(fixture()), cfg, NOW);
+  assert.equal(s.verdict, 'pending');
+  assert.equal(s.trigger.databaseId, 101);
+  assert.deepEqual(s.unresolvedThreads.map((t) => t.id), ['T_empty']);
+});
+
+test('null nodes and missing timestamps are skipped by reviewerEvents', () => {
+  const pr = withNullNodes(noRequest(fixture()));
+  pr.reactions = { nodes: [null] };
+  pr.reviewThreads.nodes.push({ id: 'T_null', isResolved: false, comments: { nodes: [null] } });
+  assert.deepEqual(reviewerEvents(pr, cfg), reviewerEvents(noRequest(fixture()), cfg));
+});
+
+test('errorFrame names where an unexpected error was thrown', () => {
+  const crash = () => null.createdAt;
+  let err;
+  try { crash(); } catch (e) { err = e; }
+  assert.match(errorFrame(err), /^ \(at crash \(.*prloop\.test\.mjs:\d+:\d+\)\)$/);
+  assert.equal(errorFrame({ message: 'gh failed' }), '');
 });
