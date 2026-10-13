@@ -1947,6 +1947,9 @@ class GuidanceConsistencyTests(unittest.TestCase):
         ownership = "Only the agent that created a directory removes it"
         self.assertIn(ownership, step)
         self.assertIn(ownership, loop)
+        exact = "by its exact path, never by glob or name prefix"
+        self.assertIn(exact, step)
+        self.assertIn(exact, loop)
         # The general stop rule keeps its own heading instead of reading as part of cleanup.
         stopping = loop.split("## Stopping", 1)
         self.assertEqual(len(stopping), 2)

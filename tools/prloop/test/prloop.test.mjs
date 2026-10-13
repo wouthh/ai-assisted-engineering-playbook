@@ -1475,7 +1475,8 @@ test('the fix prompt carries only the trigger data and the contract', () => {
     'report "blocked" with the exact refused step or missing tool named', 'leave the work as it is',
     'plain separate `git add <paths>`, `git commit` and `git push` commands, never chained into one command and never `git add -A`',
     "Follow the repository's commit-message policy", 'never add co-author, generated-by or other attribution trailers', 'never run the full project gate yourself',
-    'in the foreground with a timeout of at least 90 minutes', 'Never background a command']) assert.ok(p.includes(part), part);
+    'in the foreground with a timeout of at least 90 minutes', 'Never background a command',
+    'Clean up only the exact paths you created yourself, never by glob or name prefix', "never another agent's or a parent's directories"]) assert.ok(p.includes(part), part);
   // An external write to the playbook needs the coordinator's authority: the agent only proposes the issue.
   assert.match(p, /never file an issue in another repository yourself: put the proposed prloop issue/);
   assert.doesNotMatch(p, /then file one there/);
