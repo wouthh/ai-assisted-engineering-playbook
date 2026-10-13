@@ -1471,7 +1471,9 @@ test('the fix prompt carries only the trigger data and the contract', () => {
   for (const part of ['PR #7 in example-org/example-repo', 'branch feat/x', 'head abc123', 'worktree /work/x', 'Trigger: findings',
     '- T1 src/a.js:3 P1 Off by one', 'runs the gate (npm test)', 'reusing exactly:\n@codex review', '"status":"requested|blocked|nothing_to_do"',
     'Never wait for or poll reviews', 'on its own last line, always, also when you stop early or are blocked',
-    'report "blocked" with the denied command or missing tool named', 'never run the full project gate yourself',
+    'report "blocked" with the exact refused step or missing tool named', 'leave the work as it is',
+    'plain separate `git add <paths>`, `git commit` and `git push` commands, never chained into one command and never `git add -A`',
+    "Follow the repository's commit-message policy", 'never add co-author, generated-by or other attribution trailers', 'never run the full project gate yourself',
     'in the foreground with a timeout of at least 90 minutes', 'Never background a command']) assert.ok(p.includes(part), part);
   // An external write to the playbook needs the coordinator's authority: the agent only proposes the issue.
   assert.match(p, /never file an issue in another repository yourself: put the proposed prloop issue/);
