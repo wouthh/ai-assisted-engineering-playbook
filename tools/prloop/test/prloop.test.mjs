@@ -3677,7 +3677,7 @@ test('reviewer memory 17: a fix agent spawned while blocked (state under `[bot]`
 const withNullNodes = (pr) => {
   pr.comments.nodes.unshift(null, { id: 'IC_nodate', databaseId: 7, body: 'note', createdAt: null, author: { login: 'example-dev' }, reactions: { nodes: [null] } });
   pr.reviews.nodes.push(null, { id: 'R_nodate', body: 'No date', state: 'COMMENTED', submittedAt: null, author: BOT, commit: { oid: pr.headRefOid } });
-  pr.reviewThreads.nodes.push(null, { id: 'T_empty', isResolved: false, path: 'src/retry.js', line: 1, comments: { nodes: [] } });
+  pr.reviewThreads.nodes.push({ id: 'T_empty', isResolved: false, path: 'src/retry.js', line: 1, comments: { nodes: [] } });
   return pr;
 };
 
@@ -3688,10 +3688,16 @@ test('null nodes and missing timestamps are skipped by classify', () => {
   assert.deepEqual(s.unresolvedThreads.map((t) => t.id), ['T_empty']);
 });
 
+test('a null review thread fails closed in classify', () => {
+  const pr = fixture();
+  pr.reviewThreads.nodes = [null];
+  assert.throws(() => classify(pr, cfg, NOW), /unreadable review thread/);
+});
+
 test('null nodes and missing timestamps are skipped by reviewerEvents', () => {
   const pr = withNullNodes(noRequest(fixture()));
   pr.reactions = { nodes: [null] };
-  pr.reviewThreads.nodes.push({ id: 'T_null', isResolved: false, comments: { nodes: [null] } });
+  pr.reviewThreads.nodes.push(null, { id: 'T_null', isResolved: false, comments: { nodes: [null] } });
   assert.deepEqual(reviewerEvents(pr, cfg), reviewerEvents(noRequest(fixture()), cfg));
 });
 
