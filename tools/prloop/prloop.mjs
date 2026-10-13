@@ -778,7 +778,9 @@ export async function readyGate(s, cfg, cwd, deps = {}) {
     const dir = join(stateDir(), 'gates');
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     const logFile = join(dir, `${(deps.repo ?? 'local').replace('/', '__')}__${s.pr ?? 'local'}__${s.head}__${new Date().toISOString().replace(/[:.]/g, '-')}.log`);
-    const r = await runGate(cfg.gate, cwd, cfg, { ...deps, logFile, adopt: release.adopt, admitted: () => markQueued(false) }); // the gate shell keeps the key lock if ready dies
+    // The gate shell keeps the key lock, and the caller's worktree lock (deps.adopt), if ready dies.
+    const adopt = (pid) => { release.adopt?.(pid); deps.adopt?.(pid); };
+    const r = await runGate(cfg.gate, cwd, cfg, { ...deps, logFile, adopt, admitted: () => markQueued(false) });
     const run = { head: s.head, source: 'prloop', status: r.status, ...pick(r, ['start', 'end', 'durationMs', 'peakLoad', 'peakRssMiB']), log: logFile };
     if (deps.repo && s.pr) recordGateRun(deps.repo, s.pr, run);
     if (r.status === 0) {
@@ -2041,7 +2043,7 @@ export async function main(argv) {
       if (lock.holder) return out({ verdict: 'error', error: lockMessage(cwd, lock.holder) }, EXIT.error);
       try {
         let s = classify(fetchPr(repo, prArg), cfg);
-        const gate = await readyGate(s, cfg, cwd, { repo });
+        const gate = await readyGate(s, cfg, cwd, { repo, adopt: lock.adopt });
         if (gate?.cached) console.error(`gate already passed for head ${gate.cached} (${gate.run.source ?? 'unknown'} pass)`);
         const lastGate = lastGateSummary(gate?.run ?? loadState(repo, prArg).lastGate);
         if (gate && !gate.ok) return out({ ready: false, pr: s.pr, head: s.head, gate: 'failed', exitCode: gate.status, tail: gate.tail, lastGate,

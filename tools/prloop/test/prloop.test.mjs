@@ -2428,6 +2428,23 @@ test('ready holds the worktree lock while its gate runs, so run waits for it', (
   assert.equal(lockHolder(r.work, null), null); // released when ready ends
 });
 
+test('a gate that outlives a killed ready keeps the worktree lock, so run still waits for it', (t) => {
+  tempState(t);
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  const pr = fixture();
+  Object.assign(pr, { headRefName: 'feat', headRefOid: r.run(r.work, 'rev-parse', 'HEAD'), mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE' });
+  fakeGh(t, r.dir, pr);
+  const held = join(r.dir, 'held.json');
+  // The gate SIGKILLs its ready (after ready has recorded the gate shell), then reads the lock while it still runs.
+  const gate = `sleep 1; kill -9 $PPID; "${process.execPath}" "${PRLOOP}" lock-status . > "${held}.tmp"; mv "${held}.tmp" "${held}"`;
+  spawnSync(process.execPath, [PRLOOP, 'ready', '7', '--repo', 'example-org/example-repo', '--gate', gate],
+    { cwd: r.work, encoding: 'utf8', stdio: 'ignore', env: { ...process.env, PRLOOP_LOCK_TOKEN: '', PRLOOP_GATE_SLOTS: '64', PRLOOP_MAX_LOAD: '100000', PRLOOP_MIN_FREE_MEM: '1K' } });
+  for (let i = 0; i < 100 && !existsSync(held); i++) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+  assert.deepEqual(pick(JSON.parse(readFileSync(held, 'utf8')), ['locked']), { locked: true });
+});
+
 test('ready rereads the PR after its gate: a head pushed meanwhile is not reported ready', (t) => {
   tempState(t);
   const r = gitRepo();
