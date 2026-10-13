@@ -3326,7 +3326,7 @@ const sharedFile = (state) => JSON.parse(readFileSync(join(state, 'reviewer-stat
 const decide = (pr, nowMs, c = cfg) => reviewerDecision(pr, classify(pr, c, nowMs), c, nowMs, OWNER);
 
 // A PR in a real worktree served by a fake `gh`, whose `pr comment` (a retry) swaps in `afterComment` when given.
-async function runReviewerCase(t, { mutate, nowMs, extra = {}, afterComment, shared, prState }) {
+async function runReviewerCase(t, { mutate, nowMs, extra = {}, afterComment, shared, prState, beforeRun }) {
   const state = tempState(t);
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
@@ -3339,6 +3339,7 @@ async function runReviewerCase(t, { mutate, nowMs, extra = {}, afterComment, sha
   Object.assign(pr, { headRefName: 'feat', headRefOid: head, mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE' });
   mutate(pr);
   const calls = fakeGh(t, r.dir, pr);
+  beforeRun?.(r.dir);
   if (afterComment) {
     const next = afterComment(structuredClone(pr));
     writeFileSync(join(r.dir, 'after.json'), JSON.stringify({ data: { viewer: { login: 'example-dev' }, repository: { mergeCommitAllowed: true, squashMergeAllowed: true, rebaseMergeAllowed: true, pullRequest: next } } }));
@@ -3354,7 +3355,7 @@ esac
     { ...cfg, agent: 'none', interval: 1, deadline: 3000, ...extra }, { metrics: idle().metrics, now: () => nowMs });
   const phases = runStatus('example-org/example-repo').prs[0].events.map((e) => e.phase);
   const events = runStatus('example-org/example-repo', 50).prs[0].events;
-  return { res, phases, calls: calls(), state, events };
+  return { res, phases, calls: calls(), state, events, dir: r.dir };
 }
 const posted = (calls) => calls.some((c) => c.startsWith('pr comment'));
 
@@ -3583,6 +3584,28 @@ test('reviewer memory 15: a quota reply under one spelling and a 👍 under the 
   assert.equal(ev.source, 'https://github.com/example-org/example-repo/pull/7');
   assert.equal(events.filter((e) => e.phase === 'reviewer_available').length, 1); // logged once, not every poll
   assert.ok(phases.includes('clean') && !posted(calls), phases.join());
+});
+
+test('reviewer memory 15b: availability seen while already waiting is saved with its event, before the next poll', async (t) => {
+  // The first read shows only 👀 on the request; later reads add a 👍. Each read snapshots the state file, as a run
+  // stopped before that poll would leave it.
+  const { events, dir } = await runReviewerCase(t, { nowMs: ms('10:07'), prState: { quotaSeen: '2026-01-01T09:30:00.000Z' },
+    shared: { [OWNER]: { [BOT.login]: { blockedAt: '2026-01-01T09:30:00.000Z' } } },
+    mutate: (p) => request(p).reactions.nodes.push({ content: 'EYES', createdAt: at('10:06'), user: BOT_REACT }),
+    beforeRun: (d) => {
+      const reply = JSON.parse(readFileSync(join(d, 'pr.json'), 'utf8'));
+      writeFileSync(join(d, 'first.json'), JSON.stringify(reply));
+      reply.data.repository.pullRequest.reactions.nodes.push({ content: 'THUMBS_UP', createdAt: at('09:45'), user: BOT_REACT });
+      writeFileSync(join(d, 'pr.json'), JSON.stringify(reply));
+      writeFileSync(join(d, 'bin', 'gh'), `#!/bin/sh
+echo "$1" >> "${d}/calls.log"; echo x >> "${d}/reads"; n=$(wc -l < "${d}/reads")
+cp "$XDG_STATE_HOME/prloop/example-org__example-repo__7.json" "${d}/snap-$n.json"
+if [ "$n" = 1 ]; then cat "${d}/first.json"; else cat "${d}/pr.json"; fi
+`, { mode: 0o755 });
+    } });
+  assert.deepEqual(events.map((e) => e.phase), ['waiting', 'reviewer_available', 'deadline']);
+  assert.equal(JSON.parse(readFileSync(join(dir, 'snap-2.json'), 'utf8')).quotaSeen, '2026-01-01T09:30:00.000Z');
+  assert.equal(JSON.parse(readFileSync(join(dir, 'snap-3.json'), 'utf8')).quotaSeen, undefined, 'the cleared marker was saved with its event');
 });
 
 test('reviewer memory 16: a review-summary placeholder or 👀 alone does not unblock', (t) => {
