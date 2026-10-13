@@ -67,6 +67,8 @@ When the task has an active written plan or tracker, keep it current as work pro
 
 ## Task-end cleanup
 
-When the task ends or fails, remove everything temporary it created before handing back: scratch directories, worktrees of merged or closed PRs, test containers and their volumes, and background processes it started. Remove only what the task owns; prefer a temporary directory that the system clears on reboot for work that does not need to survive one, and mind its size when that directory is memory-backed.
+When the task ends or fails, remove everything temporary it created before handing back: scratch directories, worktrees of merged or closed PRs, test containers and their volumes, and background processes it started. Remove only what the task owns. Keep anything that may be the only copy of diagnostic or rollback evidence or of unpushed work, such as unpushed commits in the worktree of a closed, unmerged PR: preserve it durably first, or leave it in place and name it in the handoff. Prefer a temporary directory that the system clears on reboot for work that does not need to survive one, and mind its size when that directory is memory-backed.
+
+## Stopping
 
 Stop when the remaining blocker requires product intent, new authority, unavailable infrastructure, or an external decision. Report the exact boundary so the next run can continue without repeating completed work.
