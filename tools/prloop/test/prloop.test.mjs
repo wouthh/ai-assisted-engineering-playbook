@@ -2313,7 +2313,9 @@ test('run kills an agent that outlives --agent-timeout and blocks with "agent ti
   t.after(() => rmSync(base, { recursive: true, force: true }));
   const { res, r } = await runNoResultAgent(t, false, { body: `sleep 30 & echo $! > "${base}/gc"; wait`, extra: { agentTimeout: 300 } });
   assert.equal(res.verdict, 'blocked', JSON.stringify(res));
-  assert.throws(() => process.kill(Number(readFileSync(join(base, 'gc'), 'utf8')), 0), { code: 'ESRCH' }); // its sleeping child is gone too
+  const gc = Number(readFileSync(join(base, 'gc'), 'utf8')), alive = () => { try { process.kill(gc, 0); return true; } catch { return false; } };
+  for (let i = 0; i < 50 && alive(); i++) await new Promise((ok) => setTimeout(ok, 100)); // a loaded machine can reap the killed child late
+  assert.throws(() => process.kill(gc, 0), { code: 'ESRCH' }); // its sleeping child is gone too
   assert.equal(res.reason, 'agent timed out after 1s of work with no output: it was killed before printing its result, so check its last command (time its gate spent queued is not counted)');
   assert.ok(Date.now() - started < 20e3);
   assert.equal(readFileSync(join(r.dir, 'bash-timeouts'), 'utf8'), '300 300\n');
