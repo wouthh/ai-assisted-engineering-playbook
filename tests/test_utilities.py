@@ -1841,6 +1841,14 @@ class GuidanceConsistencyTests(unittest.TestCase):
         self.assertRegex(fix_agent, r"Exception: a subagent whose tooling caps one command[^\n]*runs `prloop ready` as a background job and waits for it to exit")
         self.assertIn("the exception in the fix-agent step 5 below", text.split("### Fix agent", 1)[0])
 
+    def test_correction_cycle_runs_full_gate_after_push(self) -> None:
+        # prloop ready needs the pushed PR head, so correction cycles must not demand a full gate before the push.
+        for path in ("docs/implementation-loop.md", "examples/fictional-order-service/README.md"):
+            with self.subTest(path=path):
+                text = (ROOT / path).read_text(encoding="utf-8")
+                self.assertNotRegex(text, r"rerun the (relevant )?focused[/ ](and )?full gates")
+                self.assertRegex(text, r"rerun the (relevant )?focused tests[^.]*push, run the full gate on the pushed head")
+
     def test_gate_tmpdir_scope_matches_across_guidance(self) -> None:
         for path in ("docs/review-wait-loop.md", "templates/AGENTS.template.md", "tools/prloop/README.md"):
             with self.subTest(path=path):
