@@ -3,7 +3,7 @@
 // Single file, no dependencies. Needs Node 20+, git and an authenticated `gh`.
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { appendFileSync, chmodSync, closeSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
+import { appendFileSync, chmodSync, closeSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { availableParallelism, constants as osConstants, freemem, homedir, loadavg, tmpdir, totalmem } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -1654,13 +1654,14 @@ export function pruneAgentLogs(now = Date.now()) {
 // child cannot exhaust the heap; callers use only the tail (failure reports, the agent's final JSON line).
 export const OUTPUT_TAIL = 4 << 20;
 const keepTail = (s) => (s.length > 2 * OUTPUT_TAIL ? s.slice(-OUTPUT_TAIL) : s);
-// Every child (gate shell, agent) leads its own process group, so a timeout, or prloop itself getting SIGINT or SIGTERM,
+// Every child (gate shell, agent) leads its own process group, so a timeout, or prloop itself getting SIGINT, SIGTERM or SIGHUP,
 // stops the whole tree (test workers, services) with killGroup, not just the shell. With `timeout` the group is
 // stopped once it has used up that budget. Time during which `paused()` is true (the agent's gate is queued) does not count.
 // `out` (a file descriptor) also receives every byte of stdout and stderr, untrimmed.
 const spawnAsync = (cmd, args, cwd, { env = process.env, lock, onSpawn = lock?.adopt, timeout, paused = () => false, out } = {}) => new Promise((done) => {
+  trapSignals();
   const c = spawn(cmd, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], detached: true, env: lock?.token ? { ...env, PRLOOP_LOCK_TOKEN: lock.token } : env });
-  if (c.pid) { groups.add(c.pid); trapSignals(); }
+  if (c.pid) { groups.add(c.pid); watch(`+${c.pid}`); }
   if (c.pid && onSpawn) onSpawn(c.pid);
   let timedOut = false, timer, left = timeout, last = Date.now();
   // ponytail: sampled at least every second, so a queue that starts or ends between samples is off by up to a second.
@@ -1677,13 +1678,23 @@ const spawnAsync = (cmd, args, cwd, { env = process.env, lock, onSpawn = lock?.a
   c.stdout.on('data', (d) => { if (out !== undefined) writeSync(out, d); stdout = keepTail(stdout + d); });
   c.stderr.on('data', (d) => { if (out !== undefined) writeSync(out, d); stderr = keepTail(stderr + d); });
   const tail = (s) => s.slice(-OUTPUT_TAIL);
-  c.on('error', (e) => { clearTimeout(timer); groups.delete(c.pid); done({ status: 1, stdout: tail(stdout), stderr: `${tail(stderr)}${e.message}` }); });
-  c.on('close', (code) => { clearTimeout(timer); groups.delete(c.pid); done({ status: code ?? 1, stdout: tail(stdout), stderr: tail(stderr), ...(timedOut ? { timedOut } : {}) }); });
+  c.on('error', (e) => { clearTimeout(timer); unwatch(c.pid); done({ status: 1, stdout: tail(stdout), stderr: `${tail(stderr)}${e.message}` }); });
+  c.on('close', (code) => { clearTimeout(timer); unwatch(c.pid); done({ status: code ?? 1, stdout: tail(stdout), stderr: tail(stderr), ...(timedOut ? { timedOut } : {}) }); });
 });
 
 // Process groups of running children; scratch dirs this process owns.
 const groups = new Set(), owned = new Set();
 export const KILL_GRACE = 5e3;
+// Children lead their own groups, so signals aimed at prloop (SIGKILL, a group kill, an uncaught crash) no longer reach
+// them. A detached watcher, started before the first child, holds the other end of a pipe and learns each group from it;
+// when prloop dies however it dies, the pipe closes and the watcher TERMs, then KILLs, the groups still listed.
+const WATCH = `const g = new Set(); let b = '';
+process.stdin.on('data', (d) => { b += d; let i; while ((i = b.indexOf('\\n')) >= 0) { const l = b.slice(0, i); b = b.slice(i + 1); (l[0] === '+' ? g.add : g.delete).call(g, Number(l.slice(1))); } });
+const sig = (s) => { for (const p of g) try { process.kill(-p, s); } catch {} };
+process.stdin.on('end', () => { if (g.size) { sig('SIGTERM'); setTimeout(() => sig('SIGKILL'), ${KILL_GRACE}); } });`;
+let watcher;
+const watch = (line) => watcher.stdin.write(`${line}\n`);
+const unwatch = (pid) => { groups.delete(pid); watch(`-${pid}`); };
 // TERM to the whole group, KILL after `grace` if any member is still there. Resolves once the group is gone or killed.
 export function killGroup(pid, grace = KILL_GRACE) {
   const sig = (s) => { try { process.kill(-pid, s); return true; } catch { return false; } };
@@ -1698,18 +1709,23 @@ export function killGroup(pid, grace = KILL_GRACE) {
     }, 50);
   });
 }
-// On SIGINT or SIGTERM prloop stops every child group and removes its scratch before exiting with 128+signal.
+// On SIGINT, SIGTERM or SIGHUP prloop stops every child group and removes its scratch before exiting with 128+signal.
 // Children run detached, so a terminal Ctrl-C reaches only prloop: a second signal during the grace period
 // sends KILL to every group at once instead of leaving a group that ignores TERM running.
 let trapped = false, stopping = false;
 function trapSignals() {
   if (trapped) return;
   trapped = true;
+  watcher = spawn(process.execPath, ['-e', WATCH], { detached: true, stdio: ['pipe', 'ignore', 'ignore'] });
+  watcher.on('error', () => {});
+  watcher.stdin.on('error', () => {});
+  watcher.unref();
+  watcher.stdin.unref();
   const finish = (name) => {
     for (const d of owned) rmSync(d, { recursive: true, force: true });
     process.exit(128 + osConstants.signals[name]);
   };
-  for (const name of ['SIGINT', 'SIGTERM']) process.on(name, async () => {
+  for (const name of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(name, async () => {
     if (stopping) {
       for (const p of groups) try { process.kill(-p, 'SIGKILL'); } catch {}
       return finish(name);
@@ -1731,18 +1747,20 @@ export const agentEnv = (cfg, env = process.env) => {
   return cfg.agent === 'claude' ? { ...out, BASH_DEFAULT_TIMEOUT_MS: String(cfg.agentTimeout), BASH_MAX_TIMEOUT_MS: String(cfg.agentTimeout) } : out;
 };
 // Scratch for prloop, its gates and its agents: under --gate-tmpdir when set (a small /tmp fills up), else the system
-// tmpdir. The name records the owner (<prefix><pid>.<start>-XXXXXX), so sweepTmp can reclaim it after a killed prloop.
+// tmpdir. The name records the owner (<prefix><pid>.<start>.<pid namespace>-XXXXXX), so sweepTmp can reclaim it after a killed prloop.
+const pidNs = (() => { try { return readlinkSync('/proc/self/ns/pid').replace(/\D/g, ''); } catch { return ''; } })();
 const tmpRoot = (cfg) => cfg.gateTmpdir ?? tmpdir();
 const scratch = (cfg, prefix) => {
   mkdirSync(tmpRoot(cfg), { recursive: true });
-  const d = mkdtempSync(join(tmpRoot(cfg), `${prefix}${process.pid}.${procStart(process.pid) ?? ''}-`));
+  const d = mkdtempSync(join(tmpRoot(cfg), `${prefix}${process.pid}.${procStart(process.pid) ?? ''}.${pidNs}-`));
   owned.add(d);
   return d;
 };
 const dropScratch = (d) => { rmSync(d, { recursive: true, force: true }); owned.delete(d); };
-const TMP_NAME = /^prloop-(?:gate|agent|agent-out|review)-(?:(\d+)\.(\d*)-)?[A-Za-z0-9]{6}$/;
+const TMP_NAME = /^prloop-(?:gate|agent|agent-out|review)-(?:(\d+)\.(\d*)\.(\d*)-)?[A-Za-z0-9]{6}$/;
 const LEGACY_TMP_AGE = 24 * 36e5;
 // Removes this user's prloop scratch dirs under `dir` whose owner process is gone; a live owner's dir is never touched.
+// An owner in another PID namespace (a sandboxed agent, or this prloop inside one) cannot be checked, so counts as live.
 // With `dryRun` it only counts. Returns { dir, live, stale, removed }.
 export function sweepTmp(dir, { dryRun = false, now = Date.now() } = {}) {
   const r = { dir, live: 0, stale: 0, removed: 0 };
@@ -1755,7 +1773,7 @@ export function sweepTmp(dir, { dryRun = false, now = Date.now() } = {}) {
     if (!st?.isDirectory() || (process.getuid && st.uid !== process.getuid())) continue;
     // ponytail: a name without an owner predates owner pids; this age rule is a one-time cleanup of those leftovers,
     // drop it once no installation has any left.
-    const stale = m[1] ? !alive(Number(m[1]), m[2] || null) : now - st.mtimeMs > LEGACY_TMP_AGE;
+    const stale = m[1] ? m[3] === pidNs && !alive(Number(m[1]), m[2] || null) : now - st.mtimeMs > LEGACY_TMP_AGE;
     if (!stale) r.live++;
     else if (dryRun) r.stale++;
     else { rmSync(join(dir, f), { recursive: true, force: true }); r.removed++; }
@@ -1763,11 +1781,8 @@ export function sweepTmp(dir, { dryRun = false, now = Date.now() } = {}) {
   return r;
 }
 const sweepFile = () => join(stateDir(), 'tmp-sweep.json');
-// Run by `run` and `ready` at start; remembers the last reclaim for `run --status`. Not inside a run's agent
-// (PRLOOP_QUEUE_FILE set): a sandbox with its own PID namespace cannot see the run's live owners and would take
-// their dirs for dead, and the run sweeps on its own start anyway.
-export function reclaimTmp(cfg, env = process.env) {
-  if (env.PRLOOP_QUEUE_FILE) return;
+// Run by `run` and `ready` at start; remembers the last reclaim for `run --status`.
+export function reclaimTmp(cfg) {
   const r = sweepTmp(tmpRoot(cfg));
   if (!r.removed) return;
   logStderr({ event: 'reclaimed_tmp', dir: r.dir, removed: r.removed });
