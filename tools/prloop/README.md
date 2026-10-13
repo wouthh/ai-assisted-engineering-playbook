@@ -176,7 +176,7 @@ The manual alternative, for an agent that drives one PR itself. Every command pr
 | `timeout` | 30 | No reaction within `--ack-timeout` (3m) of the request, or no result within `--timeout` (40m). Both are measured from the request time, so running `wait` again does not restart the clock. Includes `rerequestBody`, a copy of your last trigger comment, to repost unchanged. A timed-out request no longer blocks `prloop ready`. |
 | `unavailable` | 31 | Only with `--reviewer cloud`: the bot replied that it cannot review (usage limit, failure), or two requests on this head timed out. |
 | `blocked` | 50 | A local review could not run or post, `--agent none` selects no reviewer, or its per-head or per-PR limit is used up. |
-| `error` | 40 | GitHub could not be read three times in a row, bad input, or history prloop cannot fully see (more than 100 review threads, or more than 100 comments since the head) so it fails closed. |
+| `error` | 40 | GitHub could not be read three times in a row, bad input, or history prloop cannot fully see (more than 100 review threads, a review thread GitHub returned as null, or more than 100 comments since the head) so it fails closed. |
 
 ```bash
 git push
