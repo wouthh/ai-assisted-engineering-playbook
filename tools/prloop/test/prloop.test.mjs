@@ -2386,6 +2386,48 @@ test('run skips a locked worktree before judging its checkout: the holder\'s unc
   assert.equal(res.verdict, 'deadline', JSON.stringify(res));
 });
 
+test('run waits for a live lock holder without spawning an agent or charging a round, and proceeds past a dead one', async (t) => {
+  const state = tempState(t);
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  const pr = fixture();
+  Object.assign(pr, { headRefName: 'feat', headRefOid: r.run(r.work, 'rev-parse', 'HEAD'), mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE' });
+  pr.reviewThreads.nodes.push(thread('T1', at('10:20')));
+  fakeGh(t, r.dir, pr);
+  writeFileSync(join(r.dir, 'bin', 'claude'), `#!/bin/sh\ntouch "${r.dir}/spawned"\necho '{"type":"result","subtype":"error_max_turns","is_error":true,"result":"Ran out of turns."}'\n`, { mode: 0o755 });
+  const rounds = () => JSON.parse(readFileSync(join(state, 'example-org__example-repo__7.json'), 'utf8')).rounds ?? 0;
+  const go = (deadline) => runAll({ repo: 'example-org/example-repo', pr: '7', worktree: r.work }, { ...cfg, interval: 1, deadline }, { metrics: idle().metrics });
+  const live = takeLock(r.work, 'ready of PR #7'); // a live `prloop ready` gating this head
+  const [held] = await go(200);
+  live.release();
+  assert.equal(held.verdict, 'deadline', JSON.stringify(held));
+  assert.equal(existsSync(join(r.dir, 'spawned')), false);
+  assert.equal(rounds(), 0);
+  assert.ok(runStatus('example-org/example-repo').prs[0].events.some((e) => e.phase === 'worktree_locked'));
+  takeLock(r.work, 'ready of PR #7', deadPid()); // its process died without releasing the claim
+  const [stale] = await go('1h');
+  assert.equal(stale.verdict, 'blocked', JSON.stringify(stale));
+  assert.equal(existsSync(join(r.dir, 'spawned')), true);
+  assert.equal(rounds(), 1);
+});
+
+test('ready holds the worktree lock while its gate runs, so run waits for it', (t) => {
+  tempState(t);
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  const pr = fixture();
+  Object.assign(pr, { headRefName: 'feat', headRefOid: r.run(r.work, 'rev-parse', 'HEAD'), mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE' });
+  fakeGh(t, r.dir, pr);
+  const held = join(r.dir, 'held.json');
+  const res = spawnSync(process.execPath, [PRLOOP, 'ready', '7', '--repo', 'example-org/example-repo', '--gate', `"${process.execPath}" "${PRLOOP}" lock-status . > "${held}"; true`],
+    { cwd: r.work, encoding: 'utf8', env: { ...process.env, PRLOOP_LOCK_TOKEN: '', PRLOOP_GATE_SLOTS: '64', PRLOOP_MAX_LOAD: '100000', PRLOOP_MIN_FREE_MEM: '1K' } });
+  assert.notEqual(res.status, 40, res.stdout);
+  assert.deepEqual(pick(JSON.parse(readFileSync(held, 'utf8')).holder, ['purpose']), { purpose: 'ready of PR #7' });
+  assert.equal(lockHolder(r.work, null), null); // released when ready ends
+});
+
 test('ready rereads the PR after its gate: a head pushed meanwhile is not reported ready', (t) => {
   tempState(t);
   const r = gitRepo();
