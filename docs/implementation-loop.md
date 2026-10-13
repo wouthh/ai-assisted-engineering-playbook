@@ -61,4 +61,8 @@ Poll at reasonable intervals, normally 30–90 seconds for a bounded time per re
 
 Without merge authority, leave the clean PR for human review. When merging is authorized, re-query head/base, review signals, threads, checks, and mergeability immediately beforehand. Use GitHub's supported merge operation with an exact expected-head guard and no administrator bypass. Respect the project's merge policy; use squash when no different policy was approved. Verify the live target branch and expected file/tree changes afterward. Remove only the merged feature branch when cleanup is authorized, and preserve evidence and unrelated refs.
 
+## Plans, trackers and issues
+
+When the task has an active written plan or tracker, keep it current as work progresses: mark finished steps done and add new work and follow-ups. With an explicit issue-write grant (publication authority for a PR does not include it), keep the relevant issues on each affected repository in sync with it: every open follow-up has an issue and a plan row, every deferred finding becomes an issue, work in progress is linked both ways (`Fixes #<n>` in the PR body, the PR link commented on the issue), and after a merge confirm the issue closed and mark the plan row done. Without that grant, record the needed issue changes in the plan or handoff and route them for a decision instead of writing them.
+
 Stop when the remaining blocker requires product intent, new authority, unavailable infrastructure, or an external decision. Report the exact boundary so the next run can continue without repeating completed work.
