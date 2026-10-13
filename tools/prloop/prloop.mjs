@@ -1626,7 +1626,7 @@ Use "blocked" with the reason when disputed findings remain unresolved.
 
 Run \`prloop ready\` and any long test command in the foreground with a timeout of at least ${minutes} minutes. Never background a command; if one is backgrounded anyway, wait for it to finish before ending your turn. Your final message must end with the JSON status line.
 If prloop itself misbehaves (wrong status, refused sync, missed review signal, misleading docs), never patch the installed prloop and never file an issue in another repository yourself: put the proposed prloop issue (observed and expected behaviour, a fixture-test idea, no project-specific details) in "reason", and the coordinator files it when authorized.
-Never wait for or poll reviews, merge, touch other PRs, rewrite history except through \`prloop sync\`, or retry in a loop. A denied action or a missing tool means stop immediately, leave the work as it is, and report "blocked" with the exact refused step or missing tool named in "reason", so the coordinator can finish it.`;
+Never wait for or poll reviews, merge, touch other PRs, rewrite history except through \`prloop sync\`, or retry in a loop. Clean up only the exact paths you created yourself, never by glob or name prefix, and never another agent's or a parent's directories. A denied action or a missing tool means stop immediately, leave the work as it is, and report "blocked" with the exact refused step or missing tool named in "reason", so the coordinator can finish it.`;
 }
 
 // Finds the agent's final JSON line, also inside a JSON wrapper such as `claude --output-format json`.
