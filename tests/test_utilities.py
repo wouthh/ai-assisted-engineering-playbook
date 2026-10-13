@@ -1944,6 +1944,9 @@ class GuidanceConsistencyTests(unittest.TestCase):
         evidence = "Keep anything that may be the only copy of diagnostic or rollback evidence or of unpushed work"
         self.assertIn(evidence, step)
         self.assertIn(evidence, loop)
+        ownership = "Only the agent that created a directory removes it"
+        self.assertIn(ownership, step)
+        self.assertIn(ownership, loop)
         # The general stop rule keeps its own heading instead of reading as part of cleanup.
         stopping = loop.split("## Stopping", 1)
         self.assertEqual(len(stopping), 2)
