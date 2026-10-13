@@ -6,7 +6,7 @@ import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import {
-  EXIT, OUTPUT_TAIL, main, reviewerEvents, recordReviewerEvents, reviewerDecision, approvedFor, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, recordEvent, saveState, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, gateProvenance, treeRss, recordGatePass, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, reconcileStates, syncBranch, unionLines, unionResult, waitFor,
+  EXIT, OUTPUT_TAIL, main, reviewerEvents, recordReviewerEvents, reviewerDecision, approvedFor, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, sweepTmp, tmpLine, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, recordEvent, saveState, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, gateProvenance, treeRss, recordGatePass, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, reconcileStates, syncBranch, unionLines, unionResult, waitFor,
 } from '../prloop.mjs';
 
 const pick = (o, keys) => Object.fromEntries(keys.map((k) => [k, o[k]]));
@@ -1282,6 +1282,42 @@ test('--gate-tmpdir gives each gate a private TMPDIR and removes it afterwards',
   assert.deepEqual(readdirSync(join(dir, 'tmp')), []);
 });
 
+test('the tmp sweep removes scratch of dead owners and old unowned leftovers, never a live owner\'s', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'prloop-sweep-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const mk = (name, old = false) => { mkdirSync(join(dir, name, 'sub'), { recursive: true }); if (old) utimesSync(join(dir, name), 0, 0); return name; };
+  const live = mk(`prloop-gate-${process.pid}.${procStart(process.pid) ?? ''}-Abc123`);
+  const dead = mk(`prloop-gate-${deadPid()}.-Def456`);
+  const reused = mk(`prloop-agent-${process.pid}.1-Ghi789`); // our PID, but another process's start time
+  const legacyOld = mk('prloop-agent-out-Jkl012', true), legacyNew = mk('prloop-review-Mno345');
+  const other = mk('prloop-gate-tmp', true); // not a prloop scratch name: a configured gate tmpdir is never swept
+  writeFileSync(join(dir, 'prloop-gate-Pqr678'), ''); // not a directory
+  assert.deepEqual(sweepTmp(dir, { dryRun: true }), { dir, live: 2, stale: 3, removed: 0 });
+  assert.equal(readdirSync(dir).length, 7);
+  assert.deepEqual(sweepTmp(dir), { dir, live: 2, stale: 0, removed: 3 });
+  assert.deepEqual(readdirSync(dir).sort(), [live, legacyNew, other, 'prloop-gate-Pqr678'].sort());
+  assert.ok(![dead, reused, legacyOld].some((d) => existsSync(join(dir, d))));
+  assert.match(tmpLine({ gateTmpdir: dir }), new RegExp(`^prloop temp dirs in ${dir}: 2 in use, 0 left over by dead owners`));
+});
+
+test('a gate\'s whole process tree stops when prloop gets SIGTERM, and its TMPDIR is removed', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'prloop-sigterm-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const pidFile = join(dir, 'grandchild');
+  const script = `const { runGate, config } = await import(${JSON.stringify(new URL('../prloop.mjs', import.meta.url).href)});
+await runGate(${JSON.stringify(`sleep 30 & echo "$! $TMPDIR" > "${pidFile}"; wait`)}, ${JSON.stringify(dir)},
+  { ...config({}, {}), gateCost: 0, gateTmpdir: ${JSON.stringify(join(dir, 'tmp'))} }, { metrics: () => ({ load: 0, cores: 8, freeMem: 2 ** 34, totalMem: 2 ** 35 }) });`;
+  const p = spawn(process.execPath, ['--input-type=module', '-e', script], { stdio: 'ignore' });
+  const exited = new Promise((done) => p.on('exit', (code) => done(code)));
+  for (let i = 0; i < 100 && !existsSync(pidFile); i++) await new Promise((r) => setTimeout(r, 20));
+  const [pid, gateTmp] = readFileSync(pidFile, 'utf8').trim().split(' ');
+  assert.ok(existsSync(gateTmp));
+  p.kill('SIGTERM');
+  assert.equal(await exited, 143);
+  assert.throws(() => process.kill(Number(pid), 0), { code: 'ESRCH' }); // the sleeping grandchild is gone
+  assert.equal(existsSync(gateTmp), false);
+});
+
 test('runGate keeps only a bounded tail of verbose gate output', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'prloop-gateout-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -2195,8 +2231,11 @@ test('with --gate-tmpdir an agent run gets a private TMPDIR there, removed when 
 
 test('run kills an agent that outlives --agent-timeout and blocks with "agent timed out"', async (t) => {
   const started = Date.now();
-  const { res, r } = await runNoResultAgent(t, false, { body: 'sleep 30 & wait', extra: { agentTimeout: 300 } });
+  const base = mkdtempSync(join(tmpdir(), 'prloop-agent-gc-'));
+  t.after(() => rmSync(base, { recursive: true, force: true }));
+  const { res, r } = await runNoResultAgent(t, false, { body: `sleep 30 & echo $! > "${base}/gc"; wait`, extra: { agentTimeout: 300 } });
   assert.equal(res.verdict, 'blocked', JSON.stringify(res));
+  assert.throws(() => process.kill(Number(readFileSync(join(base, 'gc'), 'utf8')), 0), { code: 'ESRCH' }); // its sleeping child is gone too
   assert.equal(res.reason, 'agent timed out after 1s of work with no output: it was killed before printing its result, so check its last command (time its gate spent queued is not counted)');
   assert.ok(Date.now() - started < 20e3);
   assert.equal(readFileSync(join(r.dir, 'bash-timeouts'), 'utf8'), '300 300\n');
