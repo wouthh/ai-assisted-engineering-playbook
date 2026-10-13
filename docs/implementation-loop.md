@@ -37,7 +37,7 @@ For side effects, prefer a pure decision followed by an explicit adapter. Valida
 
 ## 4. Validate incrementally
 
-Run syntax and focused tests during implementation. Once the change is coherent, run static analysis, affected integration tests, privacy/security checks, and the documented full gate. Do not use a broad build as the first signal when a focused check can explain the failure more clearly.
+Run syntax and focused tests during implementation. Once the change is coherent, run static analysis, affected integration tests, privacy/security checks, and the documented full gate: before a PR exists, run it directly once per exact clean head, within the machine's load and memory limits; once a PR exists, push first and gate the pushed head (through `prloop ready` when the repository uses [`prloop`](review-wait-loop.md)). Do not use a broad build as the first signal when a focused check can explain the failure more clearly.
 
 ## 5. Inspect the result
 
