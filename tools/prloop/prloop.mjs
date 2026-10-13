@@ -1699,15 +1699,24 @@ export function killGroup(pid, grace = KILL_GRACE) {
   });
 }
 // On SIGINT or SIGTERM prloop stops every child group and removes its scratch before exiting with 128+signal.
-// A second signal during the grace period falls through to the default action.
-let trapped = false;
+// Children run detached, so a terminal Ctrl-C reaches only prloop: a second signal during the grace period
+// sends KILL to every group at once instead of leaving a group that ignores TERM running.
+let trapped = false, stopping = false;
 function trapSignals() {
   if (trapped) return;
   trapped = true;
-  for (const name of ['SIGINT', 'SIGTERM']) process.once(name, async () => {
-    await Promise.all([...groups].map((p) => killGroup(p)));
+  const finish = (name) => {
     for (const d of owned) rmSync(d, { recursive: true, force: true });
     process.exit(128 + osConstants.signals[name]);
+  };
+  for (const name of ['SIGINT', 'SIGTERM']) process.on(name, async () => {
+    if (stopping) {
+      for (const p of groups) try { process.kill(-p, 'SIGKILL'); } catch {}
+      return finish(name);
+    }
+    stopping = true;
+    await Promise.all([...groups].map((p) => killGroup(p)));
+    finish(name);
   });
 }
 
@@ -1754,8 +1763,11 @@ export function sweepTmp(dir, { dryRun = false, now = Date.now() } = {}) {
   return r;
 }
 const sweepFile = () => join(stateDir(), 'tmp-sweep.json');
-// Run by `run` and `ready` at start; remembers the last reclaim for `run --status`.
-function reclaimTmp(cfg) {
+// Run by `run` and `ready` at start; remembers the last reclaim for `run --status`. Not inside a run's agent
+// (PRLOOP_QUEUE_FILE set): a sandbox with its own PID namespace cannot see the run's live owners and would take
+// their dirs for dead, and the run sweeps on its own start anyway.
+export function reclaimTmp(cfg, env = process.env) {
+  if (env.PRLOOP_QUEUE_FILE) return;
   const r = sweepTmp(tmpRoot(cfg));
   if (!r.removed) return;
   logStderr({ event: 'reclaimed_tmp', dir: r.dir, removed: r.removed });
