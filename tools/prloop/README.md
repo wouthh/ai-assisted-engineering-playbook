@@ -109,7 +109,7 @@ Only one writer works in a worktree at a time. Before it spawns a fix agent or l
 
 Coordinators respect the lock too: check `prloop lock-status [<dir>]` (exit 50 and the holder when locked) before handing a worktree to an agent. When parallel work would share a checkout, give each agent or PR its own worktree, `git worktree add <dir> -b <branch> origin/<base>` for new work or `git worktree add <dir> <existing branch>`, and remove it with `git worktree remove <dir>` after the merge.
 
-Fix agents never wait for or poll reviews, merge, touch other PRs, rewrite history except through `prloop sync`, or retry in a loop.
+Fix agents never wait for or poll reviews, merge, touch other PRs, rewrite history except through `prloop sync`, or retry in a loop. They clean up only the exact paths they created, never by glob or name prefix, and never another agent's or a parent's directories.
 
 | Option | Default | |
 |---|---|---|
