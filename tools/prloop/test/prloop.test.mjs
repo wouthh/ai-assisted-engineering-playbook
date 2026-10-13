@@ -3326,7 +3326,7 @@ const sharedFile = (state) => JSON.parse(readFileSync(join(state, 'reviewer-stat
 const decide = (pr, nowMs, c = cfg) => reviewerDecision(pr, classify(pr, c, nowMs), c, nowMs, OWNER);
 
 // A PR in a real worktree served by a fake `gh`, whose `pr comment` (a retry) swaps in `afterComment` when given.
-async function runReviewerCase(t, { mutate, nowMs, extra = {}, afterComment, shared }) {
+async function runReviewerCase(t, { mutate, nowMs, extra = {}, afterComment, shared, prState }) {
   const state = tempState(t);
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
@@ -3334,6 +3334,7 @@ async function runReviewerCase(t, { mutate, nowMs, extra = {}, afterComment, sha
   const head = r.run(r.work, 'rev-parse', 'HEAD');
   writeFileSync(join(state, 'heads.json'), JSON.stringify({ 'example-org/example-repo#7': { sha: head, at: at('09:00') } }));
   if (shared) writeFileSync(join(state, 'reviewer-state.json'), JSON.stringify(shared));
+  if (prState) writeFileSync(join(state, 'example-org__example-repo__7.json'), JSON.stringify({ repo: 'example-org/example-repo', pr: 7, rounds: 0, seen: {}, ...prState }));
   const pr = fixture();
   Object.assign(pr, { headRefName: 'feat', headRefOid: head, mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE' });
   mutate(pr);
@@ -3352,7 +3353,8 @@ esac
   const [res] = await runAll({ repo: 'example-org/example-repo', pr: '7', worktree: r.work, deadline: '1h' },
     { ...cfg, agent: 'none', interval: 1, deadline: 3000, ...extra }, { metrics: idle().metrics, now: () => nowMs });
   const phases = runStatus('example-org/example-repo').prs[0].events.map((e) => e.phase);
-  return { res, phases, calls: calls(), state };
+  const events = runStatus('example-org/example-repo', 50).prs[0].events;
+  return { res, phases, calls: calls(), state, events };
 }
 const posted = (calls) => calls.some((c) => c.startsWith('pr comment'));
 
@@ -3398,15 +3400,16 @@ test('reviewer memory 4: a newer successful review or thumbs-up, here or on anot
   pr.comments.nodes.push(botComment('IC_q', QUOTA, '09:30'));
   const reviewed = structuredClone(pr);
   reviewed.reviews.nodes.push({ id: 'R_ok', body: 'Looks fine.', state: 'COMMENTED', submittedAt: at('09:45'), author: BOT, commit: { oid: 'f'.repeat(40) } });
-  assert.equal(decide(reviewed, ms('10:10')), null); // this PR
+  const unblocked = (d) => d.action === 'none' && !d.blockedAt && !!d.available;
+  assert.ok(unblocked(decide(reviewed, ms('10:10')))); // this PR
   const thumbs = structuredClone(pr);
   thumbs.comments.nodes.push({ ...botComment('IC_x', '@codex review', '09:40'), author: { login: 'example-dev' }, reactions: { nodes: [{ content: 'THUMBS_UP', createdAt: at('09:41'), user: BOT }] } });
-  assert.equal(decide(thumbs, ms('10:10')), null);
+  assert.ok(unblocked(decide(thumbs, ms('10:10'))));
   rmSync(join(state, 'reviewer-state.json'));
   assert.equal(decide(pr, ms('10:10')).action, 'local');
-  // Another PR's loop saw a newer success: the shared state unblocks this one.
-  recordReviewerEvents([{ login: BOT.login, kind: 'ok', at: '2026-01-01T09:50:00.000Z' }], cfg, OWNER);
-  assert.equal(decide(pr, ms('10:10')), null);
+  // Another PR's loop saw a newer success: the shared state unblocks this one and names that PR.
+  recordReviewerEvents([{ login: BOT.login, kind: 'ok', at: '2026-01-01T09:50:00.000Z' }], cfg, OWNER, 'https://github.com/example-org/other/pull/9');
+  assert.deepEqual(decide(pr, ms('10:10')).available, { at: '2026-01-01T09:50:00.000Z', source: 'https://github.com/example-org/other/pull/9' });
 });
 
 test('reviewer memory 5: the shared state alone blocks under 16 h and falls back to a local review', async (t) => {
@@ -3424,7 +3427,9 @@ test('reviewer memory 5: the shared state alone blocks under 16 h and falls back
 test('reviewer memory 6: a shared block with a newer okAt is not blocked', (t) => {
   tempState(t);
   recordReviewerEvents([{ login: BOT.login, kind: 'quota', at: '2026-01-01T09:30:00.000Z' }, { login: BOT.login, kind: 'ok', at: '2026-01-01T09:40:00.000Z' }], cfg, OWNER);
-  assert.equal(decide(noRequest(fixture()), ms('10:10')), null);
+  const d = decide(noRequest(fixture()), ms('10:10'));
+  assert.equal(d.blockedAt, undefined);
+  assert.equal(d.available.at, '2026-01-01T09:40:00.000Z');
 });
 
 test('reviewer memory 7: a newer event replaces an older one in the shared state, never the reverse', (t) => {
@@ -3540,4 +3545,71 @@ test('reviewer memory options: window and backoff come from flags, environment o
   assert.equal(config({}, { PRLOOP_QUOTA_WINDOW: '4h' }, { machine: { quotaWindow: '8h' } }).quotaWindow, 4 * H);
   assert.deepEqual(config({ reviewerBackoff: '1m, 3m' }, {}).reviewerBackoff, [6e4, 18e4]);
   assert.throws(() => config({ reviewerBackoff: '1m,0' }, {}), /reviewer-backoff/);
+});
+
+// ---------- reviewer login key and availability (#52) ----------
+// GitHub names the bot `chatgpt-codex-connector` on comments and `chatgpt-codex-connector[bot]` on reactions.
+const BOT_REACT = { login: `${BOT.login}[bot]` };
+// The Codex review summary, posted (and later edited) when a review starts: not a completed review.
+const SUMMARY = '<!-- codex-pull-request-review-summary -->\n\n## Codex Review Summary\n\n| Review | Status |\n| --- | --- |\n| Code Review | Completed |';
+
+test('reviewer memory 14: both spellings of the bot login share one key, and an old `[bot]` entry merges into it', (t) => {
+  const state = tempState(t);
+  writeFileSync(join(state, 'reviewer-state.json'), JSON.stringify({ [OWNER]: {
+    [BOT.login]: { blockedAt: '2026-01-01T09:30:00.000Z' },
+    [BOT_REACT.login]: { blockedAt: '2026-01-01T09:10:00.000Z', okAt: '2026-01-01T09:20:00.000Z', okFrom: 'https://github.com/example-org/other/pull/9' } } }));
+  const pr = noRequest(fixture());
+  pr.reactions.nodes.push({ content: 'THUMBS_UP', createdAt: at('09:05'), user: BOT_REACT });
+  assert.deepEqual(reviewerEvents(pr, cfg).map((e) => e.login), [BOT.login, BOT.login]);
+  recordReviewerEvents(reviewerEvents(pr, cfg), cfg, OWNER, pr.url);
+  assert.deepEqual(sharedFile(state)[OWNER], { [BOT.login]: { blockedAt: '2026-01-01T09:30:00.000Z', okAt: '2026-01-01T09:20:00.000Z', okFrom: 'https://github.com/example-org/other/pull/9' } });
+  // A reviewer regex that names only the `[bot]` spelling still reads the normalized key.
+  assert.equal(recordReviewerEvents([], { ...cfg, reviewer: /^chatgpt-codex-connector\[bot\]$/ }, OWNER).blockedAt, '2026-01-01T09:30:00.000Z');
+});
+
+test('reviewer memory 15: a quota reply under one spelling and a 👍 under the other unblock, and the run logs what did', async (t) => {
+  tempState(t);
+  const pr = noRequest(fixture());
+  pr.comments.nodes.push(botComment('IC_q', QUOTA, '09:30'),
+    { ...botComment('IC_x', '@codex review', '09:40'), author: { login: 'example-dev' }, reactions: { nodes: [{ content: 'THUMBS_UP', createdAt: at('09:45'), user: BOT_REACT }] } });
+  assert.deepEqual(decide(pr, ms('10:10')).available, { at: '2026-01-01T09:45:00.000Z', source: pr.url });
+  // A block seen earlier by this PR, cleared by a 👍 under the other spelling on the current request.
+  const { phases, events, calls } = await runReviewerCase(t, { nowMs: ms('10:10'), prState: { quotaSeen: '2026-01-01T09:30:00.000Z' },
+    shared: { [OWNER]: { [BOT.login]: { blockedAt: '2026-01-01T09:30:00.000Z' } } },
+    mutate: (p) => request(p).reactions.nodes.push({ content: 'THUMBS_UP', createdAt: at('10:07'), user: BOT_REACT }) });
+  const ev = events.find((e) => e.phase === 'reviewer_available');
+  assert.ok(ev, phases.join());
+  assert.equal(ev.okAt, '2026-01-01T10:07:00.000Z');
+  assert.equal(ev.source, 'https://github.com/example-org/example-repo/pull/7');
+  assert.equal(events.filter((e) => e.phase === 'reviewer_available').length, 1); // logged once, not every poll
+  assert.ok(phases.includes('clean') && !posted(calls), phases.join());
+});
+
+test('reviewer memory 16: a review-summary placeholder or 👀 alone does not unblock', (t) => {
+  tempState(t);
+  recordReviewerEvents([{ login: BOT.login, kind: 'quota', at: '2026-01-01T09:30:00.000Z' }], cfg, OWNER);
+  const pr = fixture(); // the current request at 10:05, acknowledged with 👀 and a summary comment
+  request(pr).reactions.nodes.push({ content: 'EYES', createdAt: at('10:06'), user: BOT_REACT });
+  pr.reactions.nodes.push({ content: 'EYES', createdAt: at('10:06'), user: BOT_REACT });
+  pr.comments.nodes.push(botComment('IC_sum', SUMMARY, '10:06'));
+  assert.deepEqual(reviewerEvents(pr, cfg).map((e) => `${e.kind}@${e.at.slice(11, 16)}`), ['ok@09:01']);
+  const d = decide(pr, ms('10:10'));
+  assert.equal(d.action, 'wait');
+  assert.equal(d.blockedAt, '2026-01-01T09:30:00.000Z');
+  assert.equal(d.available, undefined);
+  // An explicit no-findings comment is a completed review and does unblock.
+  pr.comments.nodes.push(botComment('IC_clean', "Codex Review: Didn't find any major issues.", '10:20'));
+  assert.equal(decide(pr, ms('10:25')).blockedAt, undefined);
+});
+
+test('reviewer memory 17: a fix agent spawned while blocked (state under `[bot]`, a summary on the PR) gets the local-review instruction', async (t) => {
+  const shared = { [OWNER]: { [BOT_REACT.login]: { blockedAt: '2026-01-01T09:30:00.000Z' } } };
+  const { res, calls, state } = await runReviewerCase(t, { nowMs: ms('10:10'), shared, mutate: (p) => {
+    p.reviewThreads.nodes.push(thread('T0', '2026-01-01T08:00:00Z'));
+    p.comments.nodes.push(botComment('IC_sum', SUMMARY, '09:50'));
+  } });
+  assert.equal(res.verdict, 'requested_while_unresolved', JSON.stringify(res));
+  assert.match(res.prompt, /Do not post a review request/);
+  assert.ok(!posted(calls));
+  assert.deepEqual(Object.keys(sharedFile(state)[OWNER]), [BOT.login]);
 });
