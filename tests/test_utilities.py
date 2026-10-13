@@ -1880,6 +1880,14 @@ class GuidanceConsistencyTests(unittest.TestCase):
         self.assertIn("## Task-end cleanup", loop)
         self.assertIn(rule, loop)
         self.assertIn("Remove only what the task owns", loop)
+        evidence = "Keep anything that may be the only copy of diagnostic or rollback evidence or of unpushed work"
+        self.assertIn(evidence, step)
+        self.assertIn(evidence, loop)
+        # The general stop rule keeps its own heading instead of reading as part of cleanup.
+        stopping = loop.split("## Stopping", 1)
+        self.assertEqual(len(stopping), 2)
+        self.assertIn("Stop when the remaining blocker requires", stopping[1])
+        self.assertNotIn("Stop when the remaining blocker requires", loop.split("## Task-end cleanup", 1)[1].split("## Stopping", 1)[0])
         walkthrough = (ROOT / "examples/fictional-order-service/README.md").read_text(encoding="utf-8")
         self.assertIn("removes its own scratch directory and the worktree of its merged or closed PR", walkthrough)
 
