@@ -3174,9 +3174,10 @@ test('run still gives an unavailable head one local review at the round cap', as
 const ERROR = "Codex couldn't complete this request. Try again later.";
 const ms = (hhmm) => Date.parse(at(hhmm));
 const H = 36e5;
+const OWNER = 'example-org';
 const noRequest = (pr) => { pr.comments.nodes = pr.comments.nodes.filter((c) => c.id !== 'IC_req'); return pr; };
 const sharedFile = (state) => JSON.parse(readFileSync(join(state, 'reviewer-state.json'), 'utf8'));
-const decide = (pr, nowMs, c = cfg) => reviewerDecision(pr, classify(pr, c, nowMs), c, nowMs);
+const decide = (pr, nowMs, c = cfg) => reviewerDecision(pr, classify(pr, c, nowMs), c, nowMs, OWNER);
 
 // A PR in a real worktree served by a fake `gh`, whose `pr comment` (a retry) swaps in `afterComment` when given.
 async function runReviewerCase(t, { mutate, nowMs, extra = {}, afterComment, shared }) {
@@ -3214,7 +3215,7 @@ test('reviewer memory 1: eyes on the current head means wait, and no trigger is 
   const pr = fixture();
   request(pr).reactions.nodes.push({ content: 'EYES', createdAt: at('10:05'), user: BOT });
   pr.comments.nodes.push(botComment('IC_q', QUOTA, '09:30')); // even with a recent quota reply on record
-  assert.deepEqual(decide(pr, ms('10:06')), { action: 'wait' });
+  assert.equal(decide(pr, ms('10:06')).action, 'wait');
   const { res, phases, calls } = await runReviewerCase(t, { nowMs: ms('10:06'), mutate: (p) => request(p).reactions.nodes.push({ content: 'EYES', createdAt: at('10:05'), user: BOT }) });
   assert.equal(res.verdict, 'deadline', JSON.stringify(res));
   assert.ok(phases.includes('waiting') && !phases.includes('local_review') && !phases.includes('needs_agent'), phases.join());
@@ -3228,7 +3229,7 @@ test('reviewer memory 2: a quota reply under 16 h old blocks the request, runs a
   const d = decide(pr, ms('10:10'));
   assert.equal(d.action, 'local');
   assert.equal(d.blockedAt, '2026-01-01T09:30:00.000Z');
-  assert.equal(sharedFile(state)['chatgpt-codex-connector'].blockedAt, '2026-01-01T09:30:00.000Z');
+  assert.equal(sharedFile(state)[OWNER]['chatgpt-codex-connector'].blockedAt, '2026-01-01T09:30:00.000Z');
   const { res, phases, calls } = await runReviewerCase(t, { nowMs: ms('10:10'), mutate: (p) => noRequest(p).comments.nodes.push(botComment('IC_q', QUOTA, '09:30')) });
   assert.ok(phases.includes('reviewer_quota') && phases.includes('local_review'), phases.join());
   assert.match(res.reason, /--agent none runs no local reviewer/); // the local path, not a fix agent posting a request
@@ -3258,39 +3259,39 @@ test('reviewer memory 4: a newer successful review or thumbs-up, here or on anot
   rmSync(join(state, 'reviewer-state.json'));
   assert.equal(decide(pr, ms('10:10')).action, 'local');
   // Another PR's loop saw a newer success: the shared state unblocks this one.
-  recordReviewerEvents([{ login: BOT.login, kind: 'ok', at: '2026-01-01T09:50:00.000Z' }], cfg);
+  recordReviewerEvents([{ login: BOT.login, kind: 'ok', at: '2026-01-01T09:50:00.000Z' }], cfg, OWNER);
   assert.equal(decide(pr, ms('10:10')), null);
 });
 
 test('reviewer memory 5: the shared state alone blocks under 16 h and falls back to a local review', async (t) => {
   tempState(t);
-  recordReviewerEvents([{ login: BOT.login, kind: 'quota', at: '2026-01-01T09:30:00.000Z' }], cfg);
+  recordReviewerEvents([{ login: BOT.login, kind: 'quota', at: '2026-01-01T09:30:00.000Z' }], cfg, OWNER);
   const pr = noRequest(fixture()); // no quota reply on this PR; its only bot signal is an older 👍 at 09:01
   assert.equal(decide(pr, ms('10:10')).action, 'local');
   assert.equal(decide(pr, ms('09:30') + 16 * H), null);
   const { phases, calls } = await runReviewerCase(t, { nowMs: ms('10:10'), mutate: noRequest,
-    shared: { [BOT.login]: { blockedAt: '2026-01-01T09:30:00.000Z' } } });
+    shared: { [OWNER]: { [BOT.login]: { blockedAt: '2026-01-01T09:30:00.000Z' } } } });
   assert.ok(phases.includes('local_review'), phases.join());
   assert.ok(!posted(calls));
 });
 
 test('reviewer memory 6: a shared block with a newer okAt is not blocked', (t) => {
   tempState(t);
-  recordReviewerEvents([{ login: BOT.login, kind: 'quota', at: '2026-01-01T09:30:00.000Z' }, { login: BOT.login, kind: 'ok', at: '2026-01-01T09:40:00.000Z' }], cfg);
+  recordReviewerEvents([{ login: BOT.login, kind: 'quota', at: '2026-01-01T09:30:00.000Z' }, { login: BOT.login, kind: 'ok', at: '2026-01-01T09:40:00.000Z' }], cfg, OWNER);
   assert.equal(decide(noRequest(fixture()), ms('10:10')), null);
 });
 
 test('reviewer memory 7: a newer event replaces an older one in the shared state, never the reverse', (t) => {
   const state = tempState(t);
-  const rec = (kind, at) => recordReviewerEvents([{ login: BOT.login, kind, at }], cfg);
+  const rec = (kind, at) => recordReviewerEvents([{ login: BOT.login, kind, at }], cfg, OWNER);
   rec('quota', '2026-01-01T10:00:00.000Z');
   rec('quota', '2026-01-01T09:00:00.000Z');
   rec('ok', '2026-01-01T08:00:00.000Z');
-  assert.deepEqual(sharedFile(state)[BOT.login], { blockedAt: '2026-01-01T10:00:00.000Z', okAt: '2026-01-01T08:00:00.000Z' });
+  assert.deepEqual(sharedFile(state)[OWNER][BOT.login], { blockedAt: '2026-01-01T10:00:00.000Z', okAt: '2026-01-01T08:00:00.000Z' });
   const merged = rec('quota', '2026-01-01T11:00:00.000Z');
   assert.deepEqual(merged, { blockedAt: '2026-01-01T11:00:00.000Z', okAt: '2026-01-01T08:00:00.000Z' });
   // Logins the reviewer regex does not match are kept but never read for this reviewer.
-  recordReviewerEvents([{ login: 'other-bot', kind: 'quota', at: '2026-01-01T12:00:00.000Z' }], cfg);
+  recordReviewerEvents([{ login: 'other-bot', kind: 'quota', at: '2026-01-01T12:00:00.000Z' }], cfg, OWNER);
   assert.equal(rec('ok', '2026-01-01T07:00:00.000Z').blockedAt, '2026-01-01T11:00:00.000Z');
 });
 
@@ -3299,14 +3300,14 @@ test('reviewer memory 8: concurrent writers keep the shared file valid JSON with
   const mod = JSON.stringify(new URL('../prloop.mjs', import.meta.url).href);
   const writer = (i) => new Promise((done, fail) => {
     const code = `import { recordReviewerEvents, config } from ${mod}; const c = config({}, {});
-      for (let k = 0; k < 25; k++) recordReviewerEvents([{ login: 'bot-${i}', kind: k % 2 ? 'ok' : 'quota', at: new Date(Date.UTC(2026, 0, 1, 0, k)).toISOString() }], c);`;
+      for (let k = 0; k < 25; k++) recordReviewerEvents([{ login: 'bot-${i}', kind: k % 2 ? 'ok' : 'quota', at: new Date(Date.UTC(2026, 0, 1, 0, k)).toISOString() }], c, 'o');`;
     const p = spawn(process.execPath, ['--input-type=module', '-e', code], { env: process.env, stdio: ['ignore', 'ignore', 'pipe'] });
     let err = '';
     p.stderr.on('data', (b) => { err += b; });
     p.on('exit', (c) => (c === 0 ? done() : fail(new Error(err))));
   });
   await Promise.all([0, 1, 2, 3].map(writer));
-  const all = sharedFile(state);
+  const all = sharedFile(state).o;
   for (const i of [0, 1, 2, 3]) assert.deepEqual(all[`bot-${i}`], { blockedAt: '2026-01-01T00:24:00.000Z', okAt: '2026-01-01T00:23:00.000Z' });
   assert.deepEqual(readdirSync(state).filter((f) => f.endsWith('.tmp')), []);
 });
@@ -3354,7 +3355,7 @@ test('reviewer memory 10: other reviewer errors back off 2, 5 and 10 minutes, at
 
 test('reviewer memory 11: cloud mode with a quota block blocks without a local fallback', async (t) => {
   tempState(t);
-  const shared = { [BOT.login]: { blockedAt: '2026-01-01T09:30:00.000Z' } };
+  const shared = { [OWNER]: { [BOT.login]: { blockedAt: '2026-01-01T09:30:00.000Z' } } };
   writeFileSync(join(process.env.XDG_STATE_HOME, 'prloop', 'reviewer-state.json'), JSON.stringify(shared));
   assert.equal(decide(noRequest(fixture()), ms('10:10'), { ...cfg, mode: 'cloud' }).action, 'blocked');
   const { res, phases, calls } = await runReviewerCase(t, { nowMs: ms('10:10'), mutate: noRequest, shared, extra: { mode: 'cloud' } });
@@ -3362,6 +3363,28 @@ test('reviewer memory 11: cloud mode with a quota block blocks without a local f
   assert.match(res.reason, /quota used up at 2026-01-01T09:30/);
   assert.match(res.next, /rerun after 2026-01-02T01:30/);
   assert.ok(!phases.includes('local_review') && !posted(calls), phases.join());
+});
+
+test('reviewer memory 12: quota is per repository owner: another owner\'s reply or success never changes it', (t) => {
+  tempState(t);
+  recordReviewerEvents([{ login: BOT.login, kind: 'quota', at: '2026-01-01T09:30:00.000Z' }], cfg, 'other-org');
+  assert.equal(decide(noRequest(fixture()), ms('10:10')), null);
+  recordReviewerEvents([{ login: BOT.login, kind: 'quota', at: '2026-01-01T09:30:00.000Z' }], cfg, OWNER);
+  recordReviewerEvents([{ login: BOT.login, kind: 'ok', at: '2026-01-01T09:50:00.000Z' }], cfg, 'other-org');
+  assert.equal(decide(noRequest(fixture()), ms('10:10')).action, 'local');
+});
+
+test('reviewer memory 13: while quota-blocked, fix agents for a gate failure or unresolved threads post no request', async (t) => {
+  const shared = { [OWNER]: { [BOT.login]: { blockedAt: '2026-01-01T09:30:00.000Z' } } };
+  const noRequestPrompt = /Do not post a review request/;
+  const unresolved = await runReviewerCase(t, { nowMs: ms('10:10'), shared, mutate: (p) => p.reviewThreads.nodes.push(thread('T0', '2026-01-01T08:00:00Z')) });
+  assert.equal(unresolved.res.verdict, 'requested_while_unresolved', JSON.stringify(unresolved.res));
+  assert.match(unresolved.res.prompt, noRequestPrompt);
+  const gate = await runReviewerCase(t, { nowMs: ms('10:10'), shared, mutate: () => {},
+    extra: { gate: 'exit 1', gateCost: 0, reviewBeforeGate: true, timeout: 1e12, ackTimeout: 1e12 } });
+  assert.equal(gate.res.verdict, 'gate_failed', JSON.stringify(gate.res));
+  assert.match(gate.res.prompt, noRequestPrompt);
+  assert.ok(!posted(unresolved.calls) && !posted(gate.calls));
 });
 
 test('reviewer memory options: window and backoff come from flags, environment or the machine file', () => {
