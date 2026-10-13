@@ -303,8 +303,18 @@ export function headSeenAt(key, sha) {
 // ---------- pure classification (tested with fixtures) ----------
 
 const login = (n) => n?.author?.login ?? n?.user?.login ?? '';
-// GitHub returns null for a list node it could not resolve (a deleted comment, a partial response): drop those
-// nodes from every connection in place, so readers only see real nodes. Missing timestamps then compare false.
+// GitHub returns null for a list node it could not resolve (a partial response). The `nodes` path of the first one, or ''.
+const nullNode = (o, path = '') => {
+  if (!o || typeof o !== 'object') return '';
+  for (const [k, v] of Object.entries(o)) {
+    const p = path ? `${path}.${k}` : k;
+    if (k === 'nodes' && Array.isArray(v) && v.includes(null)) return p;
+    const found = nullNode(v, p);
+    if (found) return found;
+  }
+  return '';
+};
+// Drops those nodes from every connection in place, so readers only see real nodes. Missing timestamps then compare false.
 const dropNullNodes = (o) => {
   if (Array.isArray(o)) o.forEach(dropNullNodes);
   else if (o && typeof o === 'object') {
@@ -341,9 +351,10 @@ const namesHead = (named, head, cfg) => (named.length === 40 ? named === head : 
 //   measured from the request time so re-running `wait` does not restart the clock;
 // - outdated threads stay unresolved until someone resolves them: an outdated anchor is not a fix.
 export function classify(pr, cfg, nowMs = Date.now()) {
-  // A null thread could be an unresolved one, so a partial thread list fails closed instead of reading as no threads.
-  if (pr.reviewThreads.nodes.includes(null)) throw new Error('GitHub returned an unreadable review thread: prloop cannot see them all, so it fails closed');
-  dropNullNodes(pr);
+  // A null node could be an unresolved thread, a newer request or reaction, or a force-push, so a partial snapshot fails
+  // closed (and is read again) instead of reading as a clean or older history.
+  const unreadable = nullNode(pr);
+  if (unreadable) throw new Error(`GitHub returned an unreadable node in ${unreadable}: prloop cannot see the full history, so it fails closed`);
   const head = pr.headRefOid;
   // GitHub exposes no push time: take the latest of the commit date, the last force-push and when prloop
   // first saw this head, so an older commit that becomes the head cannot inherit earlier signals.

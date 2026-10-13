@@ -3681,17 +3681,30 @@ const withNullNodes = (pr) => {
   return pr;
 };
 
-test('null nodes and missing timestamps are skipped by classify', () => {
-  const s = classify(withNullNodes(fixture()), cfg, NOW);
+test('missing timestamps and threads without comments are skipped by classify', () => {
+  const pr = withNullNodes(fixture());
+  pr.comments.nodes = pr.comments.nodes.filter(Boolean);
+  pr.comments.nodes[0].reactions.nodes = [];
+  pr.reviews.nodes = pr.reviews.nodes.filter(Boolean);
+  const s = classify(pr, cfg, NOW);
   assert.equal(s.verdict, 'pending');
   assert.equal(s.trigger.databaseId, 101);
   assert.deepEqual(s.unresolvedThreads.map((t) => t.id), ['T_empty']);
 });
 
-test('a null review thread fails closed in classify', () => {
-  const pr = fixture();
-  pr.reviewThreads.nodes = [null];
-  assert.throws(() => classify(pr, cfg, NOW), /unreadable review thread/);
+test('a null node in any connection fails closed in classify', () => {
+  // A null thread could be unresolved; a null comment or reaction could be the newer request or 👀 that supersedes a clean result.
+  const cases = {
+    reviewThreads: (pr) => { pr.reviewThreads.nodes = [null]; },
+    comments: (pr) => { pr.comments.nodes.push(null); },
+    'comments.reactions': (pr) => { pr.comments.nodes.at(-1).reactions.nodes.push(null); },
+    reactions: (pr) => { pr.reactions = { nodes: [null] }; },
+  };
+  for (const [where, mutate] of Object.entries(cases)) {
+    const pr = fixture();
+    mutate(pr);
+    assert.throws(() => classify(pr, cfg, NOW), /unreadable node in .*nodes: prloop cannot see the full history, so it fails closed/, where);
+  }
 });
 
 test('null nodes and missing timestamps are skipped by reviewerEvents', () => {
