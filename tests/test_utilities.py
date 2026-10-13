@@ -1859,13 +1859,19 @@ class GuidanceConsistencyTests(unittest.TestCase):
         self.assertIn("push, reply and resolve addressed threads, gate the pushed head through `prloop ready`", delivery)
         step6 = (ROOT / "docs/implementation-loop.md").read_text(encoding="utf-8").split("## 6.", 1)[1].split("\n## ", 1)[0]
         self.assertRegex(step6, r"resolve the addressed thread, and run the full gate on the pushed head \(through `prloop ready`")
+        # A deferred prloop ready result has not run the gate, so it cannot count as validation.
+        self.assertRegex(step4, r"reports `\"gate\": \"deferred\"`[^.]*the gate has not run yet[^.]*before treating the head as validated")
+        self.assertIn('handle a `"gate": "deferred"` result as in step 4', step6)
+        walkthrough = (ROOT / "examples/fictional-order-service/README.md").read_text(encoding="utf-8")
+        self.assertIn("push, reply on and resolve the addressed threads, run the full gate on the pushed head (with `prloop ready 12`", walkthrough)
 
     def test_template_delivery_runs_existing_pr_full_gate_after_push(self) -> None:
         # prloop ready rejects a local head that differs from the PR head, so existing-PR work pushes first.
         text = (ROOT / "templates/AGENTS.template.md").read_text(encoding="utf-8")
         delivery = text.split("## Delivery", 1)[1].split("\n## ", 1)[0]
         self.assertRegex(delivery, r"after pushing to an existing PR \(through `prloop ready`")
-        self.assertIn("run focused checks, push, run the full gate on the pushed head", delivery)
+        # prloop ready blocks on unresolved threads, so correction cycles resolve before gating.
+        self.assertIn("run focused checks, push, inspect the hosted diff, reply with fixing SHA/evidence, resolve, then run the full gate on the pushed head (through `prloop ready`", delivery)
         # A deferred gate (heavy gate or reviewBeforeGate) has not run, so it cannot count as validation yet.
         self.assertRegex(delivery, r"reports `\"gate\": \"deferred\"`[^.]*the gate has not run yet[^.]*before recording the gate as passed")
 

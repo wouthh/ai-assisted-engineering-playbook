@@ -57,7 +57,7 @@ Tests cover the values immediately below, at, and above the threshold plus inval
 
 A useful review asks whether the boundary is correct, whether equality is specified, and whether invalid configuration fails closed. A request to add a database, framework, or deployment would be valid future work but outside this task.
 
-If a correction changes behavior, add a normal follow-up commit, rerun the focused tests, push, run the full gate on the pushed head (with `prloop ready 12` when prloop runs the loop), and obtain a fresh review of the new head.
+If a correction changes behavior, add a normal follow-up commit, rerun the focused tests, push, reply on and resolve the addressed threads, run the full gate on the pushed head (with `prloop ready 12` when prloop runs the loop, which stays blocked while a thread is unresolved), and obtain a fresh review of the new head.
 
 If a finding is invalid because the reviewer misread the repository's `AGENTS.md` (for example, it asks for real order data when the root `AGENTS.md` states "Examples must be fictional or independently reusable."), reply with evidence and resolve the thread. When instruction maintenance is authorized, also clarify that wording in a normal PR so the finding does not return; otherwise report the gap.
 
