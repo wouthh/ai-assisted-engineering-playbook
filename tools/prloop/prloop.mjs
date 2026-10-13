@@ -1642,8 +1642,8 @@ const tail = (t) => String(t ?? '').trim().slice(-300);
 // result line (its `blocked` status names a refused step). Prose that merely quotes "permission denied" never blocks.
 // Text is searched only when there is neither, such as a codex session that ended without a result line.
 export function permissionDenied(r, result) {
-  const denials = cliWrapper(r.final)?.permission_denials; // other JSON objects are not a wrapper
-  if (Array.isArray(denials)) return denials.length > 0;
+  const w = cliWrapper(r.final); // a claude result wrapper (`type: "result"`) may omit the array; other JSON is not a wrapper
+  if (Array.isArray(w?.permission_denials) || w?.type === 'result') return (w.permission_denials?.length ?? 0) > 0;
   return !result && DENIED.test(`${r.final}\n${r.stderr}`);
 }
 
