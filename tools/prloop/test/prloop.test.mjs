@@ -6,7 +6,7 @@ import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import {
-  EXIT, OUTPUT_TAIL, main, reviewerEvents, recordReviewerEvents, reviewerDecision, approvedFor, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, sweepTmp, tmpLine, reclaimTmp, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, recordEvent, saveState, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, gateProvenance, treeRss, recordGatePass, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, reconcileStates, syncBranch, unionLines, unionResult, waitFor,
+  EXIT, OUTPUT_TAIL, main, reviewerEvents, recordReviewerEvents, reviewerDecision, approvedFor, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, permissionDenied, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, sweepTmp, tmpLine, reclaimTmp, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, recordEvent, saveState, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, gateProvenance, treeRss, recordGatePass, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, reconcileStates, syncBranch, unionLines, unionResult, waitFor,
 } from '../prloop.mjs';
 
 const pick = (o, keys) => Object.fromEntries(keys.map((k) => [k, o[k]]));
@@ -2232,6 +2232,35 @@ test('run keeps a successful agent\'s reason, such as a proposed prloop issue, i
   const e = runStatus('example-org/example-repo').prs[0].events.find((x) => x.phase === 'agent_reason');
   assert.equal(e?.reason, 'proposed prloop issue: status stale', JSON.stringify(e));
   assert.equal(e.status, 'requested');
+});
+
+// A claude wrapper whose result text quotes "permission denied" in prose, with the given runtime denials.
+function deniedWrapperAgent(t, denials) {
+  const dir = mkdtempSync(join(tmpdir(), 'prloop-denied-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const line = '{"status":"requested","head":"x","fixed":["T1"],"disputed":[]}';
+  writeFileSync(join(dir, 'out.json'), JSON.stringify({ type: 'result', subtype: 'success', is_error: false, terminal_reason: 'completed',
+    result: `Fixed the insert: publishing those posts would otherwise fail with "permission denied" for the runtime role.\n${line}`, permission_denials: denials }));
+  return `cat "${join(dir, 'out.json')}"`;
+}
+
+test('run continues when a successful agent\'s summary only mentions a permission denied error', async (t) => {
+  const { res } = await runNoResultAgent(t, true, { body: deniedWrapperAgent(t, []) });
+  assert.equal(res.verdict, 'clean', JSON.stringify(res));
+});
+
+test('run blocks when the runtime reports permission denials', async (t) => {
+  const { res } = await runNoResultAgent(t, true, { body: deniedWrapperAgent(t, [{ tool_name: 'Bash', tool_input: { command: 'git push' } }]) });
+  assert.equal(res.verdict, 'blocked', JSON.stringify(res));
+  assert.equal(res.reason, 'the agent reported a permission denial');
+});
+
+test('permission denials come from structured output; text only without a wrapper or result line', () => {
+  const ok = { status: 'requested' };
+  assert.equal(permissionDenied({ final: JSON.stringify({ result: 'permission denied', permission_denials: [] }), stderr: '' }, ok), false);
+  assert.equal(permissionDenied({ final: JSON.stringify({ result: 'done', permission_denials: [{ tool_name: 'Write' }] }), stderr: '' }, ok), true);
+  assert.equal(permissionDenied({ final: 'the "permission denied" error is fixed', stderr: '' }, ok), false); // codex with a result line
+  assert.equal(permissionDenied({ final: 'stopped', stderr: 'sandbox: permission denied' }, null), true); // codex without one
 });
 
 test('run blocks with the session error and keeps the agent log when an agent ends without a result line', async (t) => {
