@@ -2633,6 +2633,15 @@ echo "{\\"status\\":\\"fixed\\",\\"head\\":\\"$new\\",\\"fixed\\":[\\"T1\\"],\\"
   assert.equal(gatePassed('true', r.work), fixed); // prloop gated the fixed head itself
   const phases = runStatus('example-org/example-repo', 50).prs[0].events.map((e) => e.phase);
   assert.ok(phases.includes('merged_low_impact'), phases.join());
+  // A saved early merge is dropped when a later run turns the feature off: the head goes back to normal review.
+  const st = JSON.parse(readFileSync(join(state, 'example-org__example-repo__7.json'), 'utf8'));
+  writeFileSync(join(state, 'example-org__example-repo__7.json'), JSON.stringify({ ...st, phase: 'polling', lowImpactMerge: { head: fixed, reason: 'x' } }));
+  const reply = (p) => JSON.stringify({ data: { viewer: { login: 'example-dev' }, repository: { mergeCommitAllowed: true, squashMergeAllowed: true, rebaseMergeAllowed: true, pullRequest: p } } });
+  writeFileSync(join(r.dir, 'pr.json'), reply({ ...pr, headRefOid: fixed, reviewThreads: { ...pr.reviewThreads, nodes: [] } }));
+  writeFileSync(join(r.dir, 'calls.log'), '');
+  const [off] = await runAll({ repo: 'example-org/example-repo', pr: '7', worktree: r.work, merge: 'squash', deadline: '1h' }, { ...cfg, gate: 'true', gateCost: 0, interval: 1, agent: 'none', lowImpactMerge: false }, { metrics: idle().metrics });
+  assert.notEqual(off.verdict, 'merged', JSON.stringify(off));
+  assert.ok(!calls().some((c) => c.startsWith('pr merge')), 'no merge with the feature off');
   // Without --merge, or with --low-impact-merge false, the agent is never told to skip the request.
   assert.equal(config({ lowImpactMerge: 'false' }, {}).lowImpactMerge, false);
   assert.equal(config({}, {}).lowImpactMerge, true);
