@@ -1834,6 +1834,14 @@ class GuidanceConsistencyTests(unittest.TestCase):
                 self.assertIn("Never supervise it through a detached process plus a `pgrep -f` watcher", text)
                 self.assertIn("clear that PR's state file before rerunning, instead of spending `prloop reset-rounds`", text)
 
+    def test_template_isolates_shared_scratch_and_scales_agents_by_resources(self) -> None:
+        text = (ROOT / "templates/AGENTS.template.md").read_text(encoding="utf-8")
+        self.assertIn("its top level belongs to the coordinator", text)
+        self.assertIn('mktemp -d "<scratch>/agents/<task>-XXXXXX"', text)
+        self.assertIn("states the path in its report", text)
+        self.assertRegex(text, r"add them one at a time while watching load[^\n]*free memory[^\n]*CPU temperature")
+        self.assertIn("A lower limit set by the user takes precedence", text)
+
     def test_template_fix_agent_gate_rule_allows_capped_subagents(self) -> None:
         text = (ROOT / "templates/AGENTS.template.md").read_text(encoding="utf-8")
         fix_agent = text.split("### Fix agent", 1)[1]
