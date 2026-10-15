@@ -1834,13 +1834,22 @@ class GuidanceConsistencyTests(unittest.TestCase):
                 self.assertIn("Never supervise it through a detached process plus a `pgrep -f` watcher", text)
                 self.assertIn("clear that PR's state file before rerunning, instead of spending `prloop reset-rounds`", text)
 
-    def test_template_isolates_shared_scratch_and_scales_agents_by_resources(self) -> None:
-        text = (ROOT / "templates/AGENTS.template.md").read_text(encoding="utf-8")
-        self.assertIn("its top level belongs to the coordinator", text)
-        self.assertIn('mktemp -d "<scratch>/agents/<task>-XXXXXX"', text)
-        self.assertIn("states the path in its report", text)
-        self.assertRegex(text, r"add them one at a time while watching load[^\n]*free memory[^\n]*CPU temperature")
-        self.assertIn("A lower limit set by the user takes precedence", text)
+    def test_shared_scratch_and_agent_capacity_rules_are_mirrored(self) -> None:
+        for path in ("templates/AGENTS.template.md", "docs/implementation-loop.md"):
+            with self.subTest(path=path):
+                text = (ROOT / path).read_text(encoding="utf-8")
+                self.assertIn("its top level belongs to the coordinator", text)
+                self.assertIn("creates `<scratch>/agents/` before delegating", text)
+                self.assertIn('mktemp -d "<scratch>/agents/<task>-XXXXXX"', text)
+                self.assertIn("states the path in its report", text)
+        for path in ("templates/AGENTS.template.md", "docs/review-wait-loop.md"):
+            with self.subTest(path=path):
+                text = (ROOT / path).read_text(encoding="utf-8")
+                self.assertIn("Run 6-8 working agents at a time by default, with at most 2 heavy gates at once", text)
+                self.assertRegex(text, r"Go beyond that only when the user asks, and then add agents one at a time while watching load[^\n]*free memory[^\n]*CPU temperature")
+                self.assertIn("A lower limit set by the user takes precedence", text)
+        root = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        self.assertIn("docs/implementation-loop.md#task-end-cleanup", root)
 
     def test_template_fix_agent_gate_rule_allows_capped_subagents(self) -> None:
         text = (ROOT / "templates/AGENTS.template.md").read_text(encoding="utf-8")
