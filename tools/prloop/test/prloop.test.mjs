@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import {
   EXIT, OUTPUT_TAIL, main, errorFrame, reviewerEvents, recordReviewerEvents, reviewerDecision, approvedFor, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, permissionDenied, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, sweepTmp, tmpLine, reclaimTmp, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, recordEvent, saveState, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, gateProvenance, treeRss, recordGatePass, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, reconcileStates, syncBranch, unionLines, unionResult, waitFor,
-  MERGEABILITY_WAIT, gateFor,
+  MERGEABILITY_WAIT, gateFor, limits, busyProcess, machineCpus, gateCpuSet, cpusLine, parseCpuList, formatCpuList,
 } from '../prloop.mjs';
 
 const pick = (o, keys) => Object.fromEntries(keys.map((k) => [k, o[k]]));
@@ -3863,4 +3863,111 @@ test('errorFrame names where an unexpected error was thrown', () => {
   try { crash(); } catch (e) { err = e; }
   assert.match(errorFrame(err), /^ \(at crash \(.*prloop\.test\.mjs:\d+:\d+\)\)$/);
   assert.equal(errorFrame({ message: 'gh failed' }), '');
+});
+
+// A fake sysfs and /proc/self/status: `files` maps paths below the root to their content.
+function fakeTree(t, files) {
+  const root = mkdtempSync(join(tmpdir(), 'prloop-sys-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  for (const [f, v] of Object.entries(files)) { mkdirSync(dirname(join(root, f)), { recursive: true }); writeFileSync(join(root, f), v); }
+  return root;
+}
+
+test('CPU classes: hybrid sysfs, frequency fallback, one class, and no sysfs at all', (t) => {
+  assert.deepEqual(parseCpuList('0-3,8,10-11\n'), [0, 1, 2, 3, 8, 10, 11]);
+  assert.equal(formatCpuList([0, 1, 2, 3, 8, 10, 11]), '0-3,8,10-11');
+  const hybrid = fakeTree(t, { 'sys/devices/cpu_core/cpus': '0-3\n', 'sys/devices/cpu_atom/cpus': '4-7\n', status: 'Name:\tnode\nCpus_allowed_list:\t0-7\n' });
+  assert.deepEqual(machineCpus({ sys: join(hybrid, 'sys'), status: join(hybrid, 'status') }),
+    { allowed: [0, 1, 2, 3, 4, 5, 6, 7], classes: { performance: [0, 1, 2, 3], efficiency: [4, 5, 6, 7] } });
+  // Only the CPUs this process may use count: an affinity limited to one class leaves one class.
+  const pinned = fakeTree(t, { 'sys/devices/cpu_core/cpus': '0-3', 'sys/devices/cpu_atom/cpus': '4-7', status: 'Cpus_allowed_list:\t4-7\n' });
+  assert.deepEqual(machineCpus({ sys: join(pinned, 'sys'), status: join(pinned, 'status') }), { allowed: [4, 5, 6, 7], classes: null });
+  const freq = (mhz) => Object.fromEntries(mhz.map((f, i) => [`sys/devices/system/cpu/cpu${i}/cpufreq/cpuinfo_max_freq`, `${f * 1000}\n`]));
+  const slow = fakeTree(t, { ...freq([5000, 5000, 3500, 3500]), status: 'Cpus_allowed_list:\t0-3\n' });
+  assert.deepEqual(machineCpus({ sys: join(slow, 'sys'), status: join(slow, 'status') }).classes, { performance: [0, 1], efficiency: [2, 3] });
+  // Small per-core boost differences are one class.
+  const boost = fakeTree(t, { ...freq([5000, 4800, 4700, 4600]), status: 'Cpus_allowed_list:\t0-3\n' });
+  assert.equal(machineCpus({ sys: join(boost, 'sys'), status: join(boost, 'status') }).classes, null);
+  const none = fakeTree(t, {});
+  const bare = machineCpus({ sys: join(none, 'missing'), status: join(none, 'missing') });
+  assert.equal(bare.classes, null);
+  assert.ok(bare.allowed.length >= 1);
+});
+
+test('gateCpus resolves to a class or a list, and falls back to every usable CPU with a warning', () => {
+  const hybrid = { allowed: [0, 1, 2, 3, 4, 5, 6, 7], classes: { performance: [0, 1, 2, 3], efficiency: [4, 5, 6, 7] } };
+  const flat = { allowed: [0, 1, 2, 3], classes: null };
+  assert.deepEqual(gateCpuSet('all', hybrid), { cpus: hybrid.allowed, restricted: false });
+  assert.deepEqual(gateCpuSet('efficiency', hybrid), { cpus: [4, 5, 6, 7], restricted: true });
+  assert.deepEqual(gateCpuSet('2-3,9', flat), { cpus: [2, 3], restricted: true });
+  assert.match(gateCpuSet('performance', flat).warning, /one CPU class/);
+  assert.equal(gateCpuSet('performance', flat).restricted, false);
+  assert.match(gateCpuSet('9-10', flat).warning, /no usable CPU/);
+  const c = config({}, {}, { machine: { gateCpus: 'efficiency' } });
+  assert.equal(cpusLine(c, hybrid), 'usable 0-7 (performance 0-3, efficiency 4-7), gate cpus 4-7 (efficiency)');
+  assert.equal(cpusLine(config({}, {}), flat), 'usable 0-3 (one class), gate cpus 0-3 (all)');
+  for (const bad of ['fast', '1-', 'a,b']) assert.throws(() => config({}, {}, { machine: { gateCpus: bad } }), /gateCpus must be/);
+});
+
+test('a gate runs pinned to its CPUs and learns its CPU set and worker budget', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'prloop-slots-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const usable = parseCpuList(readFileSync('/proc/self/status', 'utf8').match(/^Cpus_allowed_list:\s*(\S+)/m)?.[1] ?? '0');
+  const cpus = { allowed: usable, classes: usable.length > 1 ? { performance: usable.slice(0, 1), efficiency: usable.slice(1) } : null };
+  const c = { ...cfg, gateSlots: 2, gateCpus: 'performance' };
+  const x = idle();
+  const r = await runGate('echo "$PRLOOP_GATE_CPUS $PRLOOP_GATE_WORKERS"; grep Cpus_allowed_list /proc/self/status || true', dir, c, { ...x, dir, cpus });
+  const [env, allowed] = r.stdout.trim().split('\n');
+  if (usable.length > 1 && spawnSync('taskset', ['-V']).status === 0) {
+    assert.equal(env, `${usable[0]} 1`);
+    assert.match(allowed, new RegExp(`\\s${usable[0]}$`));
+  }
+  // Without taskset the gate runs on every usable CPU and says so once.
+  const y = idle();
+  const twice = { ...y, dir, cpus, taskset: () => false };
+  const u = await runGate('echo "$PRLOOP_GATE_CPUS $PRLOOP_GATE_WORKERS"', dir, { ...c, gateCpus: 'all' }, twice);
+  assert.equal(u.stdout.trim(), `${formatCpuList(usable)} ${Math.max(1, Math.floor(usable.length / 2))}`);
+});
+
+test('a busy workload lowers the gate slots for new admissions only', async (t) => {
+  const proc = fakeTree(t, { '41/comm': 'bash\n', '41/cmdline': 'bash\0-c\0echo game.exe\0', '42/comm': 'GameName.exe\n', '42/cmdline': 'C:\\Games\\GameName.exe\0' });
+  assert.equal(busyProcess([/\.exe$/i], proc), 'GameName.exe');
+  assert.equal(busyProcess([/^echo/i], proc), null); // arguments never count
+  assert.equal(busyProcess([], proc), null);
+  assert.equal(busyProcess([/x/], join(proc, 'missing')), null);
+  const c = config({}, {}, { machine: { gateSlots: 3, gateSlotsWhenBusy: 1, busyProcessPatterns: ['^game'] } });
+  assert.deepEqual([c.gateSlots, c.gateSlotsWhenBusy], [3, 1]);
+  assert.equal(config({}, {}, { machine: { gateSlots: 2 } }).gateSlotsWhenBusy, 2); // unset: no change
+  assert.throws(() => config({}, {}, { machine: { busyProcessPatterns: ['('] } }), /busyProcessPatterns/);
+  assert.throws(() => config({}, {}, { machine: { gateSlotsWhenBusy: -1 } }), /nonnegative integer/);
+  const dir = mkdtempSync(join(tmpdir(), 'prloop-slots-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const running = acquireSlot(dir, 3); // a gate admitted before the game started keeps its slot
+  let game = 'game';
+  const x = idle();
+  const pause = async (ms) => { x.clock.t += ms; if (x.clock.t >= 20e3) game = null; };
+  const r = await runGate('echo ran', dir, c, { ...x, pause, dir, busy: () => game });
+  assert.equal(r.stdout.trim(), 'ran');
+  assert.ok(x.clock.t >= 20e3, `started at ${x.clock.t}`); // waited although two of three slots were free
+  assert.deepEqual(x.events.map((e) => [e.event, e.slots, e.busy]), [['waiting_for_gate_slot', 1, 'game']]);
+  assert.match(machineLine(c, { metrics: idle().metrics, dir, busy: () => 'game' }), /gate slots 1\/3 in use, limit 1 for new heavy gates while game runs$/);
+  running();
+  // A light gate keeps skipping the slot queue while the workload runs.
+  const light = await runGate('echo ran', dir, { ...c, gateCost: 0 }, { ...idle(), dir, busy: () => 'game' });
+  assert.equal(light.stdout.trim(), 'ran');
+  // gateSlotsWhenBusy 0: no slot-taking gate starts while the workload runs.
+  const zero = { ...c, gateSlotsWhenBusy: 0 };
+  let busy = 'game';
+  const y = idle();
+  await runGate('true', dir, zero, { ...y, dir, busy: () => busy, pause: async (ms) => { y.clock.t += ms; if (y.clock.t >= 10e3) busy = null; } });
+  assert.ok(y.clock.t >= 10e3);
+});
+
+test('maxLoad as a ratio scales with the usable CPUs; an absolute value stays absolute', () => {
+  const m = { load: 1, cores: 16, freeMem: 16 * GiB, totalMem: 32 * GiB };
+  assert.equal(limits(config({}, {}, { machine: { maxLoad: '0.5x' } }), m).maxLoad, 8);
+  assert.equal(limits(config({ maxLoad: '6' }, {}), m).maxLoad, 6);
+  assert.equal(limits(config({}, {}), m).maxLoad, 12);
+  assert.throws(() => config({ maxLoad: '-1x' }, {}), /must be a positive/);
+  assert.equal(config({}, agentEnv(config({ maxLoad: '0.5x' }, {}), {})).maxLoad, '0.5x'); // agents get the same ratio
 });

@@ -75,6 +75,10 @@ reviewerBackoff):
   --min-free-mem <size>     PRLOOP_MIN_FREE_MEM    default: the larger of 4G and 10% of RAM
   --resource-wait <dur>     PRLOOP_RESOURCE_WAIT   default: 30m, then proceed with one slot only
   --gate-tmpdir <dir>       PRLOOP_GATE_TMPDIR     run each gate and agent with a private TMPDIR under <dir>
+  Machine file only: busyProcessPatterns (regexes for process names, such as a game) and gateSlotsWhenBusy (the
+  gate slots for new admissions while one runs, default gateSlots); gateCpus all|performance|efficiency|<list> pins
+  gates to those CPUs (taskset), and every gate gets PRLOOP_GATE_CPUS and PRLOOP_GATE_WORKERS. maxLoad may be a
+  ratio of the usable CPUs, such as "0.75x".
 
 Exit codes: 0 clean/ok/merged, 10 findings, 20 not_requested, 21 requested_while_unresolved, 22 not_tested,
             30 timeout, 31 unavailable, 40 error, 41 conflict, 50 blocked / not ready / needs a human / merge pending.`;
@@ -119,6 +123,15 @@ const positiveNumber = (name, v) => {
   return Number(v);
 };
 
+const nonnegativeInt = (name, v) => {
+  if (!/^\d+$/.test(String(v)) || !Number.isSafeInteger(Number(v))) throw new Error(`${name} must be a nonnegative integer, not ${v}`);
+  return Number(v);
+};
+const gateCpusSpec = (v = 'all') => {
+  if (['all', 'efficiency', 'performance'].includes(v) || /^\d+(-\d+)?(,\d+(-\d+)?)*$/.test(v)) return v;
+  throw new Error(`gateCpus must be all, efficiency, performance or a CPU list such as 8-15, not ${v}`);
+};
+
 // Binary units: 512M, 4G, 4GiB or plain bytes.
 export function parseSize(v, name = 'min-free-mem') {
   if (v === undefined) return undefined;
@@ -154,7 +167,7 @@ const short = (sha) => (sha ?? '').slice(0, 7);
 
 // Values that one key of a config file may hold; anything else is a usage error, not a silent default.
 const REPO_KEYS = { gate: 'string', gateWeight: 'string|number', union: 'array', merge: 'string', reviewBeforeGate: 'boolean', regenerate: 'string|array', generated: 'array', gateIrrelevant: 'array', docsGate: 'string', docsPaths: 'array' };
-const MACHINE_KEYS = { gateSlots: 'number|string', maxLoad: 'number|string', minFreeMem: 'number|string', resourceWait: 'string', gateTmpdir: 'string', approvedRegenerate: 'object', quotaWindow: 'string', reviewerBackoff: 'string' };
+const MACHINE_KEYS = { gateSlots: 'number|string', maxLoad: 'number|string', minFreeMem: 'number|string', resourceWait: 'string', gateTmpdir: 'string', busyProcessPatterns: 'array', gateSlotsWhenBusy: 'number|string', gateCpus: 'string', approvedRegenerate: 'object', quotaWindow: 'string', reviewerBackoff: 'string' };
 function readConfigFile(file, keys) {
   if (!file || !existsSync(file)) return {};
   let obj;
@@ -240,11 +253,16 @@ export function config(opts, env = process.env, { machine = {}, repo = {} } = {}
     maxRounds: positiveInt('max-rounds', opts.maxRounds ?? 6),
     maxAgents: positiveInt('max-agents', opts.maxAgents ?? 2),
     gateSlots,
-    maxLoad: positiveNumber('max-load', opts.maxLoad ?? env.PRLOOP_MAX_LOAD ?? machine.maxLoad),
+    // An absolute load average, or `<ratio>x`: that ratio of the CPUs this process may use (affinity, cpuset).
+    maxLoad: ((v) => (/x$/i.test(String(v)) ? `${positiveNumber('max-load', String(v).slice(0, -1))}x` : positiveNumber('max-load', v)))(opts.maxLoad ?? env.PRLOOP_MAX_LOAD ?? machine.maxLoad),
     minFreeMem: parseSize(opts.minFreeMem ?? env.PRLOOP_MIN_FREE_MEM ?? machine.minFreeMem),
     resourceWait: parseDuration(opts.resourceWait ?? env.PRLOOP_RESOURCE_WAIT ?? machine.resourceWait ?? '30m', 'resource-wait'),
     gateTmpdir: (tmp => tmp && resolve(tmp))(opts.gateTmpdir ?? env.PRLOOP_GATE_TMPDIR ?? machine.gateTmpdir),
     gateWeight, gateCost: gateCost(gateWeight),
+    // Machine file only: while a process matching one of these runs (a game, a render), heavy gates get fewer slots.
+    busyProcessPatterns: (machine.busyProcessPatterns ?? []).map((p) => { try { return new RegExp(p, 'i'); } catch (e) { throw new Error(`busyProcessPatterns: ${e.message}`); } }),
+    gateSlotsWhenBusy: Math.min(gateSlots, nonnegativeInt('gateSlotsWhenBusy', machine.gateSlotsWhenBusy ?? gateSlots)),
+    gateCpus: gateCpusSpec(machine.gateCpus),
     // A local review needs the gate first, so --reviewer local always gates before the review.
     reviewBeforeGate: mode !== 'local' && (bool('review-before-gate', opts.reviewBeforeGate ?? env.PRLOOP_REVIEW_BEFORE_GATE ?? repo.reviewBeforeGate)
       ?? (gateWeight !== undefined && gateCost(gateWeight) >= 1)),
@@ -495,7 +513,9 @@ export function machineMetrics() {
   return { load: loadavg()[0], cores: availableParallelism(), freeMem, totalMem: totalmem() };
 }
 
-export const limits = (cfg, m) => ({ maxLoad: cfg.maxLoad ?? 0.75 * m.cores, minFreeMem: cfg.minFreeMem ?? Math.max(4 * GiB, Math.round(0.1 * m.totalMem)) });
+// m.cores counts the CPUs this process may use (availableParallelism follows affinity and cpusets), not every core.
+const loadLimit = (v, cores) => (v === undefined ? 0.75 * cores : /x$/.test(String(v)) ? Number(String(v).slice(0, -1)) * cores : v);
+export const limits = (cfg, m) => ({ maxLoad: loadLimit(cfg.maxLoad, m.cores), minFreeMem: cfg.minFreeMem ?? Math.max(4 * GiB, Math.round(0.1 * m.totalMem)) });
 
 // One admission check. `w` tracks one wait period: `waiting_for_resources` is logged once when it starts and
 // `resource_wait_expired` once after --resource-wait. Returns ok, wait, or expired (proceed with one slot only).
@@ -634,6 +654,85 @@ export const slotsInUse = (dir) => {
   try { return new Set(readdirSync(dir).flatMap((f) => { const m = /^slot-(\d+)\.(\d+)\.\d+$/.exec(f); return m && slotClaimAlive(join(dir, f), Number(m[2])) ? [m[1]] : []; })).size; } catch { return 0; }
 };
 
+// ---------- busy workloads and CPU classes ----------
+
+// The first running process whose name (comm, or the base name of argv[0], which keeps a long or Windows-style
+// path) matches one of `patterns`, or null. Command-line arguments are not matched, so a prompt or a shell command
+// that merely mentions a pattern never counts. Without /proc (not Linux) nothing matches.
+export function busyProcess(patterns, proc = '/proc') {
+  if (!patterns?.length) return null;
+  let pids;
+  try { pids = readdirSync(proc).filter((f) => /^\d+$/.test(f)); } catch { return null; }
+  for (const pid of pids) {
+    let names;
+    try {
+      const argv0 = readFileSync(join(proc, pid, 'cmdline'), 'utf8').split('\0')[0];
+      names = [readFileSync(join(proc, pid, 'comm'), 'utf8').trim(), argv0.split(/[\\/]/).at(-1)];
+    } catch { continue; } // exited meanwhile
+    const hit = names.find((n) => n && patterns.some((re) => re.test(n)));
+    if (hit) return hit;
+  }
+  return null;
+}
+
+// "0-3,8" <-> [0, 1, 2, 3, 8], the kernel's CPU list format.
+export const parseCpuList = (s) => String(s).trim().split(',').filter(Boolean).flatMap((r) => {
+  const [a, b = a] = r.split('-').map(Number);
+  return Array.from({ length: b - a + 1 }, (_, i) => a + i);
+});
+export const formatCpuList = (cpus) => cpus.reduce((runs, c) => {
+  const last = runs.at(-1);
+  if (last && c === last[1] + 1) last[1] = c; else runs.push([c, c]);
+  return runs;
+}, []).map(([a, b]) => (a === b ? `${a}` : `${a}-${b}`)).join(',');
+
+// The CPUs this process may use and, on a hybrid CPU, its performance and efficiency classes among them.
+// Linux exposes hybrid classes as /sys/devices/cpu_core/cpus and cpu_atom/cpus; without those, CPUs whose maximum
+// frequency is below 80% of the fastest count as efficiency cores (small per-core boost differences stay one class).
+// Anywhere else every usable CPU is one class: classes is null.
+export function machineCpus({ sys = '/sys', status = '/proc/self/status' } = {}) {
+  const read = (f) => { try { return readFileSync(f, 'utf8').trim(); } catch { return ''; } };
+  const listed = /^Cpus_allowed_list:\s*(\S+)/m.exec(read(status));
+  const allowed = listed ? parseCpuList(listed[1]) : Array.from({ length: availableParallelism() }, (_, i) => i);
+  let performance = parseCpuList(read(join(sys, 'devices/cpu_core/cpus'))), efficiency = parseCpuList(read(join(sys, 'devices/cpu_atom/cpus')));
+  if (!performance.length || !efficiency.length) {
+    let freqs = [];
+    try {
+      freqs = readdirSync(join(sys, 'devices/system/cpu')).flatMap((d) => {
+        const m = /^cpu(\d+)$/.exec(d), f = m && Number(read(join(sys, 'devices/system/cpu', d, 'cpufreq/cpuinfo_max_freq')));
+        return f > 0 ? [[Number(m[1]), f]] : [];
+      });
+    } catch { /* no sysfs */ }
+    const top = Math.max(0, ...freqs.map(([, f]) => f));
+    performance = freqs.filter(([, f]) => f >= 0.8 * top).map(([c]) => c);
+    efficiency = freqs.filter(([, f]) => f < 0.8 * top).map(([c]) => c);
+  }
+  const usable = new Set(allowed);
+  performance = performance.filter((c) => usable.has(c)).sort((a, b) => a - b);
+  efficiency = efficiency.filter((c) => usable.has(c)).sort((a, b) => a - b);
+  return { allowed, classes: performance.length && efficiency.length ? { performance, efficiency } : null };
+}
+let cpuCache;
+const cpusNow = () => (cpuCache ??= machineCpus());
+
+// The CPUs a gate runs on for cfg.gateCpus. `restricted` is false when the gate may use every usable CPU;
+// `warning` says why a requested restriction does not apply (no such class here, no usable CPU in the list).
+export function gateCpuSet(spec, { allowed, classes }) {
+  if (spec === 'all') return { cpus: allowed, restricted: false };
+  const cpus = spec === 'performance' || spec === 'efficiency' ? classes?.[spec] : parseCpuList(spec).filter((c) => allowed.includes(c));
+  if (!cpus?.length) return { cpus: allowed, restricted: false, warning: classes || !['performance', 'efficiency'].includes(spec) ? `no usable CPU in gateCpus ${spec}` : `gateCpus ${spec}: this machine shows one CPU class` };
+  return { cpus, restricted: cpus.length < allowed.length };
+}
+let tasksetOk;
+const hasTaskset = () => (tasksetOk ??= spawnSync('taskset', ['-V'], { stdio: 'ignore' }).status === 0);
+let cpuWarned = false;
+
+export function cpusLine(cfg, cpus = cpusNow()) {
+  const g = gateCpuSet(cfg.gateCpus, cpus);
+  const classes = cpus.classes ? `performance ${formatCpuList(cpus.classes.performance)}, efficiency ${formatCpuList(cpus.classes.efficiency)}` : 'one class';
+  return `usable ${formatCpuList(cpus.allowed)} (${classes}), gate cpus ${formatCpuList(g.cpus)} (${cfg.gateCpus}${g.warning ? `: ${g.warning}` : ''})`;
+}
+
 // Runs `gate` after admission, holding machine-wide slots (cfg.gateCost; a light gate, cost 0, takes none while load
 // and memory allow, so a short gate never queues behind long ones), optionally with a private TMPDIR that is removed
 // afterwards (a full test suite can fill a small tmpfs /tmp). Admission is rechecked on every slot poll, so a
@@ -642,17 +741,23 @@ export const slotsInUse = (dir) => {
 // owner-only file. Returns { status, stdout, stderr, start, end, durationMs, peakLoad, peakRssMiB }; the peaks are
 // sampled every few seconds while the gate runs (peakRssMiB: the gate's whole process tree, null without /proc).
 export async function runGate(gate, cwd, cfg, deps = {}) {
-  const { dir = slotDir(), pause = sleep, log = logStderr, metrics = machineMetrics } = deps;
+  const { dir = slotDir(), pause = sleep, log = logStderr, metrics = machineMetrics, busy = () => busyProcess(cfg.busyProcessPatterns), cpus = cpusNow() } = deps;
   const w = {};
-  let release, logged = false;
+  let release, logged = false, slots;
   const cost = cfg.gateCost ?? 1;
   for (;;) {
     const admitted = await admit(cfg, deps, w);
+    slots = cfg.gateSlots;
     // After an expired resource wait even a light gate takes the one slot, like any other gate.
     if (cost === 0 && admitted === 'ok') { release = Object.assign(() => {}, { adopt() {} }); break; }
-    const slots = admitted === 'expired' ? 1 : cfg.gateSlots;
-    if ((release = acquireSlots(dir, slots, Math.max(1, cost)))) break;
-    if (!logged) { logged = true; log({ event: 'waiting_for_gate_slot', slots, inUse: slotsInUse(dir) }); }
+    if (admitted === 'expired') slots = 1;
+    // A busy workload lowers the limit for new admissions only: running gates keep their slots, and a new one
+    // waits until the slots in use, its own included, fit the lower limit (0: no slot-taking gate starts meanwhile).
+    const busyName = busy();
+    if (busyName) slots = Math.min(slots, cfg.gateSlotsWhenBusy ?? slots);
+    const fits = !busyName || slotsInUse(dir) + Math.min(Math.max(1, cost), slots) <= slots;
+    if (slots > 0 && fits && (release = acquireSlots(dir, slots, Math.max(1, cost)))) break;
+    if (!logged) { logged = true; log({ event: 'waiting_for_gate_slot', slots, inUse: slotsInUse(dir), ...(busyName ? { busy: busyName } : {}) }); }
     await pause(SLOT_POLL);
   }
   deps.admitted?.();
@@ -660,6 +765,14 @@ export async function runGate(gate, cwd, cfg, deps = {}) {
   try {
     const env = { ...process.env };
     if (cfg.gateTmpdir) env.TMPDIR = tmp = scratch(cfg, 'prloop-gate-');
+    // The gate's CPUs (cfg.gateCpus, pinned with taskset) and a worker budget, its share of them, for sizing test workers.
+    const set = gateCpuSet(cfg.gateCpus ?? 'all', cpus);
+    let pin = set.restricted, warning = set.warning;
+    if (pin && !(deps.taskset ?? hasTaskset)()) { pin = false; warning = 'taskset is not available: the gate runs on every usable CPU'; }
+    const gateCpus = pin ? set.cpus : cpus.allowed;
+    if (warning && !cpuWarned) { cpuWarned = true; log({ event: 'gate_cpus_unsupported', gateCpus: cfg.gateCpus, reason: warning }); }
+    env.PRLOOP_GATE_CPUS = formatCpuList(gateCpus);
+    env.PRLOOP_GATE_WORKERS = String(Math.max(1, Math.floor(gateCpus.length * Math.min(Math.max(1, cost), slots) / Math.max(1, slots))));
     if (deps.logFile) out = openSync(deps.logFile, 'w', 0o600);
     let gatePid, peakLoad = 0, peakRss = null;
     const sample = () => {
@@ -671,7 +784,8 @@ export async function runGate(gate, cwd, cfg, deps = {}) {
     sampler = setInterval(sample, 2e3);
     sampler.unref();
     const start = new Date();
-    const r = await spawnAsync('sh', ['-c', `(${gate}) 2>&1`], cwd, { env, onSpawn, out });
+    const shell = ['sh', '-c', `(${gate}) 2>&1`];
+    const r = await (pin ? spawnAsync('taskset', ['-c', formatCpuList(gateCpus), ...shell], cwd, { env, onSpawn, out }) : spawnAsync(shell[0], shell.slice(1), cwd, { env, onSpawn, out }));
     const end = new Date();
     sample();
     const run = { start: start.toISOString(), end: end.toISOString(), durationMs: end - start, peakLoad: Number(peakLoad.toFixed(2)),
@@ -701,10 +815,12 @@ export function treeRss(pid) {
   return mine.length ? mine.reduce((n, [, , rss]) => n + rss * 4096, 0) : null;
 }
 
-export function machineLine(cfg, { metrics = machineMetrics, dir = slotDir() } = {}) {
+export function machineLine(cfg, { metrics = machineMetrics, dir = slotDir(), busy = () => busyProcess(cfg.busyProcessPatterns) } = {}) {
   const m = metrics();
   const { maxLoad, minFreeMem } = limits(cfg, m);
-  return `load ${m.load.toFixed(2)} (max ${maxLoad.toFixed(2)}, ${m.cores} cores), free memory ${gib(m.freeMem)} GiB (min ${gib(minFreeMem)} GiB), gate slots ${slotsInUse(dir)}/${cfg.gateSlots} in use`;
+  const busyName = busy();
+  const limit = busyName && cfg.gateSlotsWhenBusy < cfg.gateSlots ? `, limit ${cfg.gateSlotsWhenBusy} for new heavy gates while ${busyName} runs` : '';
+  return `load ${m.load.toFixed(2)} (max ${maxLoad.toFixed(2)}, ${m.cores} cores), free memory ${gib(m.freeMem)} GiB (min ${gib(minFreeMem)} GiB), gate slots ${slotsInUse(dir)}/${cfg.gateSlots} in use${limit}`;
 }
 
 // ---------- local checkout gate ----------
@@ -2345,7 +2461,7 @@ export async function main(argv) {
     Object.assign(opts, { generated: repoFile.generated ?? [], regenerate: repoFile.regenerate, approvedRegenerate: machine.approvedRegenerate });
     // The repository file names the method; merging itself still needs an explicit --merge.
     if (opts.merge === 'repo') opts.merge = repoFile.merge ?? (() => { throw new Error('--merge repo needs "merge" in .prloop.json'); })();
-    if (cmd === 'run' && opts.status) { reconcileStates(opts.repo); return out({ machine: machineLine(cfg), tmp: tmpLine(cfg), ...runStatus(opts.repo) }, 0); }
+    if (cmd === 'run' && opts.status) { reconcileStates(opts.repo); return out({ machine: machineLine(cfg), cpus: cpusLine(cfg), tmp: tmpLine(cfg), ...runStatus(opts.repo) }, 0); }
     if (cmd === 'run' || cmd === 'ready') {
       const c = selfCheck(SCRIPT_DIR);
       if (c?.warning && (opts.requireCurrent || process.env.PRLOOP_REQUIRE_CURRENT === '1')) return out({ verdict: 'error', error: c.warning }, EXIT.error);
