@@ -1899,8 +1899,10 @@ export function checkWorktree(cwd, s) {
   return null;
 }
 
-export function findWorktree(branch, cwd) {
-  const list = tryGit(['worktree', 'list', '--porcelain'], cwd) ?? '';
+// `gitDir` is the repository's Git common directory, resolved once at startup, so a removed starting directory
+// (a merged PR's worktree cleaned up mid-batch) does not hide the other worktrees.
+export function findWorktree(branch, gitDir) {
+  const list = (gitDir && tryGit(['--git-dir', gitDir, 'worktree', 'list', '--porcelain'], gitDir)) ?? '';
   for (const block of list.split('\n\n')) {
     const wt = /^worktree (.+)$/m.exec(block)?.[1];
     if (wt && block.split('\n').includes(`branch refs/heads/${branch}`)) return wt;
@@ -1918,6 +1920,9 @@ const TERMINAL = new Set(['merged', 'closed', 'merge_pending', 'clean', 'blocked
 export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.now } = {}) {
   const repo = opts.repo;
   const prs = String(opts.pr).split(',').map(Number);
+  const startDir = process.cwd();
+  const gitDir = opts.worktree ? null : tryGit(['rev-parse', '--path-format=absolute', '--git-common-dir'], startDir);
+  let startGone = false;
   const deadline = Date.now() + cfg.deadline;
   const { maxAgents, maxRounds } = cfg;
   mkdirSync(stateDir(), { recursive: true });
@@ -2034,7 +2039,8 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     // The worktree is found before classifying: an abbreviated reviewed commit resolves in its object database.
     try {
       raw = fetchPr(repo, st.pr);
-      cwd = opts.worktree ? resolve(opts.worktree) : findWorktree(raw.headRefName, process.cwd());
+      if (!opts.worktree && !startGone && !existsSync(startDir)) { startGone = true; logStderr({ event: 'start_dir_removed', dir: startDir, gitDir }); }
+      cwd = opts.worktree ? resolve(opts.worktree) : findWorktree(raw.headRefName, gitDir);
       s = classify(raw, { ...cfg, cwd }, now()); st.failures = 0;
     } catch (e) {
       if ((st.failures = (st.failures ?? 0) + 1) >= 3) block(st, `GitHub read failed: ${String(e.stderr || e.message).slice(0, 300)}`);
