@@ -43,7 +43,8 @@ A repository declares its own gate in `.prloop.json` at its root, so a coordinat
 
 ```json
 { "gate": "npm run check", "gateWeight": "heavy", "union": ["CHANGELOG.md"], "merge": "squash", "reviewBeforeGate": true,
-  "generated": ["src/generated/**"], "regenerate": "npm run generate" }
+  "generated": ["src/generated/**"], "regenerate": "npm run generate",
+  "docsGate": "npm run check:docs", "docsPaths": ["docs/**", "*.md"] }
 ```
 
 | Key | |
@@ -54,10 +55,16 @@ A repository declares its own gate in `.prloop.json` at its root, so a coordinat
 | `generated` | Globs of generated files, in addition to files that `.gitattributes` marks `linguist-generated` on either side. |
 | `regenerate` | A command, or a list of commands run in order, that rebuilds the generated files (an empty list or a blank command is rejected). With it, `sync` [resolves conflicts limited to generated files itself](#syncing-with-the-base). |
 | `gateIrrelevant` | Globs of paths whose changes do not affect the gate (for example `["docs/**", "*.md"]`). `run --merge` accepts a [self-reported pass](#gate-logs-and-pass-provenance) only on a head whose diff from a prloop-run pass of the same gate touches nothing else; a changed submodule or `.prloop.json` never counts as irrelevant, and the list is read from the checked-out head each time. Unset means every path counts. |
+| `docsGate` | A cheaper command (`docsPaths` required too) that `prloop` runs instead of `gate` on a docs-only change. See [docs-only gate](#docs-only-gate). |
+| `docsPaths` | Globs of documentation paths (for example `["docs/**", "*.md"]`). |
 | `merge` | The merge method used by `run --merge repo`. Merging itself still needs that explicit flag. |
 | `reviewBeforeGate` | [Pipelined review](#pipelined-review); defaults to on for a declared heavy gate (`heavy` or a slot count of 1 or more), off otherwise. `--review-before-gate true\|false`, `PRLOOP_REVIEW_BEFORE_GATE`. |
 
 `prloop` reads the file of the repository that holds the current directory (or `--worktree` for `run`); unknown keys or wrong types are a usage error (exit 40). A flag overrides the environment, which overrides the file.
+
+### Docs-only gate
+
+With `docsGate` and `docsPaths`, prloop picks the gate per PR head: when every path the PR changes since its merge base with the base branch (GitHub's base commit, else `origin/<base>`) matches `docsPaths`, `ready`, `status`, local reviews and `run` use `docsGate` instead of `gate`, as a light gate (no slot). The diff lists renames as a delete plus an add, so moving a code file into a docs path still needs the full gate, and so does a deleted code file. Anything else runs the full gate: any other path, a changed submodule or `.prloop.json`, an empty change, or no reachable merge base. The [gate cache](#one-full-gate-per-head) is keyed by the command that ran, so a docs pass never counts as a full pass. `ready` and `status` report `gateKind` (`docs` or `full`), and `lastGate` names the `gateKind` and `gate` command that ran.
 
 ### Pipelined review
 
