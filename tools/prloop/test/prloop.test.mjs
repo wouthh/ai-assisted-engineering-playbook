@@ -2253,19 +2253,21 @@ test('run never reports clean while GitHub mergeability is UNKNOWN: it polls, th
 
 // A PR with one unresolved finding and a fake `claude` whose JSON wrapper reports error_max_turns and no result line.
 // With `resolves`, the agent resolves the thread (real progress) before its session ends.
-async function runNoResultAgent(t, resolves, { body, extra = {}, cmd = 'claude' } = {}) {
+async function runNoResultAgent(t, resolves, { body, extra = {}, cmd = 'claude', pr = fixture(), after } = {}) {
   const state = tempState(t);
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   r.run(r.work, 'push', '-q', 'origin', 'feat');
   const head = r.run(r.work, 'rev-parse', 'HEAD');
   writeFileSync(join(state, 'heads.json'), JSON.stringify({ 'example-org/example-repo#7': { sha: head, at: at('09:00') } }));
-  const pr = fixture();
   Object.assign(pr, { headRefName: 'feat', headRefOid: head, mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE' });
-  pr.reviewThreads.nodes.push(thread('T1', at('10:20')));
+  if (!after) pr.reviewThreads.nodes.push(thread('T1', at('10:20')));
   fakeGh(t, r.dir, pr);
-  const done = { ...pr, reviewThreads: { ...pr.reviewThreads, nodes: [{ ...thread('T1', at('10:20')), isResolved: true }] } };
-  request(done).reactions.nodes.push({ content: 'THUMBS_UP', createdAt: at('10:30'), user: BOT });
+  let done = after?.(pr);
+  if (!done) {
+    done = { ...pr, reviewThreads: { ...pr.reviewThreads, nodes: [{ ...thread('T1', at('10:20')), isResolved: true }] } };
+    request(done).reactions.nodes.push({ content: 'THUMBS_UP', createdAt: at('10:30'), user: BOT });
+  }
   const reply = JSON.stringify({ data: { viewer: { login: 'example-dev' }, repository: { mergeCommitAllowed: true, squashMergeAllowed: true, rebaseMergeAllowed: true, pullRequest: done } } });
   writeFileSync(join(r.dir, 'done.json'), reply);
   writeFileSync(join(r.dir, 'bin', cmd), `#!/bin/sh
@@ -2277,6 +2279,19 @@ ${body ?? `echo '{"type":"result","subtype":"error_max_turns","is_error":true,"r
   const [res] = await runAll({ repo: 'example-org/example-repo', pr: '7', worktree: r.work, deadline: '1h' }, { ...cfg, interval: 1, ...extra }, { metrics: idle().metrics });
   return { res, r };
 }
+
+test('run counts an automatic review that started during the agent as progress', async (t) => {
+  const pr = fixture();
+  pr.comments.nodes = pr.comments.nodes.filter((c) => c.id !== 'IC_req'); // nothing requested yet
+  const { res, r } = await runNoResultAgent(t, true, {
+    pr, extra: { deadline: 3000 },
+    after: (base) => ({ ...base, reactions: { nodes: [{ content: 'EYES', createdAt: new Date().toISOString(), user: BOT }] } }), // the PR-body eyes, fresh
+    body: `echo '{"status":"nothing_to_do","head":"x","fixed":[],"disputed":[],"reason":"the request is already covered"}'`,
+  });
+  assert.ok(existsSync(join(r.dir, 'token')), 'the agent ran');
+  assert.notEqual(res.verdict, 'blocked', JSON.stringify(res));
+  assert.doesNotMatch(JSON.stringify(runStatus('example-org/example-repo')), /no progress/);
+});
 
 test('run keeps a successful agent\'s reason, such as a proposed prloop issue, in the run log', async (t) => {
   const { res } = await runNoResultAgent(t, true, { body: `echo '{"status":"requested","head":"x","fixed":["T1"],"disputed":[],"reason":"proposed prloop issue: status stale"}'` });
