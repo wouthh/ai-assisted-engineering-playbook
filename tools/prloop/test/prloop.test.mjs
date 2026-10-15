@@ -1495,7 +1495,7 @@ test('the fix prompt carries only the trigger data and the contract', () => {
   const p = buildPrompt({ repo: 'example-org/example-repo', pr: 7, branch: 'feat/x', head: 'abc123', cwd: '/work/x', trigger: 'findings',
     findings: [{ id: 'T1', path: 'src/a.js', line: 3, body: '**<sub>![P1 Badge](https://img.shields.io/badge/P1-orange)</sub> P1 Off by one**\n\nUseful? React with a thumb.' }], gate: 'npm test', requestBody: '@codex review' });
   for (const part of ['PR #7 in example-org/example-repo', 'branch feat/x', 'head abc123', 'worktree /work/x', 'Trigger: findings',
-    '- T1 src/a.js:3 P1 Off by one', 'runs the gate (npm test)', 'reusing exactly:\n@codex review', '"status":"requested|blocked|nothing_to_do"',
+    '- T1 src/a.js:3 P1 Off by one', 'runs the gate (npm test)', 'reusing exactly:\n@codex review', '"status":"requested|fixed|blocked|nothing_to_do"',
     'Never wait for or poll reviews', 'on its own last line, always, also when you stop early or are blocked',
     'report "blocked" with the exact refused step or missing tool named', 'leave the work as it is',
     'plain separate `git add <paths>`, `git commit` and `git push` commands, never chained into one command and never `git add -A`',
