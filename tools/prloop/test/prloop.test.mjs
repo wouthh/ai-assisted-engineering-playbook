@@ -1333,16 +1333,18 @@ test('a gate\'s whole process tree stops when prloop is killed with SIGKILL', as
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const pidFile = join(dir, 'grandchild');
   const script = `const { runGate, config } = await import(${JSON.stringify(new URL('../prloop.mjs', import.meta.url).href)});
-await runGate(${JSON.stringify(`sleep 30 & echo "$!" > "${pidFile}"; wait`)}, ${JSON.stringify(dir)},
+await runGate(${JSON.stringify(`sleep 30 & p=$!; sleep 1; echo "$p" > "${pidFile}"; wait`)}, ${JSON.stringify(dir)},
   { ...config({}, {}), gateCost: 0 }, { metrics: () => ({ load: 0, cores: 8, freeMem: 2 ** 34, totalMem: 2 ** 35 }) });`;
   const p = spawn(process.execPath, ['--input-type=module', '-e', script], { stdio: 'ignore' });
   const exited = new Promise((done) => p.on('exit', (code, sig) => done(sig)));
-  for (let i = 0; i < 100 && !existsSync(pidFile); i++) await new Promise((r) => setTimeout(r, 20));
+  // The gate announces its pid a second late, so prloop has registered the group with the watcher before the SIGKILL.
+  for (let i = 0; i < 500 && !existsSync(pidFile); i++) await new Promise((r) => setTimeout(r, 20));
   const pid = Number(readFileSync(pidFile, 'utf8').trim());
   p.kill('SIGKILL');
   assert.equal(await exited, 'SIGKILL');
   let gone = false;
-  for (let i = 0; i < 100 && !gone; i++) { await new Promise((r) => setTimeout(r, 20)); try { process.kill(pid, 0); } catch { gone = true; } }
+  // Up to 10s: on a loaded machine the watcher can take well over 2s to see the pipe close and signal the group.
+  for (let i = 0; i < 500 && !gone; i++) { await new Promise((r) => setTimeout(r, 20)); try { process.kill(pid, 0); } catch { gone = true; } }
   assert.ok(gone, 'the watcher stops the orphaned gate group');
 });
 
