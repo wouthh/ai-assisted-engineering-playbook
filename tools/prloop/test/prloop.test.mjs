@@ -32,6 +32,29 @@ test('pending request without bot signals keeps waiting', () => {
   assert.equal(s.readyToRequest, false);
 });
 
+test('a pending review tells standalone callers to wait but tells fix agents the request is covered', (t) => {
+  const saved = process.env.PRLOOP_LOCK_TOKEN;
+  t.after(() => { if (saved === undefined) delete process.env.PRLOOP_LOCK_TOKEN; else process.env.PRLOOP_LOCK_TOKEN = saved; });
+  const reviewing = () => { // an automatic review in progress: no request comment, an eyes reaction on the head
+    const pr = fixture();
+    pr.comments.nodes = pr.comments.nodes.filter((c) => c.id !== 'IC_req');
+    pr.reactions = { nodes: [{ content: 'EYES', createdAt: at('10:05'), user: BOT }] };
+    return pr;
+  };
+  for (const make of [fixture, reviewing]) {
+    delete process.env.PRLOOP_LOCK_TOKEN;
+    const alone = classify(make(), cfg, NOW);
+    assert.equal(alone.verdict, 'pending');
+    assert.match(alone.reasons.join('\n'), /run `prloop wait` instead/);
+    process.env.PRLOOP_LOCK_TOKEN = 'agent-token';
+    const agent = classify(make(), cfg, NOW);
+    assert.equal(agent.verdict, 'pending');
+    assert.equal(agent.readyToRequest, false);
+    assert.doesNotMatch(agent.reasons.join('\n'), /prloop wait/);
+    assert.match(agent.reasons.join('\n'), /already covered, nothing to post/);
+  }
+});
+
 test('clean via thumbs-up on the current request', () => {
   const pr = fixture();
   request(pr).reactions.nodes.push({ content: 'THUMBS_UP', createdAt: at('10:20'), user: BOT });
