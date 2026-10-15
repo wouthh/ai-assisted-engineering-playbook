@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import {
   EXIT, OUTPUT_TAIL, main, errorFrame, reviewerEvents, recordReviewerEvents, reviewerDecision, approvedFor, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, permissionDenied, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, sweepTmp, tmpLine, reclaimTmp, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, recordEvent, saveState, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, gateProvenance, treeRss, recordGatePass, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, reconcileStates, syncBranch, unionLines, unionResult, waitFor,
-  MERGEABILITY_WAIT, gateFor, limits, busyProcess, machineCpus, gateCpuSet, gateLauncher, cpusLine, parseCpuList, formatCpuList,
+  MERGEABILITY_WAIT, gateFor, limits, busyProcess, machineCpus, gateCpuSet, gateLauncher, cpusLine, parseCpuList, formatCpuList, lowImpactRound, severeFinding,
 } from '../prloop.mjs';
 
 const pick = (o, keys) => Object.fromEntries(keys.map((k) => [k, o[k]]));
@@ -2578,6 +2578,64 @@ test('run keeps finding PR worktrees after the directory it started in is remove
   const [res] = await runP;
   assert.equal(res.verdict, 'blocked', JSON.stringify(res));
   assert.match(res.reason, /has uncommitted changes/);
+});
+
+test('low-impact rounds: counted only when every finding is fixed, none disputed, and none labelled P0 or P1', () => {
+  const v = { findings: [{ id: 'T1', body: 'P3: Rename the helper' }, { id: 'T2', body: 'P2 Badge: stale term in docs' }] };
+  const ok = { lowImpact: true, fixed: ['T1', 'T2'], disputed: [] };
+  assert.equal(lowImpactRound(0, v, ok), 1);
+  assert.equal(lowImpactRound(1, v, ok), 2);
+  assert.equal(lowImpactRound(1, v, { ...ok, lowImpact: false }), 0);
+  assert.equal(lowImpactRound(1, v, { ...ok, fixed: ['T1'] }), 0); // one left unfixed
+  assert.equal(lowImpactRound(1, v, { ...ok, disputed: ['T2'] }), 0);
+  assert.equal(lowImpactRound(1, { findings: [...v.findings, { id: 'T3', body: '![P1 Badge] Data loss on retry' }] }, { ...ok, fixed: ['T1', 'T2', 'T3'] }), 0); // the label vetoes the agent's claim
+  assert.equal(lowImpactRound(1, { verdict: 'gate_failed' }, ok), 0); // only findings rounds count
+  assert.equal(severeFinding([{ body: 'P0: secret in log' }]), true);
+  assert.equal(severeFinding([{ body: 'P10 is not a label' }]), false);
+  const t = { pr: 7, repo: 'o/n', trigger: 'findings', findings: v.findings, requestBody: '@codex review' };
+  assert.match(buildPrompt(t), /fix every instance of it in the repository in this round/);
+  assert.match(buildPrompt(t), /"lowImpact":false,"lowImpactReason"/);
+  assert.doesNotMatch(buildPrompt(t), /low-impact early merge/);
+  assert.match(buildPrompt({ ...t, lowImpactPrior: true }), /skip this step and report status "fixed" with "lowImpact": true/);
+  assert.equal(parseAgentResult('{"status":"fixed","head":"x","fixed":["T1"],"lowImpact":true}').status, 'fixed');
+});
+
+test('run merges after a second low-impact round once the gate passes, without another review', async (t) => {
+  const state = tempState(t);
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  writeFileSync(join(state, 'heads.json'), JSON.stringify({ 'example-org/example-repo#7': { sha: head, at: at('09:00') } }));
+  // The previous round was low impact.
+  writeFileSync(join(state, 'example-org__example-repo__7.json'), JSON.stringify({ repo: 'example-org/example-repo', pr: 7, rounds: 1, seen: {}, lowImpactStreak: 1 }));
+  const pr = fixture();
+  Object.assign(pr, { headRefName: 'feat', headRefOid: head, mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE' });
+  pr.reviewThreads.nodes.push(thread('T1', at('10:20'), 'P3: Rename the helper to match the docs'));
+  const calls = fakeGh(t, r.dir, pr);
+  // The agent fixes the nit, pushes, resolves the thread and skips the review request.
+  writeFileSync(join(r.dir, 'bin', 'claude'), `#!/bin/sh
+echo "$@" > "${r.dir}/prompt"
+echo renamed > app.txt && git add app.txt && git commit -qm rename && git push -q origin feat
+new=$(git rev-parse HEAD)
+node -e 'const fs = require("fs"), f = process.argv[1], j = JSON.parse(fs.readFileSync(f, "utf8")); const p = j.data.repository.pullRequest; p.headRefOid = process.argv[2]; p.reviewThreads.nodes = []; fs.writeFileSync(f, JSON.stringify(j));' "${r.dir}/pr.json" "$new"
+echo "{\\"status\\":\\"fixed\\",\\"head\\":\\"$new\\",\\"fixed\\":[\\"T1\\"],\\"disputed\\":[],\\"lowImpact\\":true,\\"lowImpactReason\\":\\"naming nit\\"}"
+`, { mode: 0o755 });
+  const [res] = await runAll({ repo: 'example-org/example-repo', pr: '7', worktree: r.work, merge: 'squash', deadline: '1h' }, { ...cfg, gate: 'true', gateCost: 0, interval: 1 }, { metrics: idle().metrics });
+  const fixed = r.run(r.work, 'rev-parse', 'HEAD');
+  assert.equal(res.verdict, 'merged', JSON.stringify(res));
+  assert.match(res.reason, /remaining external review .* was skipped as low impact \(naming nit\)/);
+  assert.match(readFileSync(join(r.dir, 'prompt'), 'utf8'), /low-impact early merge/);
+  const log = calls();
+  assert.ok(log.some((c) => c.startsWith('pr merge 7') && c.includes(`--match-head-commit ${fixed}`)), log.join('\n'));
+  assert.ok(log.some((c) => c.startsWith('pr comment 7') && /low-impact early merge/.test(c)), 'the merge comment says the review was skipped');
+  assert.ok(!log.some((c) => c.includes('@codex review')), 'no review request');
+  assert.equal(gatePassed('true', r.work), fixed); // prloop gated the fixed head itself
+  const phases = runStatus('example-org/example-repo', 50).prs[0].events.map((e) => e.phase);
+  assert.ok(phases.includes('merged_low_impact'), phases.join());
+  // Without --merge, or with --low-impact-merge false, the agent is never told to skip the request.
+  assert.equal(config({ lowImpactMerge: 'false' }, {}).lowImpactMerge, false);
+  assert.equal(config({}, {}).lowImpactMerge, true);
 });
 
 test('run skips a locked worktree before judging its checkout: the holder\'s uncommitted edit does not block', async (t) => {

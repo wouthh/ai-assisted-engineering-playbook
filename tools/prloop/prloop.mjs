@@ -50,6 +50,8 @@ Options (flag or env):
   --agent claude|codex|none PRLOOP_AGENT           fix agent and local reviewer; --model, --effort
   --agent-timeout <dur>     PRLOOP_AGENT_TIMEOUT   default: 90m of work (gate queueing not counted); kills the agent
   --gate-weight <w>         PRLOOP_GATE_WEIGHT     light (skips the slot queue while load allows), heavy, or a slot count
+  --low-impact-merge <b>    PRLOOP_LOW_IMPACT_MERGE  default: true; with --merge, merge after two consecutive low-impact
+                                                   fix rounds once the gate passes, without another review
   --review-before-gate <b>  PRLOOP_REVIEW_BEFORE_GATE  true: request the review first, run the gate in parallel
                                                    default: true for a declared heavy gate
 
@@ -251,6 +253,8 @@ export function config(opts, env = process.env, { machine = {}, repo = {} } = {}
     interval: parseDuration(opts.interval ?? env.PRLOOP_INTERVAL ?? '75s', 'interval'),
     deadline: parseDuration(opts.deadline ?? '6h', 'deadline'),
     maxRounds: positiveInt('max-rounds', opts.maxRounds ?? 6),
+    // Low-impact early merge (with --merge): see lowImpactRound.
+    lowImpactMerge: bool('low-impact-merge', opts.lowImpactMerge ?? env.PRLOOP_LOW_IMPACT_MERGE) ?? true,
     maxAgents: positiveInt('max-agents', opts.maxAgents ?? 2),
     gateSlots,
     // An absolute load average, or `<ratio>x`: that ratio of the CPUs this process may use (affinity, cpuset).
@@ -1777,6 +1781,19 @@ export const plain = (body) => String(body ?? '').replace(/\n+(AGENTS\.md refere
   .replace(/!\[[^\]]*\]\([^)]*\)/g, '').replace(/<[^>]+>/g, '').replace(/[*_`#>]/g, '').replace(/\s+/g, ' ').trim();
 
 // The fix agent sees only this trigger, never the round history.
+// Low-impact early merge. A findings round counts as low impact when the fix agent reports lowImpact, fixed every
+// finding of the round and disputed none, and no finding carries a P0 or P1 label (checked here, not trusted to the
+// agent). Two such rounds in a row on one PR: the second agent skips the review request (status "fixed"), and `run
+// --merge` merges its head after the gate passes there, without another external review (`merged_low_impact`).
+// Any other round resets the streak. Returns the new streak.
+export const severeFinding = (findings = []) => findings.some((f) => /\bP[01]\b/.test(f.body ?? ''));
+export function lowImpactRound(streak, v, result) {
+  const ids = (v.findings ?? []).map((f) => f.id);
+  const low = result?.lowImpact === true && ids.length > 0 && !severeFinding(v.findings) && !result.disputed?.length
+    && ids.every((id) => result.fixed?.includes(id));
+  return low ? (streak ?? 0) + 1 : 0;
+}
+
 export function buildPrompt(t) {
   const data = t.trigger === 'conflict' ? `Conflicted files: ${t.conflicts.join(', ')}${t.generated?.length ? `\nGenerated files among them (regenerate them from their sources after resolving the rest, never merge them by hand): ${t.generated.join(', ')}` : ''}
 Resolve them through prloop, never with a raw \`git rebase\` or \`git merge\`: run \`prloop sync ${t.pr} --continue\`, which leaves the conflicts in the working tree; resolve them there (remove every conflict marker and stage each resolution with \`git add\` or \`git rm\`), then run \`prloop sync ${t.pr} --continue\` again, which continues, regenerates generated files when the repository declares \`regenerate\`, commits and pushes. Repeat while it reports more conflicts.`
@@ -1785,9 +1802,10 @@ Resolve them through prloop, never with a raw \`git rebase\` or \`git merge\`: r
   // Neither the output nor its log path: the output may hold a secret, and the agent reads every referenced file.
   const failure = t.gateFailure ? `\nThe full gate failed on head ${t.gateFailure.head}; rerun its steps locally to find the failing one, and never quote a secret from their output` : '';
   const summary = t.summaries?.length ? `\nReviewer summary for this head (may hold findings that are not threads):\n${t.summaries.map(plain).join('\n').slice(0, 1500)}` : '';
-  const request = t.localReview
+  const request = (t.localReview
     ? 'Do not post a review request: prloop reviews this PR locally once `prloop ready` passes.'
-    : `Post the review request as a new PR comment, reusing exactly:\n${t.requestBody}`;
+    : `Post the review request as a new PR comment, reusing exactly:\n${t.requestBody}`)
+    + (t.lowImpactPrior ? ' Exception (low-impact early merge): the previous round on this PR was low impact. If every finding of this round is low impact as defined in step 7 and you fixed them all, skip this step and report status "fixed" with "lowImpact": true; prloop then merges after the gate passes on your head.' : '');
   // A local review needs the gate first, so its agent never defers it.
   const pipelined = t.reviewBeforeGate && !t.localReview;
   const ready = `prloop ready ${t.pr} --repo ${t.repo}${t.localReview ? ' --review-before-gate false' : ''}`;
@@ -1801,14 +1819,14 @@ ${data}${failure}${summary}
 
 Do these steps in order, in this session:
 1. Read only the referenced files plus every AGENTS.md that applies to them (root and nested).
-2. Fix each valid finding with a regression test. Reply with evidence on invalid findings and leave them unresolved, except a finding proven to misread AGENTS.md, which you resolve after the evidence reply once every AGENTS.md that applies to its path confirms it is invalid. Resolve conflicts.
+2. Fix each valid finding with a regression test. When a finding is about a pattern (a stale term, a renamed variable, a removed feature, a repeated mistake), fix every instance of it in the repository in this round, not only the flagged line, and say so in the thread reply. Reply with evidence on invalid findings and leave them unresolved, except a finding proven to misread AGENTS.md, which you resolve after the evidence reply once every AGENTS.md that applies to its path confirms it is invalid. Resolve conflicts.
 3. Run focused tests while fixing; never run the full project gate yourself: only \`prloop ready\` runs it, at most once per exact head. Use \`prloop mark-tested --gate "<cmd>"\` only immediately after that exact gate command passed on this exact head and clean tree, never for a later commit or another command: it records a self-reported pass, which a merge does not accept unless only gate-irrelevant files changed since a pass prloop ran. Commit and push with normal commits (run \`prloop sync ${t.pr}\` first if the base moved), as plain separate \`git add <paths>\`, \`git commit\` and \`git push\` commands, never chained into one command and never \`git add -A\`. Follow the repository's commit-message policy and never add co-author, generated-by or other attribution trailers.
 4. Resolve the threads you fixed; reply on the disputed ones.
 5. Gate: ${gate}. If it reports a gate failure, do not rerun \`prloop ready\` straight away: rerun the failing tests or step with their focused command, fix them (including failures you did not cause when they block the gate), commit and push, and call \`prloop ready\` again only when you are confident the full gate passes. At most 5 \`prloop ready\` calls; stop as blocked only if the same failure persists after 3 consecutive fix attempts, or the failure is environmental (missing tool, no network, permission denied), and report the exact failing step. If \`prloop ready\` fails for another reason, make one repair attempt, then stop as blocked.
 6. ${request}
 7. End your final message with this JSON on its own last line, always, also when you stop early or are blocked:
-{"status":"requested|blocked|nothing_to_do","head":"<sha>","fixed":["<thread ids>"],"disputed":["<thread ids>"],"reason":"<short>"}
-Use "blocked" with the reason when disputed findings remain unresolved.
+{"status":"requested|fixed|blocked|nothing_to_do","head":"<sha>","fixed":["<thread ids>"],"disputed":["<thread ids>"],"reason":"<short>","lowImpact":false,"lowImpactReason":"<short>"}
+Use "blocked" with the reason when disputed findings remain unresolved. Set "lowImpact": true, with a short "lowImpactReason", only when every finding of this round was low impact (wording, docs, test names, nits; never a correctness, security, data-loss, migration, money or permission finding) and you fixed them all; otherwise false.
 
 Run \`prloop ready\` and any long test command in the foreground with a timeout of at least ${minutes} minutes. Never background a command; if one is backgrounded anyway, wait for it to finish before ending your turn. Your final message must end with the JSON status line.
 If prloop itself misbehaves (wrong status, refused sync, missed review signal, misleading docs), never patch the installed prloop and never file an issue in another repository yourself: put the proposed prloop issue (observed and expected behaviour, a fixture-test idea, no project-specific details) in "reason", and the coordinator files it when authorized.
@@ -1845,7 +1863,7 @@ export function parseAgentResult(text) {
   for (const m of [...body.matchAll(/\{[^{}]*"status"[^{}]*\}/g)].reverse()) {
     try {
       const r = JSON.parse(m[0]);
-      if (['requested', 'blocked', 'nothing_to_do'].includes(r?.status)) return { fixed: [], disputed: [], ...r };
+      if (['requested', 'fixed', 'blocked', 'nothing_to_do'].includes(r?.status)) return { fixed: [], disputed: [], ...r };
     } catch { /* keep looking */ }
   }
   return null;
@@ -2148,7 +2166,8 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
       if (repeated.length) return block(st, 'the same finding came back after two fixes', 'decide whether the finding is valid');
     }
     const gate = gateFor(cfg, cwd, s).gate;
-    const t = { ...v, repo, pr: st.pr, branch: s.branch, head: s.head, cwd, gate, agentTimeout: cfg.agentTimeout, reviewBeforeGate: cfg.reviewBeforeGate, localReview: cfg.mode === 'local' || !!v.localReview, requestBody: s.rerequestBody };
+    const lowImpactPrior = !!(opts.merge && cfg.lowImpactMerge && st.lowImpactStreak >= 1 && v.findings?.length && !severeFinding(v.findings));
+    const t = { ...v, repo, pr: st.pr, branch: s.branch, head: s.head, cwd, gate, agentTimeout: cfg.agentTimeout, reviewBeforeGate: cfg.reviewBeforeGate, localReview: cfg.mode === 'local' || !!v.localReview, requestBody: s.rerequestBody, lowImpactPrior };
     const prompt = buildPrompt(t);
     if (cfg.agent === 'none') return event(st, 'needs_agent', { verdict: v.verdict, prompt, next: 'spawn an agent with this prompt, then rerun prloop run',
       ...(v.conflicts?.length ? { reason: `conflicts with ${s.base}: ${v.conflicts.join(', ')}` } : {}) });
@@ -2182,6 +2201,9 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
       return event(st, 'needs_human', { status: result.status, reason: `disputed findings: ${result.disputed.join(', ')}`, next: 'decide the disputed threads' });
     }
     if (result.status === 'blocked') return fail(`agent: ${result.reason ?? 'blocked'}`);
+    st.lowImpactStreak = lowImpactRound(st.lowImpactStreak, v, result);
+    st.lowImpactMerge = lowImpactPrior && st.lowImpactStreak >= 2 && result.status === 'fixed' && result.head
+      ? { head: result.head, reason: String(result.lowImpactReason ?? '').slice(0, 300) } : undefined;
     if (!progressed()) return fail(`agent made no progress (${result.status}): no commit, resolved thread, request or gate${result.reason ? ` (agent: ${result.reason})` : ''}`);
     // A successful agent's reason may hold a proposed prloop issue: keep it in the run log for the coordinator.
     if (result.reason) logEvent(st, { phase: 'agent_reason', status: result.status, reason: String(result.reason).slice(0, 2000), agentLog });
@@ -2217,6 +2239,36 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     if (v.verdict === 'synced') return event(st, 'polling', { verdict: 'synced', head: v.head });
     if (v.verdict === 'conflict') return slot() && fix(st, s, cwd, { verdict: 'conflict', trigger: 'conflict', conflicts: v.conflicts, generated: v.generated });
     return v;
+  }
+
+  // Merges a head that passed every merge check (a clean review, or a low-impact early merge `low`).
+  function mergeNow(st, s, raw, cwd, slot, low) {
+    if (s.mergeable !== 'MERGEABLE') return s.mergeable === 'UNKNOWN' ? undefined : block(st, `GitHub reports mergeable=${s.mergeable}`);
+    const merge = () => sh('gh', ['pr', 'merge', String(st.pr), '--repo', repo, `--${opts.merge}`, '--match-head-commit', s.head]);
+    try { merge(); } catch (e) {
+      // GitHub refuses a rebase merge of a branch with merge commits even when it reports the PR clean:
+      // linearize it once (the new head then needs the gate again) or, when there is nothing to linearize, retry once.
+      // Any other refusal (API failure, permissions, rulesets) blocks: a linearizing force-push cannot fix it.
+      const why = String(e.stderr || e.message).trim().slice(0, 300);
+      if (opts.merge !== 'rebase' || st.mergeRetried || !/merge commits?|can(?:no|')t be rebased/i.test(why)) return block(st, `GitHub refused the merge: ${why}`);
+      st.mergeRetried = true;
+      logEvent(st, { phase: 'merge_refused', reason: `${why}; syncing (linearize) and retrying once` });
+      const v = syncPr(st, s, raw, cwd, slot, true);
+      if (v?.verdict !== 'up_to_date') return v;
+      try { merge(); } catch (e2) { return block(st, `GitHub refused the merge again: ${String(e2.stderr || e2.message).trim().slice(0, 300)}`); }
+    }
+    const after = classify(fetchPr(repo, st.pr), { ...cfg, cwd });
+    // A merge queue or auto-merge accepts the command without merging yet: report the real state.
+    if (after.state === 'MERGED' && low) {
+      // The merge comment and the summary say that the remaining review was skipped as low impact.
+      const note = `Merged by prloop's low-impact early merge: two consecutive review rounds held only low-impact findings, all fixed; the remaining external review of ${s.head} was skipped as low impact${low.reason ? ` (${low.reason})` : ''}.`;
+      try { sh('gh', ['pr', 'comment', String(st.pr), '--repo', repo, '--body', note]); } catch { /* the merge stands; the event below records it */ }
+      st.lowImpactMerge = undefined;
+      logEvent(st, { phase: 'merged_low_impact', reason: note });
+      return event(st, 'merged', { mergeCommit: after.mergeCommit, reason: note });
+    }
+    return after.state === 'MERGED' ? event(st, 'merged', { mergeCommit: after.mergeCommit })
+      : event(st, 'merge_pending', { reason: `state ${after.state} after merge`, next: 'a merge queue or auto-merge holds the PR; verify later' });
   }
 
   async function step(st) {
@@ -2267,6 +2319,19 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     // A later pass of the same gate on this head (an agent's `prloop ready` after a flaky failure) supersedes the failure.
     if (st.gateFailure?.head === s.head && gated(s.head)) st.gateFailure = undefined;
     const gateFailure = cfg.reviewBeforeGate && st.gateFailure?.head === s.head ? st.gateFailure : undefined;
+    // Low-impact early merge: the fix agent's head merges once prloop's own gate passes on it, without a new review.
+    // New threads, a new head, a failed gate or a missing worktree fall back to the normal review flow.
+    if (st.lowImpactMerge) {
+      const li = st.lowImpactMerge;
+      if (li.head !== s.head || !opts.merge || !cwd || s.unresolvedThreads.length || st.gateFailure?.head === s.head || ['findings', 'requested_while_unresolved'].includes(s.verdict)) {
+        st.lowImpactMerge = undefined;
+        logSaved(st, { phase: 'low_impact_merge_dropped', reason: `head ${short(s.head)} no longer qualifies; back to the normal review flow` });
+      } else {
+        const missing = localGate(s, cwd, cfg.gate);
+        if (missing.length || (cfg.gate && !gateProvenance(cfg.gate, cwd)?.ok)) return gateNow(st, s, cwd, !missing.length);
+        return mergeNow(st, s, raw, cwd, slot, li);
+      }
+    }
     const d = reviewerDecision(raw, s, cfg, now(), repo.split('/')[0]);
     // While the reviewer is quota-blocked (auto), no fix agent posts a request: it reviews locally instead.
     const quotaLocal = cfg.mode === 'auto' && !!d?.blockedAt;
@@ -2329,24 +2394,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
         logEvent(st, { phase: 'gate_unverified', reason: `the gate pass on ${short(s.head)} was not run by prloop; rerunning it before merging` });
         return gateNow(st, s, cwd, true);
       }
-      if (s.mergeable !== 'MERGEABLE') return s.mergeable === 'UNKNOWN' ? undefined : block(st, `GitHub reports mergeable=${s.mergeable}`);
-      const merge = () => sh('gh', ['pr', 'merge', String(st.pr), '--repo', repo, `--${opts.merge}`, '--match-head-commit', s.head]);
-      try { merge(); } catch (e) {
-        // GitHub refuses a rebase merge of a branch with merge commits even when it reports the PR clean:
-        // linearize it once (the new head then needs the gate again) or, when there is nothing to linearize, retry once.
-        // Any other refusal (API failure, permissions, rulesets) blocks: a linearizing force-push cannot fix it.
-        const why = String(e.stderr || e.message).trim().slice(0, 300);
-        if (opts.merge !== 'rebase' || st.mergeRetried || !/merge commits?|can(?:no|')t be rebased/i.test(why)) return block(st, `GitHub refused the merge: ${why}`);
-        st.mergeRetried = true;
-        logEvent(st, { phase: 'merge_refused', reason: `${why}; syncing (linearize) and retrying once` });
-        const v = syncPr(st, s, raw, cwd, slot, true);
-        if (v?.verdict !== 'up_to_date') return v;
-        try { merge(); } catch (e2) { return block(st, `GitHub refused the merge again: ${String(e2.stderr || e2.message).trim().slice(0, 300)}`); }
-      }
-      const after = classify(fetchPr(repo, st.pr), { ...cfg, cwd });
-      // A merge queue or auto-merge accepts the command without merging yet: report the real state.
-      return after.state === 'MERGED' ? event(st, 'merged', { mergeCommit: after.mergeCommit })
-        : event(st, 'merge_pending', { reason: `state ${after.state} after merge`, next: 'a merge queue or auto-merge holds the PR; verify later' });
+      return mergeNow(st, s, raw, cwd, slot);
     }
     if (!cwd) return block(st, `no worktree has ${s.branch} checked out; pass --worktree`);
     if (!slot()) return;
