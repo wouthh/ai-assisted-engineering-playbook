@@ -3903,6 +3903,8 @@ test('gateCpus resolves to a class or a list, and falls back to every usable CPU
   assert.match(gateCpuSet('performance', flat).warning, /one CPU class/);
   assert.equal(gateCpuSet('performance', flat).restricted, false);
   assert.match(gateCpuSet('9-10', flat).warning, /no usable CPU/);
+  assert.deepEqual(parseCpuList('3,0-3,2-1'), [0, 1, 2, 3]); // overlaps and duplicates name one set
+  assert.deepEqual(gateCpuSet('0-3,0-3', flat), { cpus: [0, 1, 2, 3], restricted: false }); // every usable CPU: no pinning
   const c = config({}, {}, { machine: { gateCpus: 'efficiency' } });
   assert.equal(cpusLine(c, hybrid), 'usable 0-7 (performance 0-3, efficiency 4-7), gate cpus 4-7 (efficiency)');
   assert.equal(cpusLine(config({}, {}), flat), 'usable 0-3 (one class), gate cpus 0-3 (all)');
@@ -3955,6 +3957,11 @@ test('a busy workload lowers the gate slots for new admissions only', async (t) 
   // A light gate keeps skipping the slot queue while the workload runs.
   const light = await runGate('echo ran', dir, { ...c, gateCost: 0 }, { ...idle(), dir, busy: () => 'game' });
   assert.equal(light.stdout.trim(), 'ran');
+  // A two-slot gate keeps its cost: it waits for the workload instead of starting on one slot.
+  let busy2 = 'game';
+  const z = idle();
+  await runGate('true', dir, { ...c, gateCost: 2 }, { ...z, dir, busy: () => busy2, pause: async (ms) => { z.clock.t += ms; if (z.clock.t >= 10e3) busy2 = null; } });
+  assert.ok(z.clock.t >= 10e3, `started at ${z.clock.t}`);
   // gateSlotsWhenBusy 0: no slot-taking gate starts while the workload runs.
   const zero = { ...c, gateSlotsWhenBusy: 0 };
   let busy = 'game';
