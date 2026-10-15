@@ -1846,6 +1846,8 @@ class GuidanceConsistencyTests(unittest.TestCase):
             with self.subTest(path=path):
                 text = (ROOT / path).read_text(encoding="utf-8")
                 self.assertIn("Run 6-8 working agents at a time by default, with at most 2 heavy gates at once", text)
+                self.assertIn("That target is a machine-wide total across all work", text)
+                self.assertIn("each batch capped by its own `--max-agents`", text)
                 self.assertRegex(text, r"Go beyond that only when the user asks, and then add agents one at a time while watching load[^\n]*free memory[^\n]*CPU temperature")
                 self.assertIn("A lower limit set by the user takes precedence", text)
         root = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
