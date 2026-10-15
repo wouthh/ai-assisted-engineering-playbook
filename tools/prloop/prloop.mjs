@@ -676,10 +676,11 @@ export function busyProcess(patterns, proc = '/proc') {
 }
 
 // "0-3,8" <-> [0, 1, 2, 3, 8], the kernel's CPU list format.
-export const parseCpuList = (s) => String(s).trim().split(',').filter(Boolean).flatMap((r) => {
+// Sorted and without duplicates, so overlapping ranges ("0-3,2-5") compare as the set they name.
+export const parseCpuList = (s) => [...new Set(String(s).trim().split(',').filter(Boolean).flatMap((r) => {
   const [a, b = a] = r.split('-').map(Number);
-  return Array.from({ length: b - a + 1 }, (_, i) => a + i);
-});
+  return Array.from({ length: Math.max(0, b - a + 1) }, (_, i) => a + i);
+}))].sort((x, y) => x - y);
 export const formatCpuList = (cpus) => cpus.reduce((runs, c) => {
   const last = runs.at(-1);
   if (last && c === last[1] + 1) last[1] = c; else runs.push([c, c]);
@@ -755,7 +756,8 @@ export async function runGate(gate, cwd, cfg, deps = {}) {
     // waits until the slots in use, its own included, fit the lower limit (0: no slot-taking gate starts meanwhile).
     const busyName = busy();
     if (busyName) slots = Math.min(slots, cfg.gateSlotsWhenBusy ?? slots);
-    const fits = !busyName || slotsInUse(dir) + Math.min(Math.max(1, cost), slots) <= slots;
+    // A multi-slot gate keeps its full cost: one that needs more than the lower limit waits for the workload to end.
+    const fits = !busyName || slotsInUse(dir) + Math.max(1, cost) <= slots;
     if (slots > 0 && fits && (release = acquireSlots(dir, slots, Math.max(1, cost)))) break;
     if (!logged) { logged = true; log({ event: 'waiting_for_gate_slot', slots, inUse: slotsInUse(dir), ...(busyName ? { busy: busyName } : {}) }); }
     await pause(SLOT_POLL);
