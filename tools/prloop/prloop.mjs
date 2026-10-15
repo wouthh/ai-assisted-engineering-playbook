@@ -452,9 +452,11 @@ export function classify(pr, cfg, nowMs = Date.now()) {
 
   const reasons = [];
   if (threads.length) reasons.push(`${threads.length} unresolved threads: ${threads.map((t) => t.id).join(', ')}`);
-  if (verdict === 'pending') reasons.push(current
-    ? `review already requested on head ${short(head)} (comment ${triggerNode.databaseId}); run \`prloop wait\` instead`
-    : `reviewer is already reviewing head ${short(head)}; run \`prloop wait\` instead`);
+  // A fix agent (spawned by `prloop run`, which carries PRLOOP_LOCK_TOKEN) must not wait: `run` waits for it.
+  if (verdict === 'pending') reasons.push((current
+    ? `review already requested on head ${short(head)} (comment ${triggerNode.databaseId})`
+    : `reviewer is already reviewing head ${short(head)}`)
+    + (process.env.PRLOOP_LOCK_TOKEN ? '; the request is already covered, nothing to post' : '; run `prloop wait` instead'));
   if (reviewer === 'clean') reasons.push(`head ${short(head)} is already reviewed clean${carried && signals.at(-1).at === headTime ? ` (carried from ${short(carried.from)}: unchanged patch-id)` : ''}`);
 
   return {
