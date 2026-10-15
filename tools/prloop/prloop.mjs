@@ -76,8 +76,8 @@ reviewerBackoff):
   --resource-wait <dur>     PRLOOP_RESOURCE_WAIT   default: 30m, then proceed with one slot only
   --gate-tmpdir <dir>       PRLOOP_GATE_TMPDIR     run each gate and agent with a private TMPDIR under <dir>
   Machine file only: busyProcessPatterns (regexes for process names, such as a game) and gateSlotsWhenBusy (the
-  gate slots for new admissions while one runs, default gateSlots); gateCpus all|performance|efficiency|<list> pins
-  gates to those CPUs (taskset), and every gate gets PRLOOP_GATE_CPUS and PRLOOP_GATE_WORKERS. maxLoad may be a
+  gate slots for new admissions while one runs, default gateSlots); gateCpus inherit|all|performance|efficiency|<list> runs
+  gates on those CPUs (taskset, or a systemd user scope to leave a narrower cpuset), and every gate gets PRLOOP_GATE_CPUS and PRLOOP_GATE_WORKERS. maxLoad may be a
   ratio of the usable CPUs, such as "0.75x".
 
 Exit codes: 0 clean/ok/merged, 10 findings, 20 not_requested, 21 requested_while_unresolved, 22 not_tested,
@@ -127,9 +127,9 @@ const nonnegativeInt = (name, v) => {
   if (!/^\d+$/.test(String(v)) || !Number.isSafeInteger(Number(v))) throw new Error(`${name} must be a nonnegative integer, not ${v}`);
   return Number(v);
 };
-const gateCpusSpec = (v = 'all') => {
-  if (['all', 'efficiency', 'performance'].includes(v) || /^\d+(-\d+)?(,\d+(-\d+)?)*$/.test(v)) return v;
-  throw new Error(`gateCpus must be all, efficiency, performance or a CPU list such as 8-15, not ${v}`);
+const gateCpusSpec = (v = 'inherit') => {
+  if (['inherit', 'all', 'efficiency', 'performance'].includes(v) || /^\d+(-\d+)?(,\d+(-\d+)?)*$/.test(v)) return v;
+  throw new Error(`gateCpus must be inherit, all, efficiency, performance or a CPU list such as 8-15, not ${v}`);
 };
 
 // Binary units: 512M, 4G, 4GiB or plain bytes.
@@ -687,14 +687,16 @@ export const formatCpuList = (cpus) => cpus.reduce((runs, c) => {
   return runs;
 }, []).map(([a, b]) => (a === b ? `${a}` : `${a}-${b}`)).join(',');
 
-// The CPUs this process may use and, on a hybrid CPU, its performance and efficiency classes among them.
-// Linux exposes hybrid classes as /sys/devices/cpu_core/cpus and cpu_atom/cpus; without those, CPUs whose maximum
-// frequency is below 80% of the fastest count as efficiency cores (small per-core boost differences stay one class).
-// Anywhere else every usable CPU is one class: classes is null.
+// The CPUs this process may use (its affinity, within its cgroup's cpuset), the CPUs online on the machine, and on a
+// hybrid CPU the performance and efficiency classes among the online ones. Linux exposes hybrid classes as
+// /sys/devices/cpu_core/cpus and cpu_atom/cpus; without those, CPUs whose maximum frequency is below 80% of the fastest
+// count as efficiency cores (small per-core boost differences stay one class). Anywhere else classes is null.
 export function machineCpus({ sys = '/sys', status = '/proc/self/status' } = {}) {
   const read = (f) => { try { return readFileSync(f, 'utf8').trim(); } catch { return ''; } };
   const listed = /^Cpus_allowed_list:\s*(\S+)/m.exec(read(status));
   const allowed = listed ? parseCpuList(listed[1]) : Array.from({ length: availableParallelism() }, (_, i) => i);
+  const onlineList = parseCpuList(read(join(sys, 'devices/system/cpu/online')));
+  const online = onlineList.length ? onlineList : allowed;
   let performance = parseCpuList(read(join(sys, 'devices/cpu_core/cpus'))), efficiency = parseCpuList(read(join(sys, 'devices/cpu_atom/cpus')));
   if (!performance.length || !efficiency.length) {
     let freqs = [];
@@ -705,33 +707,62 @@ export function machineCpus({ sys = '/sys', status = '/proc/self/status' } = {})
       });
     } catch { /* no sysfs */ }
     const top = Math.max(0, ...freqs.map(([, f]) => f));
-    performance = freqs.filter(([, f]) => f >= 0.8 * top).map(([c]) => c);
-    efficiency = freqs.filter(([, f]) => f < 0.8 * top).map(([c]) => c);
+    performance = freqs.filter(([, f]) => f >= 0.8 * top).map(([c]) => c).sort((a, b) => a - b);
+    efficiency = freqs.filter(([, f]) => f < 0.8 * top).map(([c]) => c).sort((a, b) => a - b);
   }
-  const usable = new Set(allowed);
-  performance = performance.filter((c) => usable.has(c)).sort((a, b) => a - b);
-  efficiency = efficiency.filter((c) => usable.has(c)).sort((a, b) => a - b);
-  return { allowed, classes: performance.length && efficiency.length ? { performance, efficiency } : null };
+  const up = new Set(online);
+  performance = performance.filter((c) => up.has(c));
+  efficiency = efficiency.filter((c) => up.has(c));
+  return { allowed, online, classes: performance.length && efficiency.length ? { performance, efficiency } : null };
 }
 let cpuCache;
 const cpusNow = () => (cpuCache ??= machineCpus());
 
-// The CPUs a gate runs on for cfg.gateCpus. `restricted` is false when the gate may use every usable CPU;
-// `warning` says why a requested restriction does not apply (no such class here, no usable CPU in the list).
-export function gateCpuSet(spec, { allowed, classes }) {
-  if (spec === 'all') return { cpus: allowed, restricted: false };
-  const cpus = spec === 'performance' || spec === 'efficiency' ? classes?.[spec] : parseCpuList(spec).filter((c) => allowed.includes(c));
-  if (!cpus?.length) return { cpus: allowed, restricted: false, warning: classes || !['performance', 'efficiency'].includes(spec) ? `no usable CPU in gateCpus ${spec}` : `gateCpus ${spec}: this machine shows one CPU class` };
-  return { cpus, restricted: cpus.length < allowed.length };
+// The CPUs a gate should run on for cfg.gateCpus: `inherit` (the default) keeps this process's own CPUs; `all`,
+// `performance`, `efficiency` and lists name online CPUs, which may lie outside this process's cpuset. `warning` says
+// why a requested set does not apply (no such class here, no online CPU in the list); the gate then inherits.
+export function gateCpuSet(spec, { allowed, online = allowed, classes }) {
+  if (spec === 'inherit') return { cpus: allowed };
+  const cpus = spec === 'all' ? online : spec === 'performance' || spec === 'efficiency' ? classes?.[spec] : parseCpuList(spec).filter((c) => online.includes(c));
+  if (!cpus?.length) return { cpus: allowed, warning: classes || !['performance', 'efficiency'].includes(spec) ? `no online CPU in gateCpus ${spec}` : `gateCpus ${spec}: this machine shows one CPU class` };
+  return { cpus };
+}
+
+// How a gate is started on `cpus`: as is when they are this process's own CPUs; under `taskset -c` when they are a
+// subset; otherwise in a new transient systemd user scope with AllowedCPUs (a cgroup cpuset cannot be widened from
+// inside, and taskset alone cannot leave it), plus taskset, since a moved process keeps its old affinity mask.
+// `systemd-run --scope` executes the command in its own process, so the gate keeps its PID and process group. The scope
+// is probed once per CPU set, by reading the affinity a probe gets; when it fails (no systemd user manager, no cpuset
+// delegation, an old systemd-run) the gate inherits this process's CPUs and the result carries a warning.
+const SCOPE = (list) => ['systemd-run', '--user', '--scope', '--quiet', '--expand-environment=no', '-p', `AllowedCPUs=${list}`, '--', 'taskset', '-c', list];
+const scopeProbes = new Map();
+export const scopeWorks = (list) => {
+  if (!scopeProbes.has(list)) {
+    const [cmd, ...args] = SCOPE(list);
+    const r = spawnSync(cmd, [...args, 'sh', '-c', 'grep Cpus_allowed_list /proc/self/status'], { encoding: 'utf8', timeout: 10e3, stdio: ['ignore', 'pipe', 'ignore'] });
+    const got = /Cpus_allowed_list:\s*(\S+)/.exec(r.stdout ?? '')?.[1];
+    scopeProbes.set(list, r.status === 0 && !!got && formatCpuList(parseCpuList(got)) === list);
+  }
+  return scopeProbes.get(list);
+};
+export function gateLauncher(set, allowed, { taskset = hasTaskset, scope = scopeWorks } = {}) {
+  const list = formatCpuList(set.cpus), mine = new Set(allowed);
+  if (list === formatCpuList(allowed)) return { cpus: allowed, prefix: [], via: 'inherited', warning: set.warning };
+  if (set.cpus.every((c) => mine.has(c))) {
+    return taskset() ? { cpus: set.cpus, prefix: ['taskset', '-c', list], via: 'taskset' }
+      : { cpus: allowed, prefix: [], via: 'inherited', warning: 'taskset is not available: the gate runs on this process\'s CPUs' };
+  }
+  return scope(list) ? { cpus: set.cpus, prefix: SCOPE(list), via: 'systemd-run scope' }
+    : { cpus: allowed, prefix: [], via: 'inherited', warning: `a systemd user scope with AllowedCPUs=${list} did not take effect: the gate runs on this process's CPUs` };
 }
 let tasksetOk;
 const hasTaskset = () => (tasksetOk ??= spawnSync('taskset', ['-V'], { stdio: 'ignore' }).status === 0);
 let cpuWarned = false;
 
-export function cpusLine(cfg, cpus = cpusNow()) {
-  const g = gateCpuSet(cfg.gateCpus, cpus);
+export function cpusLine(cfg, cpus = cpusNow(), deps = {}) {
+  const g = gateLauncher(gateCpuSet(cfg.gateCpus, cpus), cpus.allowed, deps);
   const classes = cpus.classes ? `performance ${formatCpuList(cpus.classes.performance)}, efficiency ${formatCpuList(cpus.classes.efficiency)}` : 'one class';
-  return `usable ${formatCpuList(cpus.allowed)} (${classes}), gate cpus ${formatCpuList(g.cpus)} (${cfg.gateCpus}${g.warning ? `: ${g.warning}` : ''})`;
+  return `usable ${formatCpuList(cpus.allowed)} of online ${formatCpuList(cpus.online ?? cpus.allowed)} (${classes}), gate cpus ${formatCpuList(g.cpus)} (${cfg.gateCpus}, ${g.via}${g.warning ? `: ${g.warning}` : ''})`;
 }
 
 // Runs `gate` after admission, holding machine-wide slots (cfg.gateCost; a light gate, cost 0, takes none while load
@@ -768,11 +799,8 @@ export async function runGate(gate, cwd, cfg, deps = {}) {
     const env = { ...process.env };
     if (cfg.gateTmpdir) env.TMPDIR = tmp = scratch(cfg, 'prloop-gate-');
     // The gate's CPUs (cfg.gateCpus, pinned with taskset) and a worker budget, its share of them, for sizing test workers.
-    const set = gateCpuSet(cfg.gateCpus ?? 'all', cpus);
-    let pin = set.restricted, warning = set.warning;
-    if (pin && !(deps.taskset ?? hasTaskset)()) { pin = false; warning = 'taskset is not available: the gate runs on every usable CPU'; }
-    const gateCpus = pin ? set.cpus : cpus.allowed;
-    if (warning && !cpuWarned) { cpuWarned = true; log({ event: 'gate_cpus_unsupported', gateCpus: cfg.gateCpus, reason: warning }); }
+    const launch = gateLauncher(gateCpuSet(cfg.gateCpus ?? 'inherit', cpus), cpus.allowed, deps), gateCpus = launch.cpus;
+    if (launch.warning && !cpuWarned) { cpuWarned = true; log({ event: 'gate_cpus_unsupported', gateCpus: cfg.gateCpus, reason: launch.warning }); }
     env.PRLOOP_GATE_CPUS = formatCpuList(gateCpus);
     env.PRLOOP_GATE_WORKERS = String(Math.max(1, Math.floor(gateCpus.length * Math.min(Math.max(1, cost), slots) / Math.max(1, slots))));
     if (deps.logFile) out = openSync(deps.logFile, 'w', 0o600);
@@ -787,7 +815,8 @@ export async function runGate(gate, cwd, cfg, deps = {}) {
     sampler.unref();
     const start = new Date();
     const shell = ['sh', '-c', `(${gate}) 2>&1`];
-    const r = await (pin ? spawnAsync('taskset', ['-c', formatCpuList(gateCpus), ...shell], cwd, { env, onSpawn, out }) : spawnAsync(shell[0], shell.slice(1), cwd, { env, onSpawn, out }));
+    const [cmd, ...args] = [...launch.prefix, ...shell];
+    const r = await spawnAsync(cmd, args, cwd, { env, onSpawn, out });
     const end = new Date();
     sample();
     const run = { start: start.toISOString(), end: end.toISOString(), durationMs: end - start, peakLoad: Number(peakLoad.toFixed(2)),
