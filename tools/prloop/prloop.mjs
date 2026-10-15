@@ -1978,7 +1978,8 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     const progressed = () => {
       const after = classify(fetchPr(repo, st.pr), { ...cfg, cwd });
       return after.head !== s.head || after.unresolvedThreads.length < s.unresolvedThreads.length
-        || after.trigger?.id !== s.trigger?.id || (!testedBefore && tested(after.head));
+        || after.trigger?.id !== s.trigger?.id || (!testedBefore && tested(after.head))
+        || after.reviewerState.state !== s.reviewerState?.state; // e.g. an automatic review started meanwhile
     };
     if (!result) {
       const reason = agentFailure(r.final);
