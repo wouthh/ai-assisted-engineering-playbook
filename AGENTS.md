@@ -49,6 +49,7 @@ Policy: `implementation-review-loop-v1`. Follow [project onboarding](docs/projec
 - `prloop` (see [the review wait loop](docs/review-wait-loop.md)) runs the gate-request-wait cycle: preferably one background `prloop run` per set of PRs with `prloop run --status` check-ins; manually, `prloop ready` (runs the gate and marks the head tested) before requesting, then `prloop wait` instead of polling.
 - Start `prloop run` as a direct background job of your own shell so its exit notifies you, always with a `--deadline`. Never supervise it through a detached process plus a `pgrep -f` watcher, which can match itself and never exit.
 - After a tool failure (an agent crash, timeout, missing tool or permission, not real review rounds), read the agent log named in the event and clear that PR's state file before rerunning, instead of spending `prloop reset-rounds`.
+- Subagents sharing a coordinator's scratch directory work only in their own `mktemp -d` directory under its `agents/` (see [task-end cleanup](docs/implementation-loop.md#task-end-cleanup)); agent counts and gate slots follow [the review wait loop](docs/review-wait-loop.md).
 - Incorrect findings need evidence before resolution; ambiguous or disputed security findings remain open. Use bounded waits and an exact-head handoff when review is unavailable.
 - Leave clean PRs for human review unless GitHub merging is explicitly authorized. Never self-approve or bypass repository requirements.
 
