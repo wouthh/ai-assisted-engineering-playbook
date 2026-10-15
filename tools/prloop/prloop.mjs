@@ -2323,7 +2323,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     // New threads, a new head, a failed gate or a missing worktree fall back to the normal review flow.
     if (st.lowImpactMerge) {
       const li = st.lowImpactMerge;
-      if (li.head !== s.head || !opts.merge || !cwd || s.unresolvedThreads.length || st.gateFailure?.head === s.head || ['findings', 'requested_while_unresolved'].includes(s.verdict)) {
+      if (li.head !== s.head || !opts.merge || !cfg.lowImpactMerge || !cwd || s.unresolvedThreads.length || st.gateFailure?.head === s.head || ['findings', 'requested_while_unresolved'].includes(s.verdict)) {
         st.lowImpactMerge = undefined;
         logSaved(st, { phase: 'low_impact_merge_dropped', reason: `head ${short(s.head)} no longer qualifies; back to the normal review flow` });
       } else {

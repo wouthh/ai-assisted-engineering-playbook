@@ -27,7 +27,7 @@ Run up to 6-8 working agents at a time by default, with at most 2 heavy gates at
 - **No duplicate requests.** `ready` refuses while a request on the current head is still running; a request becomes repeatable only after it times out.
 - **No infinite loops.** The optional `prloop run` supervisor stops with a `blocked` reason on a round limit (6 by default; at the cap the coordinator judges the remaining findings by real impact, merges low-risk leftovers as deferred, or resets the rounds once with `prloop reset-rounds` for important defects before handing over to a human), an overall deadline, an agent that makes no progress or reports a permission denial, or the same finding returning after two fixes.
 
-Merging remains a separate, explicitly authorized step. `prloop run --merge` only merges a clean current head that GitHub reports mergeable, pinned with `--match-head-commit`.
+Merging remains a separate, explicitly authorized step. `prloop run --merge` only merges a current head that GitHub reports mergeable, pinned with `--match-head-commit`, and gated by prloop: a head reviewed clean, or the fixed head of a [low-impact early merge](../tools/prloop/README.md#low-impact-early-merge), where two consecutive findings rounds held only low-impact findings, all fixed, and no further external review is requested. `--low-impact-merge false` keeps the clean-review requirement.
 
 ## Origin
 
