@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import {
   EXIT, OUTPUT_TAIL, main, errorFrame, reviewerEvents, recordReviewerEvents, reviewerDecision, approvedFor, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, permissionDenied, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, sweepTmp, tmpLine, reclaimTmp, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, recordEvent, saveState, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, gateProvenance, treeRss, recordGatePass, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, reconcileStates, syncBranch, unionLines, unionResult, waitFor,
-  MERGEABILITY_WAIT,
+  MERGEABILITY_WAIT, gateFor,
 } from '../prloop.mjs';
 
 const pick = (o, keys) => Object.fromEntries(keys.map((k) => [k, o[k]]));
@@ -3303,6 +3303,58 @@ test('treeRss sums the resident memory of a process and its children', async () 
   if (!existsSync('/proc/self/stat')) return assert.equal(rss, null);
   assert.ok(rss > 0);
   assert.equal(treeRss(deadPid()), null);
+});
+
+test('docs-only gate: runs docsGate only when every changed path matches docsPaths', async (t) => {
+  tempState(t);
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  const c = { ...cfg, gate: 'echo full', docsGate: 'echo docs', docsPaths: ['docs/**', '*.md'] };
+  const pr = () => ({ branch: 'feat', base: 'main', head: r.run(r.work, 'rev-parse', 'HEAD') });
+  const kind = () => gateFor(c, r.work, pr()).gateKind;
+  assert.equal(kind(), 'full'); // no change yet
+  mkdirSync(join(r.work, 'docs'));
+  r.commit('docs', { 'README.md': 'x\n', 'docs/a.md': 'y\n' });
+  assert.equal(kind(), 'docs');
+  assert.deepEqual(pick(gateFor(c, r.work, pr()), ['gate', 'gateCost']), { gate: 'echo docs', gateCost: 0 }); // light
+  assert.equal(gateFor({ ...c, docsGate: undefined }, r.work, pr()).gate, 'echo full'); // not configured
+  // The base moving on does not count: only the PR's own change since the merge base.
+  divergeOnMain(r, { 'other.txt': 'main\n' });
+  r.run(r.work, 'merge', '-q', '--no-edit', 'origin/main');
+  assert.equal(kind(), 'docs');
+  // ready runs the docs gate, caches it under its own command, and names it.
+  const deps = { ...idle(), dir: join(r.dir, 'slots') };
+  const g = await readyGate(pr(), c, r.work, deps);
+  assert.deepEqual(pick(g.run, ['gateKind', 'gate', 'status']), { gateKind: 'docs', gate: 'echo docs', status: 0 });
+  assert.equal(gatePassed('echo docs', r.work), pr().head);
+  assert.notEqual(gatePassed('echo full', r.work), pr().head);
+  // A mixed change takes the full gate.
+  r.commit('code', { 'app.txt': 'changed\n' });
+  assert.equal(kind(), 'full');
+  assert.equal((await readyGate(pr(), c, r.work, deps)).run.gateKind, 'full');
+  // A rename from code into docs counts its source path too, and a deletion of code counts: full gate.
+  const docsOnly = r.run(r.work, 'rev-parse', 'HEAD~1');
+  r.run(r.work, 'reset', '-q', '--hard', docsOnly);
+  r.run(r.work, 'mv', 'app.txt', 'docs/app.md');
+  r.run(r.work, 'commit', '-qm', 'move code into docs');
+  assert.equal(kind(), 'full');
+  r.run(r.work, 'reset', '-q', '--hard', docsOnly);
+  r.run(r.work, 'rm', '-q', 'app.txt');
+  r.run(r.work, 'commit', '-qm', 'delete code');
+  assert.equal(kind(), 'full');
+  r.run(r.work, 'reset', '-q', '--hard', docsOnly);
+  r.run(r.work, 'rm', '-q', 'docs/a.md');
+  r.run(r.work, 'commit', '-qm', 'delete docs');
+  assert.equal(kind(), 'docs');
+  // A changed .prloop.json never counts as docs, even when a glob matches it.
+  r.commit('widen', { '.prloop.json': '{}\n' });
+  assert.equal(gateFor({ ...c, docsPaths: ['**'] }, r.work, pr()).gateKind, 'full');
+  // Without a reachable base the full gate runs.
+  assert.equal(gateFor(c, r.work, { ...pr(), base: 'missing' }).gateKind, 'full');
+  writeFileSync(join(r.work, '.prloop.json'), JSON.stringify({ docsGate: 'make docs', docsPaths: ['docs/**'] }));
+  assert.deepEqual(pick(config({}, {}, { repo: repoConfig(r.work) }), ['docsGate', 'docsPaths']), { docsGate: 'make docs', docsPaths: ['docs/**'] });
+  writeFileSync(join(r.work, '.prloop.json'), JSON.stringify({ docsPaths: 'docs/**' }));
+  assert.throws(() => repoConfig(r.work), /docsPaths must be array/);
 });
 
 test('gate provenance: a self-reported pass counts for a merge only after gate-irrelevant changes from a prloop-run pass', async (t) => {
