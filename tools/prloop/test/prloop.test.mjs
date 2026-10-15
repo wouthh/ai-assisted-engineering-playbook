@@ -2558,6 +2558,28 @@ echo '{"status":"nothing_to_do","head":"${head}"}'
   assert.equal(res.verdict, 'merged', JSON.stringify(res));
 });
 
+test('run keeps finding PR worktrees after the directory it started in is removed', async (t) => {
+  tempState(t);
+  const r = gitRepo();
+  const start = join(r.dir, 'wt-start'), home = process.cwd();
+  t.after(() => { process.chdir(home); rmSync(r.dir, { recursive: true, force: true }); });
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  r.run(r.work, 'worktree', 'add', '-q', '-b', 'merged-pr', start);
+  const pr = fixture();
+  Object.assign(pr, { headRefName: 'feat', headRefOid: r.run(r.work, 'rev-parse', 'HEAD'), mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE' });
+  fakeGh(t, r.dir, pr);
+  writeFileSync(join(r.work, 'app.txt'), 'uncommitted\n'); // a found worktree blocks on this, a lost one on "no worktree"
+  const lock = takeLock(r.work, 'another supervisor'); // keeps the first poll non-terminal
+  t.after(() => lock.release());
+  process.chdir(start);
+  const runP = runAll({ repo: 'example-org/example-repo', pr: '7' }, { ...cfg, interval: 1, deadline: 2000 }, { metrics: idle().metrics });
+  rmSync(start, { recursive: true, force: true }); // the starting worktree is cleaned up mid-batch
+  lock.release();
+  const [res] = await runP;
+  assert.equal(res.verdict, 'blocked', JSON.stringify(res));
+  assert.match(res.reason, /has uncommitted changes/);
+});
+
 test('run skips a locked worktree before judging its checkout: the holder\'s uncommitted edit does not block', async (t) => {
   tempState(t);
   const r = gitRepo();

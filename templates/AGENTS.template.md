@@ -72,7 +72,7 @@ Keep `generated` (globs; `linguist-generated` files count too) and `regenerate` 
 
 ### Coordinator
 
-- Group ready PRs into one batch and start the supervisor once, as a direct background job of your own shell so its exit notifies you, always with a deadline: `prloop run --repo <owner/name> --pr <N,...> --max-agents 2 --deadline 6h &` (add `--gate "<full local gate>"` without a `.prloop.json`). Never supervise it through a detached process plus a `pgrep -f` watcher, which can match itself and never exit.
+- Group ready PRs into one batch and start the supervisor once, as a direct background job of your own shell so its exit notifies you, always with a deadline: `prloop run --repo <owner/name> --pr <N,...> --max-agents 2 --deadline 6h &` (add `--gate "<full local gate>"` without a `.prloop.json`), started from the repository's main checkout rather than a PR worktree that is removed after its merge. Never supervise it through a detached process plus a `pgrep -f` watcher, which can match itself and never exit.
 - Subagents you start with your own agent tooling may have a per-command time cap (such as 10 minutes). Their briefs must run long gates such as `prloop ready` as a background job and wait for it to exit, never in the foreground (the exception in the fix-agent step 5 below). Agents spawned by `prloop run` get a long shell timeout instead.
 - After a tool failure (an agent crash, timeout, missing tool or permission, not real review rounds), read the agent log named in the event and clear that PR's state file before rerunning, instead of spending `prloop reset-rounds`.
 - Check `prloop run --status --repo <owner/name>` only on a notification or every 20-30 minutes or more, never in a tight loop.
