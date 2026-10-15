@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import {
   EXIT, OUTPUT_TAIL, main, errorFrame, reviewerEvents, recordReviewerEvents, reviewerDecision, approvedFor, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, permissionDenied, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, sweepTmp, tmpLine, reclaimTmp, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, recordEvent, saveState, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, gateProvenance, treeRss, recordGatePass, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, reconcileStates, syncBranch, unionLines, unionResult, waitFor,
-  MERGEABILITY_WAIT, gateFor, limits, busyProcess, machineCpus, gateCpuSet, cpusLine, parseCpuList, formatCpuList,
+  MERGEABILITY_WAIT, gateFor, limits, busyProcess, machineCpus, gateCpuSet, gateLauncher, cpusLine, parseCpuList, formatCpuList,
 } from '../prloop.mjs';
 
 const pick = (o, keys) => Object.fromEntries(keys.map((k) => [k, o[k]]));
@@ -3876,12 +3876,13 @@ function fakeTree(t, files) {
 test('CPU classes: hybrid sysfs, frequency fallback, one class, and no sysfs at all', (t) => {
   assert.deepEqual(parseCpuList('0-3,8,10-11\n'), [0, 1, 2, 3, 8, 10, 11]);
   assert.equal(formatCpuList([0, 1, 2, 3, 8, 10, 11]), '0-3,8,10-11');
-  const hybrid = fakeTree(t, { 'sys/devices/cpu_core/cpus': '0-3\n', 'sys/devices/cpu_atom/cpus': '4-7\n', status: 'Name:\tnode\nCpus_allowed_list:\t0-7\n' });
+  const hybrid = fakeTree(t, { 'sys/devices/cpu_core/cpus': '0-3\n', 'sys/devices/cpu_atom/cpus': '4-7\n', 'sys/devices/system/cpu/online': '0-7\n', status: 'Name:\tnode\nCpus_allowed_list:\t0-7\n' });
   assert.deepEqual(machineCpus({ sys: join(hybrid, 'sys'), status: join(hybrid, 'status') }),
-    { allowed: [0, 1, 2, 3, 4, 5, 6, 7], classes: { performance: [0, 1, 2, 3], efficiency: [4, 5, 6, 7] } });
-  // Only the CPUs this process may use count: an affinity limited to one class leaves one class.
-  const pinned = fakeTree(t, { 'sys/devices/cpu_core/cpus': '0-3', 'sys/devices/cpu_atom/cpus': '4-7', status: 'Cpus_allowed_list:\t4-7\n' });
-  assert.deepEqual(machineCpus({ sys: join(pinned, 'sys'), status: join(pinned, 'status') }), { allowed: [4, 5, 6, 7], classes: null });
+    { allowed: [0, 1, 2, 3, 4, 5, 6, 7], online: [0, 1, 2, 3, 4, 5, 6, 7], classes: { performance: [0, 1, 2, 3], efficiency: [4, 5, 6, 7] } });
+  // A process confined to one class (a cpuset or affinity) still sees both classes among the online CPUs.
+  const confined = fakeTree(t, { 'sys/devices/cpu_core/cpus': '0-3', 'sys/devices/cpu_atom/cpus': '4-7', 'sys/devices/system/cpu/online': '0-7', status: 'Cpus_allowed_list:\t4-7\n' });
+  assert.deepEqual(machineCpus({ sys: join(confined, 'sys'), status: join(confined, 'status') }),
+    { allowed: [4, 5, 6, 7], online: [0, 1, 2, 3, 4, 5, 6, 7], classes: { performance: [0, 1, 2, 3], efficiency: [4, 5, 6, 7] } });
   const freq = (mhz) => Object.fromEntries(mhz.map((f, i) => [`sys/devices/system/cpu/cpu${i}/cpufreq/cpuinfo_max_freq`, `${f * 1000}\n`]));
   const slow = fakeTree(t, { ...freq([5000, 5000, 3500, 3500]), status: 'Cpus_allowed_list:\t0-3\n' });
   assert.deepEqual(machineCpus({ sys: join(slow, 'sys'), status: join(slow, 'status') }).classes, { performance: [0, 1], efficiency: [2, 3] });
@@ -3892,43 +3893,53 @@ test('CPU classes: hybrid sysfs, frequency fallback, one class, and no sysfs at 
   const bare = machineCpus({ sys: join(none, 'missing'), status: join(none, 'missing') });
   assert.equal(bare.classes, null);
   assert.ok(bare.allowed.length >= 1);
+  assert.deepEqual(bare.online, bare.allowed);
 });
 
-test('gateCpus resolves to a class or a list, and falls back to every usable CPU with a warning', () => {
-  const hybrid = { allowed: [0, 1, 2, 3, 4, 5, 6, 7], classes: { performance: [0, 1, 2, 3], efficiency: [4, 5, 6, 7] } };
-  const flat = { allowed: [0, 1, 2, 3], classes: null };
-  assert.deepEqual(gateCpuSet('all', hybrid), { cpus: hybrid.allowed, restricted: false });
-  assert.deepEqual(gateCpuSet('efficiency', hybrid), { cpus: [4, 5, 6, 7], restricted: true });
-  assert.deepEqual(gateCpuSet('2-3,9', flat), { cpus: [2, 3], restricted: true });
+test('gateCpus resolves to a class or a list and picks how the gate is started', () => {
+  const confined = { allowed: [4, 5, 6, 7], online: [0, 1, 2, 3, 4, 5, 6, 7], classes: { performance: [0, 1, 2, 3], efficiency: [4, 5, 6, 7] } };
+  const flat = { allowed: [0, 1, 2, 3], online: [0, 1, 2, 3], classes: null };
+  assert.deepEqual(gateCpuSet('inherit', confined), { cpus: [4, 5, 6, 7] });
+  assert.deepEqual(gateCpuSet('all', confined), { cpus: confined.online });
+  assert.deepEqual(gateCpuSet('performance', confined), { cpus: [0, 1, 2, 3] });
+  assert.deepEqual(gateCpuSet('2-3,9', flat), { cpus: [2, 3] });
   assert.match(gateCpuSet('performance', flat).warning, /one CPU class/);
-  assert.equal(gateCpuSet('performance', flat).restricted, false);
-  assert.match(gateCpuSet('9-10', flat).warning, /no usable CPU/);
+  assert.match(gateCpuSet('9-10', flat).warning, /no online CPU/);
   assert.deepEqual(parseCpuList('3,0-3,2-1'), [0, 1, 2, 3]); // overlaps and duplicates name one set
-  assert.deepEqual(gateCpuSet('0-3,0-3', flat), { cpus: [0, 1, 2, 3], restricted: false }); // every usable CPU: no pinning
-  const c = config({}, {}, { machine: { gateCpus: 'efficiency' } });
-  assert.equal(cpusLine(c, hybrid), 'usable 0-7 (performance 0-3, efficiency 4-7), gate cpus 4-7 (efficiency)');
-  assert.equal(cpusLine(config({}, {}), flat), 'usable 0-3 (one class), gate cpus 0-3 (all)');
+  const yes = { taskset: () => true, scope: () => true }, no = { taskset: () => false, scope: () => false };
+  // Its own CPUs: started as is. A subset: taskset. Outside its cpuset: a new systemd user scope, then taskset.
+  assert.deepEqual(gateLauncher(gateCpuSet('0-3,0-3', flat), flat.allowed, yes).prefix, []);
+  assert.deepEqual(gateLauncher(gateCpuSet('2-3', flat), flat.allowed, yes).prefix, ['taskset', '-c', '2-3']);
+  const wide = gateLauncher(gateCpuSet('all', confined), confined.allowed, yes);
+  assert.deepEqual([wide.via, wide.prefix.slice(0, 3), wide.prefix.slice(-3)], ['systemd-run scope', ['systemd-run', '--user', '--scope'], ['taskset', '-c', '0-7']]);
+  assert.ok(wide.prefix.includes('AllowedCPUs=0-7') && wide.prefix.includes('--expand-environment=no'));
+  // Unsupported: the gate inherits this process's CPUs, with a warning.
+  for (const g of [gateLauncher(gateCpuSet('all', confined), confined.allowed, no), gateLauncher(gateCpuSet('2-3', flat), flat.allowed, no)]) {
+    assert.deepEqual(g.prefix, []);
+    assert.match(g.warning, /systemd user scope|taskset is not available/);
+  }
+  const c = config({}, {}, { machine: { gateCpus: 'all' } });
+  assert.equal(cpusLine(c, confined, yes), 'usable 4-7 of online 0-7 (performance 0-3, efficiency 4-7), gate cpus 0-7 (all, systemd-run scope)');
+  assert.equal(cpusLine(config({}, {}), flat), 'usable 0-3 of online 0-3 (one class), gate cpus 0-3 (inherit, inherited)');
   for (const bad of ['fast', '1-', 'a,b']) assert.throws(() => config({}, {}, { machine: { gateCpus: bad } }), /gateCpus must be/);
 });
 
-test('a gate runs pinned to its CPUs and learns its CPU set and worker budget', async (t) => {
+test('a gate started on CPUs outside its cpuset sees them through the systemd user scope', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'prloop-slots-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
-  const usable = parseCpuList(readFileSync('/proc/self/status', 'utf8').match(/^Cpus_allowed_list:\s*(\S+)/m)?.[1] ?? '0');
-  const cpus = { allowed: usable, classes: usable.length > 1 ? { performance: usable.slice(0, 1), efficiency: usable.slice(1) } : null };
-  const c = { ...cfg, gateSlots: 2, gateCpus: 'performance' };
-  const x = idle();
-  const r = await runGate('echo "$PRLOOP_GATE_CPUS $PRLOOP_GATE_WORKERS"; grep Cpus_allowed_list /proc/self/status || true', dir, c, { ...x, dir, cpus });
+  const cpus = machineCpus();
+  const gate = 'echo "$PRLOOP_GATE_CPUS $PRLOOP_GATE_WORKERS $$"; grep Cpus_allowed_list /proc/self/status || true';
+  const r = await runGate(gate, dir, { ...cfg, gateSlots: 2, gateCpus: 'all' }, { ...idle(), dir, cpus });
   const [env, allowed] = r.stdout.trim().split('\n');
-  if (usable.length > 1 && spawnSync('taskset', ['-V']).status === 0) {
-    assert.equal(env, `${usable[0]} 1`);
-    assert.match(allowed, new RegExp(`\\s${usable[0]}$`));
-  }
-  // Without taskset the gate runs on every usable CPU and says so once.
-  const y = idle();
-  const twice = { ...y, dir, cpus, taskset: () => false };
-  const u = await runGate('echo "$PRLOOP_GATE_CPUS $PRLOOP_GATE_WORKERS"', dir, { ...c, gateCpus: 'all' }, twice);
-  assert.equal(u.stdout.trim(), `${formatCpuList(usable)} ${Math.max(1, Math.floor(usable.length / 2))}`);
+  const want = gateLauncher(gateCpuSet('all', cpus), cpus.allowed);
+  // The env names the CPUs the gate really got, and the probe guarantees the kernel agrees.
+  assert.equal(env.split(' ')[0], formatCpuList(want.cpus));
+  if (allowed) assert.equal(formatCpuList(parseCpuList(allowed.split(/\s+/).at(-1))), formatCpuList(want.cpus));
+  assert.equal(env.split(' ')[1], String(Math.max(1, Math.floor(want.cpus.length / 2))));
+  // Without the scope or taskset the gate runs on this process's CPUs and says so once.
+  const x = idle();
+  const u = await runGate('echo "$PRLOOP_GATE_CPUS"', dir, { ...cfg, gateCpus: '0' }, { ...x, dir, cpus: { ...cpus, allowed: cpus.allowed.length > 1 ? cpus.allowed : [0, 1] }, taskset: () => false, scope: () => false });
+  assert.notEqual(u.stdout.trim(), '0');
 });
 
 test('a busy workload lowers the gate slots for new admissions only', async (t) => {
