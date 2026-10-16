@@ -455,5 +455,145 @@ class DisposableRepositoryTests(GuardFixture):
         self.assertEqual(result.returncode, 0, result.stderr)
 
 
+class ForbiddenTermTests(GuardFixture):
+    TERM = "Exampleson"
+    REMOTE = "https://example.invalid/synthetic.git"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.configure()
+
+    def configure(self, **extra: object) -> None:
+        self.write_config({"expected_email": EXPECTED, "allowed_names": [NAME],
+                           "forbidden_terms": [self.TERM, "zz-private-term"], **extra})
+
+    def assert_term_refused(self, result: subprocess.CompletedProcess[str],
+                            reason: str) -> None:
+        self.assert_refused(result, reason)
+        self.assertIn("a forbidden term", result.stderr)
+        self.assertNotIn(self.TERM.lower(), result.stderr.lower())
+        self.assertNotIn("zz-private-term", result.stderr)
+
+    def stage(self, path: str, text: str) -> None:
+        target = self.repository / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+        self.git("add", path)
+
+    def push(self) -> subprocess.CompletedProcess[str]:
+        head = self.git("rev-parse", "HEAD").stdout.strip()
+        updates = f"refs/heads/main {head} refs/heads/main {ZERO}\n"
+        return self.guard("--pre-push", "origin", "url", stdin=updates)
+
+    def test_term_in_commit_message_is_refused(self) -> None:
+        path = self.message(f"Thanks {self.TERM} <{self.TERM.lower()}@mail.invalid.x>\n")
+        self.assert_term_refused(self.guard("--commit-msg", path), "commit message contains")
+
+    def test_term_in_staged_added_line_is_refused(self) -> None:
+        self.stage("notes.txt", f"first line\nwritten by A. {self.TERM}\n")
+        self.assert_term_refused(self.guard(), "an added line in 'notes.txt'")
+
+    def test_match_is_case_insensitive(self) -> None:
+        self.stage("notes.txt", "ZZ-PRIVATE-TERM appears here\n")
+        self.assert_term_refused(self.guard(), "an added line in 'notes.txt'")
+
+    def test_term_only_in_removed_line_passes(self) -> None:
+        self.write_config({"expected_email": EXPECTED, "allowed_names": [NAME]})
+        self.stage("notes.txt", f"keep\n{self.TERM}\n")
+        self.commit("Add notes")
+        self.configure()
+        self.stage("notes.txt", "keep\n")
+        result = self.guard()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_term_in_new_file_path_is_refused(self) -> None:
+        self.stage(f"docs/{self.TERM}.md", "harmless\n")
+        self.assert_term_refused(self.guard(), "a file path")
+
+    def test_binary_file_content_is_skipped(self) -> None:
+        target = self.repository / "blob.bin"
+        target.write_bytes(b"\0" + self.TERM.encode())
+        self.git("add", "blob.bin")
+        result = self.guard()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_prepare_commit_msg_arguments_skip_the_staged_check(self) -> None:
+        self.stage("notes.txt", f"{self.TERM}\n")
+        result = self.guard(self.message("Add notes\n"), "message")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_term_in_effective_name_is_refused(self) -> None:
+        env = {**self.env, "GIT_AUTHOR_NAME": f"Synthetic {self.TERM}"}
+        self.assert_term_refused(self.guard(env=env), "author name contains")
+
+    def test_term_in_outgoing_commit_diff_is_refused(self) -> None:
+        self.commit("Start")
+        self.stage("src/app.txt", f"print('{self.TERM}')\n")
+        commit = self.commit("Add app")
+        self.commit("Follow-up")
+        self.assert_term_refused(self.push(),
+                                 f"an added line in 'src/app.txt' in commit {commit[:12]}")
+
+    def test_term_in_outgoing_root_commit_path_is_refused(self) -> None:
+        self.stage(f"{self.TERM.lower()}/file.txt", "harmless\n")
+        commit = self.commit("Add file")
+        self.assert_term_refused(self.push(), f"a file path in commit {commit[:12]}")
+
+    def test_term_in_outgoing_commit_message_is_refused(self) -> None:
+        commit = self.commit(f"Add feature\n\nReviewed by {self.TERM}")
+        self.assert_term_refused(self.push(), f"commit {commit[:12]} message contains")
+
+    def test_term_in_outgoing_merge_against_first_parent_is_refused(self) -> None:
+        self.commit("Start")
+        self.git("checkout", "--quiet", "-b", "side")
+        self.stage("side.txt", f"{self.TERM}\n")
+        self.commit("Side")
+        self.git("checkout", "--quiet", "-")
+        self.git("update-ref", "refs/remotes/origin/side", "side")
+        self.git("merge", "--quiet", "--no-ff", "--no-edit", "side")
+        self.assert_term_refused(self.push(), "an added line in 'side.txt' in commit")
+
+    def test_clean_outgoing_commits_pass(self) -> None:
+        self.stage("a.txt", "clean\n")
+        self.commit("Add a")
+        self.git("mv", "a.txt", "b.txt")
+        self.commit("Rename")
+        result = self.push()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_exempt_remote_skips_term_checks(self) -> None:
+        self.configure(forbidden_terms_exempt_remotes=[self.REMOTE])
+        self.stage("notes.txt", f"{self.TERM}\n")
+        self.assertEqual(self.guard().returncode, 0)
+        path = self.message(f"About {self.TERM}\n")
+        self.assertEqual(self.guard("--commit-msg", path).returncode, 0)
+        self.commit(f"About {self.TERM}")
+        result = self.push()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_exempt_push_url_counts(self) -> None:
+        self.configure(forbidden_terms_exempt_remotes=["git@example.invalid:cv.git"])
+        self.git("remote", "set-url", "--push", "origin", "git@example.invalid:cv.git")
+        self.stage("notes.txt", f"{self.TERM}\n")
+        result = self.guard()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_missing_keys_mean_no_term_checks(self) -> None:
+        self.write_config({"expected_email": EXPECTED, "allowed_names": [NAME]})
+        self.stage("notes.txt", f"{self.TERM}\n")
+        self.assertEqual(self.guard().returncode, 0)
+        self.commit(f"About {self.TERM}")
+        result = self.push()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_malformed_keys_are_refused(self) -> None:
+        for key in ("forbidden_terms", "forbidden_terms_exempt_remotes"):
+            for value in ("Exampleson", [""], ["  "], [3], None):
+                with self.subTest(key=key, value=value):
+                    self.write_config({"expected_email": EXPECTED, "allowed_names": [NAME],
+                                       key: value})
+                    self.assert_refused(self.guard(), f"{key} must be a list")
+
+
 if __name__ == "__main__":
     unittest.main()

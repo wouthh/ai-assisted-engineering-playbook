@@ -12,13 +12,22 @@ message that are not on the allowlist, such as co-author trailers. Push mode
 message of every outgoing commit that no remote-tracking branch already
 contains.
 
+Optional forbidden_terms (case-insensitive substrings, such as a private name
+that must never be published) are refused in commit messages, identities,
+added lines and new paths of the staged change (pre-commit, pre-merge-commit
+and pre-applypatch, which run without hook arguments), and in the messages,
+identities, added lines and new paths of every outgoing commit on push.
+Refusals never print the term or the matching text.
+
 Private values live in a local JSON configuration file, never in this script:
 
     {
       "expected_email": "12345+name@users.noreply.github.com",
       "allowed_names": ["Your Name"],
       "allowed_message_emails": ["release-bot@example.com"],
-      "allowed_foreign_identities": ["Release Bot <release-bot@example.com>"]
+      "allowed_foreign_identities": ["Release Bot <release-bot@example.com>"],
+      "forbidden_terms": ["zz-private-term"],
+      "forbidden_terms_exempt_remotes": ["git@example.com:you/private-cv.git"]
     }
 
 allowed_names is required: without it every guarded operation is refused.
@@ -27,6 +36,8 @@ commit's author or committer that exactly matches one "Name <email>" entry is
 accepted, for history that legitimately contains other people's commits. A
 commit whose author and committer both match is also exempt from the message
 check; every other outgoing message is checked as usual.
+forbidden_terms_exempt_remotes lists exact remote URLs; a repository with any
+matching fetch or push URL skips the forbidden-term checks.
 
 The file is read from $GIT_IDENTITY_GUARD_CONFIG, otherwise
 $XDG_CONFIG_HOME/git-identity-guard/config.json, otherwise
@@ -46,7 +57,8 @@ import sys
 USAGE = """usage: git-identity-guard.py [--commit-msg FILE | --pre-push] [HOOK-ARGUMENTS...]
 
 Refuse Git operations whose identity (email or name) or commit message email
-does not match the local guard configuration. Exits 0 when allowed and 1 when refused.
+does not match the local guard configuration, or that contain a configured
+forbidden term. Exits 0 when allowed and 1 when refused.
 
   --commit-msg FILE  also check email addresses in the commit message FILE
   --pre-push         also check outgoing commits read from standard input
@@ -96,10 +108,12 @@ class Refusal(ValueError):
     """A reason the guarded operation must not proceed."""
 
 
-def git(*args: str, missing_ok: bool = False, raw: bool = False):
+def git(*args: str, missing_ok: bool = False, raw: bool = False,
+        stdin: str | None = None, timeout: int = 10):
     try:
         result = subprocess.run([GIT, "--no-optional-locks", *args], env=ENV,
-                                capture_output=True, text=not raw, timeout=10)
+                                capture_output=True, text=not raw, timeout=timeout,
+                                input=stdin.encode() if raw and stdin else stdin)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise Refusal("could not inspect Git identity safely") from exc
     if result.returncode:
@@ -127,6 +141,8 @@ def load_config() -> dict:
     extras = data.get("allowed_message_emails", []) if isinstance(data, dict) else None
     names = data.get("allowed_names") if isinstance(data, dict) else None
     foreign = data.get("allowed_foreign_identities", []) if isinstance(data, dict) else None
+    terms = data.get("forbidden_terms", []) if isinstance(data, dict) else None
+    exempt = data.get("forbidden_terms_exempt_remotes", []) if isinstance(data, dict) else None
     if not isinstance(expected, str) or not CONFIG_EMAIL.fullmatch(expected):
         raise Refusal("guard configuration needs a valid expected_email")
     if not isinstance(extras, list) or not all(
@@ -142,26 +158,45 @@ def load_config() -> dict:
     if not isinstance(foreign, list) or not all(
             isinstance(item, str) and CONFIG_IDENT.fullmatch(item) for item in foreign):
         raise Refusal('allowed_foreign_identities must be a list of "Name <email>" strings')
+    for key, value in (("forbidden_terms", terms),
+                       ("forbidden_terms_exempt_remotes", exempt)):
+        if not isinstance(value, list) or not all(
+                isinstance(item, str) and item.strip() for item in value):
+            raise Refusal(f"{key} must be a list of non-empty strings")
     return {"expected": expected, "names": set(names),
+            "terms": [term.lower() for term in terms], "exempt_remotes": set(exempt),
             "foreign": {CONFIG_IDENT.fullmatch(item).groups() for item in foreign},
             "message_allowed": {expected.lower(), *(e.lower() for e in extras)}}
 
 
-def require_email(label: str, email: str | None, expected: str) -> None:
-    if email != expected:
+def has_term(text: str, config: dict) -> bool:
+    lower = text.lower()
+    return any(term in lower for term in config["terms"])
+
+
+def check_terms(text: str | None, label: str, config: dict) -> None:
+    # Never print the term or the text: refusals may land in logs.
+    if text and has_term(text, config):
+        raise Refusal(f"{label} contains a forbidden term")
+
+
+def require_email(label: str, email: str | None, config: dict) -> None:
+    check_terms(email, f"{label} email", config)
+    if email != config["expected"]:
         raise Refusal(f"{label} email {email!r} is not the configured address")
 
 
-def require_name(label: str, name: str | None, names: set[str]) -> None:
+def require_name(label: str, name: str | None, config: dict) -> None:
+    check_terms(name, f"{label} name", config)
     # Exact match: case or whitespace variants are different recorded names.
-    if name not in names:
+    if name not in config["names"]:
         raise Refusal(f"{label} name {name!r} is not in allowed_names")
 
 
 def require_ident(label: str, name: str | None, email: str | None,
                   config: dict) -> None:
-    require_email(label, email, config["expected"])
-    require_name(label, name, config["names"])
+    require_email(label, email, config)
+    require_name(label, name, config)
 
 
 def git_path(name: str) -> pathlib.Path:
@@ -224,18 +259,17 @@ def disposable_repository() -> bool:
 
 
 def check_identity(config: dict) -> None:
-    expected = config["expected"]
     # Catch a wrong default even when role-specific settings happen to mask it.
     for key in ("user.email", "author.email", "committer.email"):
         email = git("config", "--get", key, missing_ok=True)
         if email is None and key != "user.email":
             continue
-        require_email(key, email, expected)
+        require_email(key, email, config)
     for key in ("user.name", "author.name", "committer.name"):
         name = git("config", "--get", key, missing_ok=True)
         if name is None and key != "user.name":
             continue
-        require_name(key, name, config["names"])
+        require_name(key, name, config)
 
     for role in ("COMMITTER", "AUTHOR"):
         ident = git("var", f"GIT_{role}_IDENT")
@@ -335,16 +369,63 @@ def check_message_text(text: str, allowed: set[str], label: str) -> None:
                           f"{email!r}, which is not on the allowlist")
 
 
-def check_message(path: pathlib.Path, allowed: set[str]) -> None:
+def check_message(path: pathlib.Path, config: dict) -> None:
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         raise Refusal("could not read the commit message") from exc
-    check_message_text(text, allowed, "commit message")
+    # Terms first, so an email refusal never echoes a word containing one.
+    check_terms(text, "commit message", config)
+    check_message_text(text, config["message_allowed"], "commit message")
+
+
+def terms_exempt(config: dict) -> bool:
+    urls = git("config", "--get-regexp", r"^remote\..*\.(push)?url$", missing_ok=True)
+    return any(line.partition(" ")[2] in config["exempt_remotes"]
+               for line in (urls or "").splitlines())
+
+
+DIFF_OPTIONS = ("--patch-with-raw", "-U0", "-M", "--no-color", "--no-ext-diff",
+                "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/")
+COMMIT_LINE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+
+
+def check_patch(patch: str, config: dict, where: str = "") -> None:
+    """Check new paths (raw lines) and added lines of a patch.
+
+    `git diff-tree --stdin` output starts each commit with its id, which sets
+    the label. Binary files have no added lines and are skipped implicitly.
+    """
+    path = ""
+    in_hunk = False
+    for line in patch.splitlines():
+        if COMMIT_LINE.fullmatch(line):
+            where, in_hunk = f" in commit {line[:12]}", False
+        elif line.startswith(":") and not in_hunk:
+            status, *paths = line.split("\t")
+            if status.split()[-1][:1] in "ARC" and has_term(paths[-1], config):
+                raise Refusal(f"a file path{where} contains a forbidden term")
+        elif line.startswith("diff --git "):
+            in_hunk = False
+        elif line.startswith("+++ ") and not in_hunk:
+            path = line[4:].removeprefix("b/")
+        elif line.startswith("@@"):
+            in_hunk = True
+        elif in_hunk and line.startswith("+") and has_term(line[1:], config):
+            label = "a file path" if has_term(path, config) else repr(path)
+            raise Refusal(f"an added line in {label}{where} contains a forbidden term")
+
+
+def check_staged(config: dict) -> None:
+    # Without a HEAD (unborn branch) this shows every staged file.
+    patch = git("-c", "core.quotePath=false", "diff", "--cached", *DIFF_OPTIONS,
+                raw=True, timeout=120)
+    check_patch(patch.decode("utf-8", "replace"), config, " of the staged change")
 
 
 def check_outgoing(updates: str, config: dict) -> None:
     """Check commits a push would publish that no remote-tracking ref has."""
+    outgoing = []
     for line in updates.splitlines():
         fields = line.split()
         if len(fields) != 4:
@@ -354,6 +435,7 @@ def check_outgoing(updates: str, config: dict) -> None:
             continue  # Branch deletion: nothing is published.
         commits = git("rev-list", local_oid, "--not", "--remotes")
         for commit in commits.split():
+            outgoing.append(commit)
             raw = git("cat-file", "commit", commit, raw=True)
             header, _, body = raw.partition(b"\n\n")
             foreign_roles = 0
@@ -364,18 +446,29 @@ def check_outgoing(updates: str, config: dict) -> None:
                     raise Refusal(f"could not parse {role.decode()} of commit {commit[:12]}")
                 name = match.group(1).decode("utf-8", "replace")
                 email = match.group(2).decode("utf-8", "replace")
+                check_terms(f"{name} <{email}>",
+                            f"commit {commit[:12]} {role.decode()} identity", config)
                 # Exact name and email, so a known bot name with another
                 # address is still refused.
                 if (name, email) in config["foreign"]:
                     foreign_roles += 1
                     continue
                 require_ident(f"commit {commit[:12]} {role.decode()}", name, email, config)
+            message = body.decode("utf-8", "replace")
+            check_terms(message, f"commit {commit[:12]} message", config)
             if foreign_roles == 2:
                 # Written and committed entirely by others (a bot commit merged
                 # on the hosting platform); its message is not ours to police.
                 continue
-            check_message_text(body.decode("utf-8", "replace"),
-                               config["message_allowed"], f"commit {commit[:12]} message")
+            check_message_text(message, config["message_allowed"],
+                               f"commit {commit[:12]} message")
+    if outgoing and config["terms"]:
+        # One pass over all outgoing diffs, each against its first parent
+        # (root commits against the empty tree).
+        patch = git("-c", "core.quotePath=false", "diff-tree", "--stdin", "--root",
+                    "--diff-merges=first-parent", *DIFF_OPTIONS, raw=True,
+                    stdin="\n".join(dict.fromkeys(outgoing)) + "\n", timeout=300)
+        check_patch(patch.decode("utf-8", "replace"), config)
 
 
 def main(argv: list[str]) -> int:
@@ -398,15 +491,22 @@ def main(argv: list[str]) -> int:
         if not push and disposable_repository():
             return 0
         config = load_config()
+        if config["terms"] and terms_exempt(config):
+            config["terms"] = []
         check_identity(config)
         if message is not None:
-            check_message(message, config["message_allowed"])
+            check_message(message, config)
+        elif not push and len(argv) == 0 and config["terms"]:
+            # pre-commit, pre-merge-commit and pre-applypatch run without
+            # arguments; prepare-commit-msg passes the message file.
+            check_staged(config)
         if push:
             check_outgoing(updates, config)
     except (Refusal, OSError, UnicodeError) as exc:
         print(f"Git identity guard: refusing this operation: {exc}.", file=sys.stderr)
         print("Use the configured email and an allowed name for user, author and "
-              "committer settings, and only allowed emails in commit messages. "
+              "committer settings, only allowed emails in commit messages, and no "
+              "forbidden terms in messages, identities or added content. "
               "This guard does not change identities or rewrite commits.",
               file=sys.stderr)
         return 1
