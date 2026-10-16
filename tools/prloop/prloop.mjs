@@ -2184,8 +2184,9 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     const result = parseAgentResult(r.final);
     if (permissionDenied(r, result)) return fail('the agent reported a permission denial');
     if (r.status !== 0) return fail(`the agent exited with status ${r.status}: ${cliWrapper(r.final) ? agentFailure(r.final) : tail(r.stderr)}`);
+    let after;
     const progressed = () => {
-      const after = classify(fetchPr(repo, st.pr), { ...cfg, cwd });
+      after = classify(fetchPr(repo, st.pr), { ...cfg, cwd });
       return after.head !== s.head || after.unresolvedThreads.length < s.unresolvedThreads.length
         || after.trigger?.id !== s.trigger?.id || (!testedBefore && tested(after.head))
         || after.reviewerState.state !== s.reviewerState?.state; // e.g. an automatic review started meanwhile
@@ -2202,9 +2203,10 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     }
     if (result.status === 'blocked') return fail(`agent: ${result.reason ?? 'blocked'}`);
     st.lowImpactStreak = lowImpactRound(st.lowImpactStreak, v, result);
-    st.lowImpactMerge = lowImpactPrior && st.lowImpactStreak >= 2 && result.status === 'fixed' && result.head
-      ? { head: result.head, reason: String(result.lowImpactReason ?? '').slice(0, 300) } : undefined;
     if (!progressed()) return fail(`agent made no progress (${result.status}): no commit, resolved thread, request or gate${result.reason ? ` (agent: ${result.reason})` : ''}`);
+    // The early-merge head is prloop's own snapshot; the agent's (possibly abbreviated) sha only has to match it.
+    st.lowImpactMerge = lowImpactPrior && st.lowImpactStreak >= 2 && result.status === 'fixed' && result.head && after.head.startsWith(String(result.head))
+      ? { head: after.head, reason: String(result.lowImpactReason ?? '').slice(0, 300) } : undefined;
     // A successful agent's reason may hold a proposed prloop issue: keep it in the run log for the coordinator.
     if (result.reason) logEvent(st, { phase: 'agent_reason', status: result.status, reason: String(result.reason).slice(0, 2000), agentLog });
     event(st, 'polling', { status: result.status });

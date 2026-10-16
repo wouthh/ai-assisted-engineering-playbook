@@ -2613,13 +2613,13 @@ test('run merges after a second low-impact round once the gate passes, without a
   Object.assign(pr, { headRefName: 'feat', headRefOid: head, mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE' });
   pr.reviewThreads.nodes.push(thread('T1', at('10:20'), 'P3: Rename the helper to match the docs'));
   const calls = fakeGh(t, r.dir, pr);
-  // The agent fixes the nit, pushes, resolves the thread and skips the review request.
+  // The agent fixes the nit, pushes, resolves the thread and skips the review request; it reports an abbreviated sha.
   writeFileSync(join(r.dir, 'bin', 'claude'), `#!/bin/sh
 echo "$@" > "${r.dir}/prompt"
 echo renamed > app.txt && git add app.txt && git commit -qm rename && git push -q origin feat
 new=$(git rev-parse HEAD)
 node -e 'const fs = require("fs"), f = process.argv[1], j = JSON.parse(fs.readFileSync(f, "utf8")); const p = j.data.repository.pullRequest; p.headRefOid = process.argv[2]; p.reviewThreads.nodes = []; fs.writeFileSync(f, JSON.stringify(j));' "${r.dir}/pr.json" "$new"
-echo "{\\"status\\":\\"fixed\\",\\"head\\":\\"$new\\",\\"fixed\\":[\\"T1\\"],\\"disputed\\":[],\\"lowImpact\\":true,\\"lowImpactReason\\":\\"naming nit\\"}"
+echo "{\\"status\\":\\"fixed\\",\\"head\\":\\"$(git rev-parse --short HEAD)\\",\\"fixed\\":[\\"T1\\"],\\"disputed\\":[],\\"lowImpact\\":true,\\"lowImpactReason\\":\\"naming nit\\"}"
 `, { mode: 0o755 });
   const [res] = await runAll({ repo: 'example-org/example-repo', pr: '7', worktree: r.work, merge: 'squash', deadline: '1h' }, { ...cfg, gate: 'true', gateCost: 0, interval: 1 }, { metrics: idle().metrics });
   const fixed = r.run(r.work, 'rev-parse', 'HEAD');
