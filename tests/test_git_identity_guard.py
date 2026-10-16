@@ -490,6 +490,37 @@ class ForbiddenTermTests(GuardFixture):
         path = self.message(f"Thanks {self.TERM} <{self.TERM.lower()}@mail.invalid.x>\n")
         self.assert_term_refused(self.guard("--commit-msg", path), "commit message contains")
 
+    def test_editor_commit_ignores_template_comments_and_verbose_diff(self) -> None:
+        self.require_configured_hooks()
+        self.stage(f"{self.TERM}.txt", f"by {self.TERM} <{OTHER}>\n")
+        self.commit("Add notes")
+        self.git("rm", "--quiet", f"{self.TERM}.txt")
+        (self.repository / f"{self.TERM}-draft.txt").write_text("untracked\n")
+        command = f"{shlex.quote(sys.executable)} {shlex.quote(str(GUARD))} --commit-msg"
+        self.git("config", "hook.identity-guard.command", command)
+        self.git("config", "hook.identity-guard.event", "commit-msg")
+        # The editor adds a subject above Git's template (comments listing the
+        # deleted and untracked paths, then the -v diff below the scissors,
+        # whose removed line and hunk header the email check must not see).
+        editor = "sh -c 'printf \"%s\\n\" \"$SUBJECT\" | cat - \"$1\" > \"$1.new\" && mv \"$1.new\" \"$1\"' editor"
+        def commit(subject: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                ["git", "commit", "-v"], cwd=self.repository, text=True,
+                capture_output=True,
+                env={**self.env, "GIT_EDITOR": editor, "SUBJECT": subject})
+        self.assert_term_refused(commit(f"Remove {self.TERM}"), "commit message contains")
+        result = commit("Remove old notes")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.git("log", "-1", "--format=%s").stdout.strip(),
+                         "Remove old notes")
+
+    def test_message_comments_follow_the_configured_comment_character(self) -> None:
+        self.git("config", "core.commentChar", ";")
+        kept = self.message(f"Add notes\n; {self.TERM} untracked\n")
+        self.assertEqual(self.guard("--commit-msg", kept).returncode, 0)
+        hashed = self.message(f"Add notes\n# {self.TERM} kept\n")
+        self.assert_term_refused(self.guard("--commit-msg", hashed), "commit message contains")
+
     def test_term_in_staged_added_line_is_refused(self) -> None:
         self.stage("notes.txt", f"first line\nwritten by A. {self.TERM}\n")
         self.assert_term_refused(self.guard(), "an added line in 'notes.txt'")

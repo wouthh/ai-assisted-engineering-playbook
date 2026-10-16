@@ -365,12 +365,34 @@ def message_addresses(text: str) -> list[tuple[int, str]]:
 
 
 def check_message_text(text: str, allowed: set[str], label: str) -> None:
-    # Every line is checked: the hook cannot tell whether Git will strip
-    # comment lines (it keeps them for `git commit -m`, for example).
+    # Comment lines are checked: the hook cannot tell whether Git will strip
+    # them (it keeps them for `git commit -m`, for example).
     for number, email in message_addresses(text):
         if not message_email_allowed(email, allowed):
             raise Refusal(f"{label} line {number} contains email "
                           f"{email!r}, which is not on the allowlist")
+
+
+def kept_message(text: str, comments: bool) -> str:
+    """The message without the verbose diff Git always drops, and its comments.
+
+    `git commit -v` appends the diff below a scissors line, and Git's editor
+    template lists branch and path names as comment lines. Comment lines may
+    survive (as with `git commit -m`), so `comments=False` is only safe where
+    the push check still inspects the stored message.
+    """
+    comment = (git("config", "--get", "core.commentString", missing_ok=True)
+               or git("config", "--get", "core.commentChar", missing_ok=True) or "#")
+    if comment == "auto":
+        return text  # Git picks the character per message; check every line.
+    scissors = f"{comment} {'-' * 24} >8 {'-' * 24}"
+    kept = []
+    for line in text.splitlines():
+        if line == scissors:
+            break
+        if comments or not line.startswith(comment):
+            kept.append(line)
+    return "\n".join(kept)
 
 
 def check_message(path: pathlib.Path, config: dict) -> None:
@@ -379,8 +401,9 @@ def check_message(path: pathlib.Path, config: dict) -> None:
     except OSError as exc:
         raise Refusal("could not read the commit message") from exc
     # Terms first, so an email refusal never echoes a word containing one.
-    check_terms(text, "commit message", config)
-    check_message_text(text, config["message_allowed"], "commit message")
+    check_terms(kept_message(text, comments=False), "commit message", config)
+    check_message_text(kept_message(text, comments=True), config["message_allowed"],
+                       "commit message")
 
 
 def remote_urls() -> dict[str, dict[str, list[str]]]:
