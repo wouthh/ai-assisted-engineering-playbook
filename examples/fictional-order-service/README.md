@@ -63,7 +63,7 @@ If a finding is invalid because the reviewer misread the repository's `AGENTS.md
 
 After validation and authorized publication, open a ready PR. Check the automatic Codex review first, including reactions on the PR body. A current-cycle bot thumbs-up may be its clean result without a comment, but eyes, silence, and stale reactions are not completion. Inspect every feedback surface, reply and resolve only addressed findings, and repeat on substantive heads until clean. An unavailable review produces an exact-head handoff, not a claim of success. These are illustrative steps; no actual cloud review was run for this fictional service. A real review record identifies the reviewer or tool, automated or human review type, exact head, scope and coverage, outcome, and remaining findings. For this example those fields are not applicable because no review occurred.
 
-With [`prloop`](../../tools/prloop/README.md), the same gate and review wait could run unattended. A hypothetical PR 12 for this change on a shared 8-core build machine with 32 GiB of RAM:
+With [`prloop`](../../tools/prloop/README.md), the same gate and review wait could run unattended, started from the repository's main checkout rather than a PR worktree that is removed after its merge. A hypothetical PR 12 for this change on a shared 8-core build machine with 32 GiB of RAM:
 
 ```bash
 prloop run --repo example-org/order-service --pr 12 \
