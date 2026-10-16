@@ -626,6 +626,35 @@ class ForbiddenTermTests(GuardFixture):
         self.assert_term_refused(self.push(url="https://example.invalid/public.git"),
                                  f"commit {commit[:12]} message contains")
 
+    def test_exempt_url_matches_after_insteadof_rewriting(self) -> None:
+        # Git passes the hook the rewritten URL, so remotes are matched by it too.
+        exempt = "git@example.invalid:cv.git"
+        self.configure(forbidden_terms_exempt_remotes=[exempt])
+        self.git("config", "url.git@example.invalid:.insteadOf", "ex:")
+        self.git("remote", "set-url", "origin", "ex:cv.git")
+        self.stage("notes.txt", f"{self.TERM}\n")
+        self.assertEqual(self.guard().returncode, 0)
+        self.commit("Start")
+        self.git("update-ref", "refs/remotes/public/main", "HEAD")
+        commit = self.commit(f"About {self.TERM}")
+        self.assertEqual(self.push(url=exempt).returncode, 0)
+        self.git("update-ref", "refs/remotes/origin/main", "HEAD")
+        self.git("remote", "add", "public", self.REMOTE)
+        self.assert_term_refused(self.push(), f"commit {commit[:12]} message contains")
+
+    def test_only_tracking_refs_of_checked_remotes_count_as_published(self) -> None:
+        self.git("remote", "add", "public", "https://example.invalid/public.git")
+        self.commit("Start")
+        self.git("update-ref", "refs/remotes/public/feature/start", "HEAD")
+        commit = self.commit(f"About {self.TERM}")
+        # Refs outside a checked remote's namespace, such as an exempt remote
+        # fetched with a custom refspec, never count as checked.
+        for ref in ("refs/remotes/private/main", "refs/mirror/main"):
+            self.git("update-ref", ref, "HEAD")
+        self.assert_term_refused(self.push(), f"commit {commit[:12]} message contains")
+        self.git("update-ref", "refs/remotes/public/feature/start", "HEAD")
+        self.assertEqual(self.push().returncode, 0)
+
     def test_term_in_pushed_ref_name_is_refused(self) -> None:
         self.commit("Start")
         for ref in (f"refs/heads/{self.TERM}", f"refs/tags/x-{self.TERM.lower()}"):
