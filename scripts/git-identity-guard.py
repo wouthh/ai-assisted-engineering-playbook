@@ -113,7 +113,7 @@ class Refusal(ValueError):
 
 
 def git(*args: str, missing_ok: bool = False, raw: bool = False,
-        stdin: str | None = None, timeout: int = 10):
+        stdin: str | None = None, timeout: int = 10, missing_code: int = 1):
     try:
         result = subprocess.run([GIT, "--no-optional-locks", *args], env=ENV,
                                 capture_output=True, text=not raw, timeout=timeout,
@@ -121,7 +121,7 @@ def git(*args: str, missing_ok: bool = False, raw: bool = False,
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise Refusal("could not inspect Git identity safely") from exc
     if result.returncode:
-        if missing_ok and result.returncode == 1:
+        if missing_ok and result.returncode == missing_code:
             return None
         raise Refusal("Git could not resolve the required identity metadata")
     return result.stdout if raw else result.stdout.strip()
@@ -400,10 +400,14 @@ def check_message(path: pathlib.Path, config: dict) -> None:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         raise Refusal("could not read the commit message") from exc
-    # Terms first, so an email refusal never echoes a word containing one.
+    # Terms first, so an email refusal never echoes a word containing one:
+    # that includes refused addresses on comment lines the term check skips.
+    full = kept_message(text, comments=True)
     check_terms(kept_message(text, comments=False), "commit message", config)
-    check_message_text(kept_message(text, comments=True), config["message_allowed"],
-                       "commit message")
+    check_terms(" ".join(email for _, email in message_addresses(full)
+                         if not message_email_allowed(email, config["message_allowed"])),
+                "commit message", config)
+    check_message_text(full, config["message_allowed"], "commit message")
 
 
 def remote_urls() -> dict[str, dict[str, list[str]]]:
@@ -411,11 +415,18 @@ def remote_urls() -> dict[str, dict[str, list[str]]]:
 
     Git resolves them after url.<base>.insteadOf and pushInsteadOf, as it does
     for the URL it passes to the pre-push hook (a push URL falls back to the
-    fetch URL).
+    fetch URL). `git remote` also lists names that only have other settings,
+    such as a global remote.origin.prune; get-url exits 2 for those and they
+    have no URL to push to, so they are skipped.
     """
-    return {name: {kind: git("remote", "get-url", *flags, "--all", name).splitlines()
-                   for kind, flags in (("url", ()), ("pushurl", ("--push",)))}
-            for name in git("remote").split()}
+    remotes = {}
+    for name in git("remote").split():
+        urls = {kind: git("remote", "get-url", *flags, "--all", name,
+                          missing_ok=True, missing_code=2)
+                for kind, flags in (("url", ()), ("pushurl", ("--push",)))}
+        if None not in urls.values():
+            remotes[name] = {kind: value.splitlines() for kind, value in urls.items()}
+    return remotes
 
 
 def push_urls() -> list[str]:
@@ -477,12 +488,18 @@ def check_outgoing(updates: str, config: dict) -> None:
     # outgoing too. Only the default tracking refs of remotes without any
     # exempt fetch or push URL count as checked; refs anywhere else (another
     # fetch refspec, or an exempt remote's namespace) do not.
-    published = ["--remotes"] if not config["terms"] else [
-        # Escaped, so a configured remote name never matches as a pattern.
-        "--glob=refs/remotes/" + re.sub(r"([*?[\\])", r"\\\1", name) + "/*"
-        for name, kinds in remote_urls().items()
-        if not any(url in config["exempt_remotes"]
-                   for urls in kinds.values() for url in urls)]
+    published = ["--remotes"]
+    if config["terms"]:
+        exempt, checked = [], []
+        for name, kinds in remote_urls().items():
+            # Escaped, so a configured remote name never matches as a pattern.
+            pattern = "refs/remotes/" + re.sub(r"([*?[\\])", r"\\\1", name) + "/*"
+            (exempt if any(url in config["exempt_remotes"] for urls in kinds.values()
+                           for url in urls) else checked).append(pattern)
+        # The * also matches slashes, so refs/remotes/a/* covers an exempt
+        # remote named a/b; exclusions apply only to the next --glob.
+        published = [arg for pattern in checked
+                     for arg in (*(f"--exclude={e}" for e in exempt), f"--glob={pattern}")]
     for line in updates.splitlines():
         fields = line.split()
         if len(fields) != 4:
