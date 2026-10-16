@@ -649,6 +649,7 @@ export function gitLockWorktree(cwd, reason) {
   if (tryGit(['worktree', 'lock', '--reason', reason, top], cwd) === null) return () => {};
   const unlock = () => { gitLocks.delete(unlock); if (current() === reason) tryGit(['worktree', 'unlock', top], cwd); };
   gitLocks.add(unlock);
+  trapSignals(); // a `ready` still queued for its gate, or a `sync`, has no child yet but must still unlock on a signal
   return unlock;
 }
 
@@ -1948,6 +1949,7 @@ const keepTail = (s) => (s.length > 2 * OUTPUT_TAIL ? s.slice(-OUTPUT_TAIL) : s)
 // `out` (a file descriptor) also receives every byte of stdout and stderr, untrimmed.
 const spawnAsync = (cmd, args, cwd, { env = process.env, lock, onSpawn = lock?.adopt, timeout, paused = () => false, out } = {}) => new Promise((done) => {
   trapSignals();
+  startWatcher();
   const c = spawn(cmd, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], detached: true, env: lock?.token ? { ...env, PRLOOP_LOCK_TOKEN: lock.token } : env });
   if (c.pid) { groups.add(c.pid); watch(`+${c.pid}`); }
   if (c.pid && onSpawn) onSpawn(c.pid);
@@ -2000,15 +2002,18 @@ export function killGroup(pid, grace = KILL_GRACE) {
 // On SIGINT, SIGTERM or SIGHUP prloop stops every child group and removes its scratch before exiting with 128+signal.
 // Children run detached, so a terminal Ctrl-C reaches only prloop: a second signal during the grace period
 // sends KILL to every group at once instead of leaving a group that ignores TERM running.
-let trapped = false, stopping = false;
-function trapSignals() {
-  if (trapped) return;
-  trapped = true;
+const startWatcher = () => {
+  if (watcher) return;
   watcher = spawn(process.execPath, ['-e', WATCH], { detached: true, stdio: ['pipe', 'ignore', 'ignore'] });
   watcher.on('error', () => {});
   watcher.stdin.on('error', () => {});
   watcher.unref();
   watcher.stdin.unref();
+};
+let trapped = false, stopping = false;
+function trapSignals() {
+  if (trapped) return;
+  trapped = true;
   const finish = (name) => {
     for (const d of owned) dropScratch(d);
     for (const u of [...gitLocks]) u();
