@@ -23,6 +23,8 @@ Commit message mode (`--commit-msg FILE`) runs the identity checks and then refu
 
 Push mode (`--pre-push`) runs the identity checks and then reads the update list Git supplies on standard input. Every outgoing commit that no remote-tracking branch already contains must have the expected author and committer email, author and committer names in `allowed_names`, and an allowed message. Commits that other people wrote are accepted once they are reachable from a remote-tracking branch, so fetch them into one before pushing a branch that contains them.
 
+After a history rewrite every commit is new to the remote, so third-party commits such as hosting-platform merges and dependency-bot updates are outgoing again. List those identities in `allowed_foreign_identities`: an outgoing author or committer whose exact name and email match an entry is accepted, and the other role of that commit is checked as usual. A commit whose author and committer both match an entry is also exempt from the message check, because its message was written and committed elsewhere (bot messages often contain the bot's own address and package names such as `@scope/name`). Every other outgoing message is checked as usual. The list never applies to your own configured or effective identity in any mode.
+
 A repository whose Git directory is under `/tmp`, `/var/tmp` or `$TMPDIR`, and which has no remote URL, is treated as disposable and skipped. Test suites that create throwaway repositories with synthetic identities therefore keep working. Push mode never uses this exemption, because `git push <url>` publishes even from a repository without a configured remote. `$TMPDIR` is ignored when it is your home directory or one of its parents. Worktrees of real repositories keep their Git directory elsewhere and stay guarded.
 
 ## Configuration
@@ -33,11 +35,14 @@ Personal values live in a private JSON file, never in the script:
 {
   "expected_email": "12345+your-name@users.noreply.github.com",
   "allowed_names": ["Your Name"],
-  "allowed_message_emails": []
+  "allowed_message_emails": [],
+  "allowed_foreign_identities": ["GitHub <noreply@github.com>"]
 }
 ```
 
 `allowed_names` is required and must be a non-empty list. A configuration without it refuses every guarded operation with a message naming the key, so upgrading the script without updating the configuration fails closed rather than silently skipping name checks. Add every name you commit under, for example `"allowed_names": ["Your Name"]`.
+
+`allowed_foreign_identities` is optional; without it no foreign identity is accepted. When present it must be a list of `"Name <email>"` strings, matched exactly (a different name, email or case does not match). Any other shape refuses every guarded operation.
 
 The guard reads `$GIT_IDENTITY_GUARD_CONFIG` if set, otherwise `$XDG_CONFIG_HOME/git-identity-guard/config.json`, otherwise `~/.config/git-identity-guard/config.json`. A missing or invalid file, including one without `allowed_names`, refuses every guarded operation, so a broken setup fails closed. Keep the file readable only by you (`chmod 600`).
 
