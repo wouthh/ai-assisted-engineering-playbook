@@ -628,7 +628,28 @@ export function takeLock(cwd, purpose, pid = process.pid) {
   if (other) { rmSync(join(dir, name), { force: true }); return { holder: other }; }
   // Written to a new file and renamed, so a reader never sees a partial claim.
   const adopt = (kid) => { claim.children.push(child(kid)); writeFileSync(join(dir, `.${name}`), JSON.stringify(claim), { mode: 0o600 }); renameSync(join(dir, `.${name}`), join(dir, name)); };
-  return { token, adopt, release: () => rmSync(join(dir, name), { force: true }) };
+  const unlock = gitLockWorktree(cwd, `prloop ${purpose} pid ${pid}`);
+  const release = () => { unlock(); rmSync(join(dir, name), { force: true }); };
+  return { token, adopt, release };
+}
+
+// The claim alone does not stop `git worktree remove` or `prune`, so a linked worktree is also git-locked while held.
+// A lock without the `prloop ` reason prefix belongs to someone else and is left alone; one with it is stale here
+// (its claim is gone, or this one could not have been taken) and is replaced. The main worktree cannot be locked.
+// Returns the unlock, which signal exits also run (see trapSignals).
+const gitLocks = new Set();
+export function gitLockWorktree(cwd, reason) {
+  const gitDir = tryGit(['rev-parse', '--absolute-git-dir'], cwd), top = tryGit(['rev-parse', '--show-toplevel'], cwd);
+  if (!gitDir || !top || gitDir === tryGit(['rev-parse', '--path-format=absolute', '--git-common-dir'], cwd)) return () => {};
+  const file = join(gitDir, 'locked');
+  const current = () => { try { return readFileSync(file, 'utf8').trim(); } catch { return null; } };
+  const held = current();
+  if (held !== null && !held.startsWith('prloop ')) return () => {};
+  if (held !== null) tryGit(['worktree', 'unlock', top], cwd);
+  if (tryGit(['worktree', 'lock', '--reason', reason, top], cwd) === null) return () => {};
+  const unlock = () => { gitLocks.delete(unlock); if (current() === reason) tryGit(['worktree', 'unlock', top], cwd); };
+  gitLocks.add(unlock);
+  return unlock;
 }
 
 // The live claim on `cwd` that `token` does not match, or null.
@@ -1990,6 +2011,7 @@ function trapSignals() {
   watcher.stdin.unref();
   const finish = (name) => {
     for (const d of owned) dropScratch(d);
+    for (const u of [...gitLocks]) u();
     process.exit(128 + osConstants.signals[name]);
   };
   for (const name of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(name, async () => {

@@ -2267,12 +2267,17 @@ test('run never reports clean while GitHub mergeability is UNKNOWN: it polls, th
 
 // A PR with one unresolved finding and a fake `claude` whose JSON wrapper reports error_max_turns and no result line.
 // With `resolves`, the agent resolves the thread (real progress) before its session ends.
-async function runNoResultAgent(t, resolves, { body, extra = {}, cmd = 'claude', pr = fixture(), after } = {}) {
+async function runNoResultAgent(t, resolves, { body, extra = {}, cmd = 'claude', pr = fixture(), after, linked = false } = {}) {
   const state = tempState(t);
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   r.run(r.work, 'push', '-q', 'origin', 'feat');
   const head = r.run(r.work, 'rev-parse', 'HEAD');
+  if (linked) { // the PR branch in a linked worktree, as coordinators set it up
+    r.run(r.work, 'switch', '-q', '--detach');
+    r.main = r.work; r.work = join(r.dir, 'wt');
+    r.run(r.main, 'worktree', 'add', '-q', r.work, 'feat');
+  }
   writeFileSync(join(state, 'heads.json'), JSON.stringify({ 'example-org/example-repo#7': { sha: head, at: at('09:00') } }));
   Object.assign(pr, { headRefName: 'feat', headRefOid: head, mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE' });
   if (!after) pr.reviewThreads.nodes.push(thread('T1', at('10:20')));
@@ -2293,6 +2298,37 @@ ${body ?? `echo '{"type":"result","subtype":"error_max_turns","is_error":true,"r
   const [res] = await runAll({ repo: 'example-org/example-repo', pr: '7', worktree: r.work, deadline: '1h' }, { ...cfg, interval: 1, ...extra }, { metrics: idle().metrics });
   return { res, r };
 }
+
+test('a linked worktree is git-locked while a fix agent runs in it, so git worktree remove refuses until it ends', async (t) => {
+  const { res, r } = await runNoResultAgent(t, true, { linked: true, body: `git worktree remove "$PWD" 2> "$(dirname "$PWD")/remove.err"; echo $? > "$(dirname "$PWD")/remove.status"
+echo '{"status":"fixed","head":"x","fixed":["T1"],"disputed":[],"reason":"ok"}'` });
+  assert.equal(res.verdict, 'clean', JSON.stringify(res));
+  assert.notEqual(readFileSync(join(r.dir, 'remove.status'), 'utf8').trim(), '0');
+  assert.match(readFileSync(join(r.dir, 'remove.err'), 'utf8'), /cannot remove a locked working tree/);
+  assert.match(readFileSync(join(r.dir, 'remove.err'), 'utf8'), /prloop fix agent for PR #7 pid \d+/);
+  r.run(r.main, 'worktree', 'remove', r.work); // unlocked once the agent ended
+});
+
+test('the git worktree lock skips the main worktree and a lock someone else holds, and replaces a stale prloop one', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  const main = takeLock(r.work, 'fix agent'); // the main worktree cannot be git-locked; the claim still works
+  assert.ok(main.token);
+  main.release();
+  const wt = join(r.dir, 'wt'), reason = () => r.run(r.work, 'worktree', 'list', '--porcelain').match(/locked (.*)/)?.[1] ?? null;
+  r.run(r.work, 'worktree', 'add', '-q', wt, '-b', 'other');
+  r.run(r.work, 'worktree', 'lock', '--reason', 'kept by its owner', wt);
+  takeLock(wt, 'gate of PR #7').release();
+  assert.equal(reason(), 'kept by its owner'); // never taken over nor unlocked
+  r.run(r.work, 'worktree', 'unlock', wt);
+  takeLock(wt, 'crashed run', spawnSync(process.execPath, ['-e', '']).pid); // died without releasing either lock
+  assert.match(reason(), /^prloop crashed run pid \d+$/);
+  const lock = takeLock(wt, 'sync of PR #7');
+  assert.equal(reason(), `prloop sync of PR #7 pid ${process.pid}`);
+  lock.release();
+  lock.release(); // releasing twice is harmless
+  assert.equal(reason(), null);
+});
 
 test('run counts an automatic review that started during the agent as progress', async (t) => {
   const pr = fixture();
