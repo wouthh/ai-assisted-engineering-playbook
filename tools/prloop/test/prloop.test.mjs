@@ -2330,6 +2330,22 @@ test('the git worktree lock skips the main worktree and a lock someone else hold
   assert.equal(reason(), null);
 });
 
+test('a prloop killed by a signal before spawning anything still git-unlocks the worktree', async (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  const wt = join(r.dir, 'wt');
+  r.run(r.work, 'worktree', 'add', '-q', wt, '-b', 'other');
+  // Like a `ready` queued for a gate slot: the lock is held and no child exists yet.
+  const c = spawn(process.execPath, ['--input-type=module', '-e', `const { takeLock } = await import(${JSON.stringify(PRLOOP)});
+takeLock(${JSON.stringify(wt)}, 'gate of PR #7'); console.log('held'); setInterval(() => {}, 1e3);`], { stdio: ['ignore', 'pipe', 'inherit'] });
+  await new Promise((ok) => c.stdout.once('data', ok));
+  assert.match(r.run(r.work, 'worktree', 'list', '--porcelain'), /locked prloop gate of PR #7/);
+  c.kill('SIGTERM');
+  const code = await new Promise((ok) => c.on('exit', (n) => ok(n)));
+  assert.equal(code, 143);
+  assert.doesNotMatch(r.run(r.work, 'worktree', 'list', '--porcelain'), /locked/);
+});
+
 test('run counts an automatic review that started during the agent as progress', async (t) => {
   const pr = fixture();
   pr.comments.nodes = pr.comments.nodes.filter((c) => c.id !== 'IC_req'); // nothing requested yet
