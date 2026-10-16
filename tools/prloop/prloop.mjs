@@ -2329,8 +2329,8 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
         st.lowImpactMerge = undefined;
         logSaved(st, { phase: 'low_impact_merge_dropped', reason: `head ${short(s.head)} no longer qualifies; back to the normal review flow` });
       } else {
-        const missing = localGate(s, cwd, cfg.gate);
-        if (missing.length || (cfg.gate && !gateProvenance(cfg.gate, cwd)?.ok)) return gateNow(st, s, cwd, !missing.length);
+        const missing = localGate(s, cwd, gate);
+        if (missing.length || (gate && !gateProvenance(gate, cwd)?.ok)) return gateNow(st, s, cwd, !missing.length);
         return mergeNow(st, s, raw, cwd, slot, li);
       }
     }
