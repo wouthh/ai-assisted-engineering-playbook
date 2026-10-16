@@ -2600,7 +2600,7 @@ test('low-impact rounds: counted only when every finding is fixed, none disputed
   assert.equal(parseAgentResult('{"status":"fixed","head":"x","fixed":["T1"],"lowImpact":true}').status, 'fixed');
 });
 
-test('run merges after a second low-impact round once the gate passes, without another review', async (t) => {
+for (const docs of [false, true]) test(`run merges after a second low-impact round once the ${docs ? 'docs' : 'full'} gate passes, without another review`, async (t) => {
   const state = tempState(t);
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
@@ -2616,12 +2616,14 @@ test('run merges after a second low-impact round once the gate passes, without a
   // The agent fixes the nit, pushes, resolves the thread and skips the review request; it reports an abbreviated sha.
   writeFileSync(join(r.dir, 'bin', 'claude'), `#!/bin/sh
 echo "$@" > "${r.dir}/prompt"
-echo renamed > app.txt && git add app.txt && git commit -qm rename && git push -q origin feat
+echo renamed > ${docs ? 'README.md' : 'app.txt'} && git add . && git commit -qm rename && git push -q origin feat
 new=$(git rev-parse HEAD)
 node -e 'const fs = require("fs"), f = process.argv[1], j = JSON.parse(fs.readFileSync(f, "utf8")); const p = j.data.repository.pullRequest; p.headRefOid = process.argv[2]; p.reviewThreads.nodes = []; fs.writeFileSync(f, JSON.stringify(j));' "${r.dir}/pr.json" "$new"
 echo "{\\"status\\":\\"fixed\\",\\"head\\":\\"$(git rev-parse --short HEAD)\\",\\"fixed\\":[\\"T1\\"],\\"disputed\\":[],\\"lowImpact\\":true,\\"lowImpactReason\\":\\"naming nit\\"}"
 `, { mode: 0o755 });
-  const [res] = await runAll({ repo: 'example-org/example-repo', pr: '7', worktree: r.work, merge: 'squash', deadline: '1h' }, { ...cfg, gate: 'true', gateCost: 0, interval: 1 }, { metrics: idle().metrics });
+  // A docs-only head is gated by the docs gate alone; the failing full gate never runs on it.
+  const gates = docs ? { gate: 'false', docsGate: 'true', docsPaths: ['*.md'] } : { gate: 'true' };
+  const [res] = await runAll({ repo: 'example-org/example-repo', pr: '7', worktree: r.work, merge: 'squash', deadline: '1h' }, { ...cfg, ...gates, gateCost: 0, interval: 1, deadline: 20000 }, { metrics: idle().metrics });
   const fixed = r.run(r.work, 'rev-parse', 'HEAD');
   assert.equal(res.verdict, 'merged', JSON.stringify(res));
   assert.match(res.reason, /remaining external review .* was skipped as low impact \(naming nit\)/);
@@ -2633,6 +2635,7 @@ echo "{\\"status\\":\\"fixed\\",\\"head\\":\\"$(git rev-parse --short HEAD)\\",\
   assert.equal(gatePassed('true', r.work), fixed); // prloop gated the fixed head itself
   const phases = runStatus('example-org/example-repo', 50).prs[0].events.map((e) => e.phase);
   assert.ok(phases.includes('merged_low_impact'), phases.join());
+  if (docs) return;
   // A saved early merge is dropped when a later run turns the feature off: the head goes back to normal review.
   const st = JSON.parse(readFileSync(join(state, 'example-org__example-repo__7.json'), 'utf8'));
   writeFileSync(join(state, 'example-org__example-repo__7.json'), JSON.stringify({ ...st, phase: 'polling', lowImpactMerge: { head: fixed, reason: 'x' } }));
