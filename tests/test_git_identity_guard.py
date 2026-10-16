@@ -14,6 +14,8 @@ ROOT = Path(__file__).resolve().parents[1]
 GUARD = ROOT / "scripts" / "git-identity-guard.py"
 EXPECTED = "12345+synthetic-user@users.noreply.github.com"
 OTHER = "someone@synthetic-mail.net"
+NAME = "Synthetic User"
+OTHER_NAME = "Synthetic Agent"
 ZERO = "0" * 40
 
 
@@ -40,7 +42,7 @@ class GuardFixture(unittest.TestCase):
         self.base = Path(self.temporary.name)
         self.repository = self.base / "repository"
         self.config = self.base / "guard.json"
-        self.write_config({"expected_email": EXPECTED})
+        self.write_config({"expected_email": EXPECTED, "allowed_names": [NAME]})
         self.env = os.environ.copy()
         for name in list(self.env):
             if name.startswith(("GIT_AUTHOR", "GIT_COMMITTER", "GIT_CONFIG", "GIT_DIR",
@@ -53,7 +55,7 @@ class GuardFixture(unittest.TestCase):
             "HOME": str(self.base),
         })
         self.git("init", "--quiet", str(self.repository), cwd=self.base)
-        self.git("config", "user.name", "Synthetic User")
+        self.git("config", "user.name", NAME)
         self.git("config", "user.email", EXPECTED)
         self.git("config", "commit.gpgSign", "false")
         # A remote URL keeps the temporary repository guarded.
@@ -128,6 +130,40 @@ class IdentityTests(GuardFixture):
         self.write_config({"expected_email": "not-an-address"})
         self.assert_refused(self.guard(), "valid expected_email")
 
+    def test_missing_allowed_names_is_refused(self) -> None:
+        self.write_config({"expected_email": EXPECTED})
+        self.assert_refused(self.guard(), "has no allowed_names")
+
+    def test_empty_allowed_names_is_refused(self) -> None:
+        self.write_config({"expected_email": EXPECTED, "allowed_names": []})
+        self.assert_refused(self.guard(), "non-empty list of names")
+
+    def test_wrong_configured_name_is_refused(self) -> None:
+        self.git("config", "user.name", OTHER_NAME)
+        self.assert_refused(self.guard(), "user.name name")
+
+    def test_wrong_effective_author_name_is_refused(self) -> None:
+        env = {**self.env, "GIT_AUTHOR_NAME": OTHER_NAME}
+        self.assert_refused(self.guard(env=env), "author name 'Synthetic Agent'")
+
+    def test_wrong_effective_committer_name_is_refused(self) -> None:
+        env = {**self.env, "GIT_COMMITTER_NAME": OTHER_NAME}
+        self.assert_refused(self.guard(env=env), "committer name 'Synthetic Agent'")
+
+    def test_any_listed_name_passes(self) -> None:
+        self.write_config({"expected_email": EXPECTED,
+                           "allowed_names": [OTHER_NAME, NAME]})
+        env = {**self.env, "GIT_AUTHOR_NAME": OTHER_NAME}
+        result = self.guard(env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_cherry_pick_source_author_name_is_checked(self) -> None:
+        self.commit("synthetic", env={**self.env, "GIT_AUTHOR_NAME": OTHER_NAME})
+        source = self.git("rev-parse", "HEAD").stdout.strip()
+        git_dir = Path(self.git("rev-parse", "--absolute-git-dir").stdout.strip())
+        (git_dir / "CHERRY_PICK_HEAD").write_text(source + "\n", encoding="utf-8")
+        self.assert_refused(self.guard(), "cherry-pick source author name")
+
     def test_inherited_trace_destinations_are_not_written(self) -> None:
         trace = self.base / "trace.json"
         env = {**self.env, "GIT_TRACE2_EVENT": str(trace), "GIT_TRACE": str(trace)}
@@ -161,7 +197,7 @@ class MessageTests(GuardFixture):
         self.assert_refused(self.guard("--commit-msg", path), "line 3")
 
     def test_allowlisted_message_emails_pass(self) -> None:
-        self.write_config({"expected_email": EXPECTED,
+        self.write_config({"expected_email": EXPECTED, "allowed_names": [NAME],
                            "allowed_message_emails": ["bot@synthetic-mail.net"]})
         path = self.message(
             "Add feature\n\n"
@@ -194,7 +230,7 @@ class MessageTests(GuardFixture):
                 self.assert_refused(self.guard("--commit-msg", path), "line 3")
 
     def test_valid_leading_punctuation_is_not_trimmed_into_an_allowed_address(self) -> None:
-        self.write_config({"expected_email": EXPECTED,
+        self.write_config({"expected_email": EXPECTED, "allowed_names": [NAME],
                            "allowed_message_emails": ["user@synthetic-mail.net"]})
         for word in ("<!user@synthetic-mail.net>", "<{user@synthetic-mail.net>",
                      "?user@synthetic-mail.net",
@@ -218,7 +254,8 @@ class MessageTests(GuardFixture):
 
     def test_exact_unusual_allowlisted_addresses_pass_in_brackets(self) -> None:
         unusual = ["user@[192.0.2.1]", '"quoted"@synthetic-mail.net']
-        self.write_config({"expected_email": EXPECTED, "allowed_message_emails": unusual})
+        self.write_config({"expected_email": EXPECTED, "allowed_names": [NAME],
+                           "allowed_message_emails": unusual})
         path = self.message("Add feature\n\n" + "".join(
             f"Co-authored-by: Synthetic <{address}>\n" for address in unusual))
         result = self.guard("--commit-msg", path)
@@ -301,6 +338,21 @@ class PushTests(GuardFixture):
         updates = f"refs/heads/main {commit} refs/heads/main {ZERO}\n"
         self.assert_refused(self.guard("--pre-push", "origin", "url", stdin=updates),
                             "author email")
+
+    def test_outgoing_commit_with_other_author_name_is_refused(self) -> None:
+        commit = self.commit("Add feature", env={**self.env, "GIT_AUTHOR_NAME": OTHER_NAME})
+        self.commit("Follow-up")
+        head = self.git("rev-parse", "HEAD").stdout.strip()
+        updates = f"refs/heads/main {head} refs/heads/main {ZERO}\n"
+        self.assert_refused(self.guard("--pre-push", "origin", "url", stdin=updates),
+                            f"commit {commit[:12]} author name")
+
+    def test_outgoing_commit_with_other_committer_name_is_refused(self) -> None:
+        commit = self.commit("Add feature",
+                             env={**self.env, "GIT_COMMITTER_NAME": OTHER_NAME})
+        updates = f"refs/heads/main {commit} refs/heads/main {ZERO}\n"
+        self.assert_refused(self.guard("--pre-push", "origin", "url", stdin=updates),
+                            f"commit {commit[:12]} committer name")
 
     def test_outgoing_commit_message_email_is_refused(self) -> None:
         commit = self.commit(f"Add feature\n\nCo-authored-by: Synthetic <{OTHER}>")

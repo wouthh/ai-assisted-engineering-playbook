@@ -1,5 +1,11 @@
 # AI-Assisted Engineering Playbook
 
+## Why this exists
+
+Coding agents working on real repositories write code fast, but they also overwrite unexplained work, claim tests passed on a different head, commit under the wrong identity, and wait on review by polling.
+I built this playbook to keep a human in charge of scope, validation and merging while the agent does the engineering.
+It gives you written rules an agent can follow, small read-only checks that enforce them, and a review loop that spends model tokens only when there is work.
+
 This playbook documents reusable AI-assisted software-engineering workflows for scoped coding-agent tasks, automated validation and pull-request review.
 
 > **Maintained**
@@ -37,6 +43,22 @@ It is useful for individual contributors, reviewers, and teams writing repositor
 Use the root [AGENTS.md](AGENTS.md) as a small working example of repository guidance. Copy and adapt [the reusable template](templates/AGENTS.template.md) rather than copying workstation-specific policy from another project.
 
 The recommended delivery path is a refreshed upstream base, a feature branch, tests and documentation, a ready PR, review of the current head, and human acceptance or an explicitly authorized GitHub merge. The [review evidence guidance](docs/validation-and-review.md#human-and-automated-review-are-different-evidence) defines what a completed review record must capture. This guidance does not establish that every past change followed the path. Instruction maintenance is part of authorized implementation, not permission to edit projects during a read-only task. Cloud review must actually be configured; AGENTS.md alone does not enable it.
+
+## A typical run
+
+A fictional example: a team asks an agent to add a discount rule to `acme/order-service`.
+
+1. The task brief (from [the template](templates/task-brief.md)) names the goal ("orders over 100 units get 5% off"), the allowed paths (`src/pricing/`, `tests/pricing/`), and what stays out of scope (deployment, merging).
+2. The agent checks the checkout with `./scripts/repo-preflight.sh`, starts a feature branch from refreshed `main`, implements the rule with a regression test, and opens a ready PR, here #42.
+3. The repository declares its gate in `.prloop.json`, for example `{"gate": "npm test", "merge": "rebase"}`. From the PR checkout the agent runs the gate once on the pushed head and then requests review:
+
+   ```bash
+   prloop ready 42 && gh pr comment 42 --body "@codex review"
+   prloop wait 42    # exits 0 when the current head is clean, 10 with findings
+   ```
+
+4. On findings, the agent fixes them with tests, pushes, replies to and resolves each thread, and repeats step 3. A coordinator handling several PRs starts `prloop run` in the background instead and checks in rarely.
+5. A human reviews the clean head and merges, or authorizes `prloop run --merge rebase` to do it.
 
 ## Reusable templates
 
@@ -92,7 +114,7 @@ prloop run --repo owner/name --pr 42,43 --gate "npm test" --deadline 6h &   # ba
 prloop run --status --repo owner/name                        # cheap check-in
 ```
 
-Keeps PRs moving through an external reviewer bot with minimal model tokens: a plain script polls, gates review requests, syncs branches with their base, and starts a fresh agent only when there is work, with failsafes against loops. `prloop ready` and `prloop wait` are the manual, agent-in-the-loop alternative. It is a single dependency-free Node.js file that reads GitHub through `gh`. By default several `prloop` processes share one machine safely through machine-wide gate slots and load and memory limits. `status` and `ready` only read the project (`run` and `ready` also read prloop's own default branch with `git ls-remote` to warn when the installed copy is outdated); `wait` reads, and posts a read-only local review only when the bot is unavailable or `--reviewer local` is set; `sync` pushes the PR branch, `run` starts agents, `run --status` reads GitHub once per repository and marks PRs merged, closed or reopened outside a run in local state (leaving it unchanged when GitHub is unreachable), and `reset-rounds` writes only local state, each only when invoked. See [the review wait loop](docs/review-wait-loop.md) and [the command reference](tools/prloop/README.md).
+Keeps PRs moving through an external reviewer bot with minimal model tokens: a plain script polls, gates review requests, syncs branches with their base, and starts a fresh agent only when there is work, with failsafes against loops. `prloop ready` and `prloop wait` are the manual, agent-in-the-loop alternative. It is a single dependency-free Node.js file that reads GitHub through `gh`, and several `prloop` processes share one machine safely through machine-wide gate slots and load and memory limits. Most commands only read; [the command reference](tools/prloop/README.md#what-each-command-reads-and-writes) lists what each one writes. See also [the review wait loop](docs/review-wait-loop.md).
 
 ### Git identity guard
 
@@ -100,7 +122,7 @@ Keeps PRs moving through an external reviewer bot with minimal model tokens: a p
 python3 scripts/git-identity-guard.py --help
 ```
 
-A global Git hook that refuses commits, merges, patches, and pushes recording an unexpected author or committer email, and commit, patch, and outgoing commit messages containing email addresses outside an allowlist, such as co-author trailers added by coding agents. Personal values come from a private configuration file, never from the script. Throwaway test repositories in temporary storage without a remote URL are skipped. It is an accident guard: `--no-verify` and hosting-platform merges bypass it. See [the Git identity guard guide](docs/git-identity-guard.md) for installation, configuration, and limits.
+A global Git hook that refuses commits, merges, patches, and pushes recording an unexpected author or committer email or a name outside an allowlist, and commit, patch, and outgoing commit messages containing email addresses outside an allowlist, such as co-author trailers added by coding agents. Personal values come from a private configuration file, never from the script. Throwaway test repositories in temporary storage without a remote URL are skipped. It is an accident guard: `--no-verify` and hosting-platform merges bypass it. See [the Git identity guard guide](docs/git-identity-guard.md) for installation, configuration, and limits.
 
 The inspection utilities and the Git identity guard use only Bash, Python's standard library, and Git; `prloop` uses Node.js, Git and the GitHub CLI. Tests create temporary synthetic repositories or use fixture JSON and never contact the network.
 
