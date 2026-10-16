@@ -3921,6 +3921,8 @@ test('gateCpus resolves to a class or a list and picks how the gate is started',
   const c = config({}, {}, { machine: { gateCpus: 'all' } });
   assert.equal(cpusLine(c, confined, yes), 'usable 4-7 of online 0-7 (performance 0-3, efficiency 4-7), gate cpus 0-7 (all, systemd-run scope)');
   assert.equal(cpusLine(config({}, {}), flat), 'usable 0-3 of online 0-3 (one class), gate cpus 0-3 (inherit, inherited)');
+  // Without an injected probe a status line never starts a systemd scope to find out.
+  assert.equal(cpusLine(c, confined), 'usable 4-7 of online 0-7 (performance 0-3, efficiency 4-7), gate cpus 0-7 (all, systemd-run scope, not probed yet)');
   for (const bad of ['fast', '1-', 'a,b']) assert.throws(() => config({}, {}, { machine: { gateCpus: bad } }), /gateCpus must be/);
 });
 
@@ -3979,6 +3981,16 @@ test('a busy workload lowers the gate slots for new admissions only', async (t) 
   const y = idle();
   await runGate('true', dir, zero, { ...y, dir, busy: () => busy, pause: async (ms) => { y.clock.t += ms; if (y.clock.t >= 10e3) busy = null; } });
   assert.ok(y.clock.t >= 10e3);
+  // Two processes racing for the last slot under the busy limit: the one that sees the overshoot after claiming backs off.
+  writeFileSync(join(dir, `slot-2.${process.pid}.903`), ''); // slot 2, admitted before the game
+  const old = () => rmSync(join(dir, `slot-2.${process.pid}.903`));
+  const two = { ...c, gateSlotsWhenBusy: 2 };
+  let rival, v = idle();
+  const raced = await runGate('true', dir, two, { ...v, dir, busy: () => { rival ??= acquireSlot(dir, 2); return 'game'; },
+    pause: async (ms) => { v.clock.t += ms; if (v.clock.t >= 10e3) rival(); } });
+  assert.equal(raced.status, 0);
+  assert.ok(v.clock.t >= 10e3, `started at ${v.clock.t} with three gates running`);
+  old();
 });
 
 test('maxLoad as a ratio scales with the usable CPUs; an absolute value stays absolute', () => {
