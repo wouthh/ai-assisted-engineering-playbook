@@ -542,12 +542,24 @@ class ForbiddenTermTests(GuardFixture):
         self.stage(f"docs/{self.TERM}.md", "harmless\n")
         self.assert_term_refused(self.guard(), "a file path")
 
-    def test_binary_file_content_is_skipped(self) -> None:
+    def test_binary_file_content_is_checked_as_text(self) -> None:
         target = self.repository / "blob.bin"
-        target.write_bytes(b"\0" + self.TERM.encode())
+        target.write_bytes(b"\0\x0c" + self.TERM.encode())
         self.git("add", "blob.bin")
-        result = self.guard()
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_term_refused(self.guard(), "an added line in 'blob.bin'")
+
+    def test_files_marked_minus_diff_are_checked(self) -> None:
+        self.stage(".gitattributes", "*.lock -diff\n")
+        self.stage("deps.lock", f"resolved by {self.TERM}\n")
+        self.assert_term_refused(self.guard(), "an added line in 'deps.lock'")
+
+    def test_scissors_without_verbose_diff_is_checked(self) -> None:
+        # `git commit -m` keeps a literal scissors line and the text below it.
+        scissors = f"# {'-' * 24} >8 {'-' * 24}"
+        termed = self.message(f"Add notes\n{scissors}\n{self.TERM}\n")
+        self.assert_term_refused(self.guard("--commit-msg", termed), "commit message contains")
+        trailer = self.message(f"Add notes\n{scissors}\nCo-authored-by: Synthetic <{OTHER}>\n")
+        self.assert_refused(self.guard("--commit-msg", trailer), "not on the allowlist")
 
     def test_prepare_commit_msg_arguments_skip_the_staged_check(self) -> None:
         self.stage("notes.txt", f"{self.TERM}\n")

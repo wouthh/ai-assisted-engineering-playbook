@@ -374,22 +374,27 @@ def check_message_text(text: str, allowed: set[str], label: str) -> None:
 
 
 def kept_message(text: str, comments: bool) -> str:
-    """The message without the verbose diff Git always drops, and its comments.
+    """The message without the verbose diff Git drops, and its comments.
 
     `git commit -v` appends the diff below a scissors line, and Git's editor
-    template lists branch and path names as comment lines. Comment lines may
-    survive (as with `git commit -m`), so `comments=False` is only safe where
-    the push check still inspects the stored message.
+    template lists branch and path names as comment lines. Git keeps a
+    scissors line and the text below it otherwise (as with `git commit -m`),
+    so the message is cut only where the verbose diff header follows it.
+    Comment lines may survive too, so `comments=False` is only safe where the
+    push check still inspects the stored message.
     """
     comment = (git("config", "--get", "core.commentString", missing_ok=True)
                or git("config", "--get", "core.commentChar", missing_ok=True) or "#")
     if comment == "auto":
         return text  # Git picks the character per message; check every line.
     scissors = f"{comment} {'-' * 24} >8 {'-' * 24}"
+    lines = text.splitlines()
     kept = []
-    for line in text.splitlines():
+    for number, line in enumerate(lines):
         if line == scissors:
-            break
+            below = [rest for rest in lines[number + 1:] if not rest.startswith(comment)]
+            if below[:1] and below[0].startswith("diff --git "):
+                break
         if comments or not line.startswith(comment):
             kept.append(line)
     return "\n".join(kept)
@@ -443,7 +448,8 @@ def terms_exempt(config: dict, push_url: str | None) -> bool:
     return bool(urls) and all(url in config["exempt_remotes"] for url in urls)
 
 
-DIFF_OPTIONS = ("--patch-with-raw", "-U0", "-M", "--no-color", "--no-ext-diff",
+# --text also checks files that .gitattributes marks binary or -diff.
+DIFF_OPTIONS = ("--patch-with-raw", "-U0", "-M", "--text", "--no-color", "--no-ext-diff",
                 "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/")
 COMMIT_LINE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
@@ -452,11 +458,12 @@ def check_patch(patch: str, config: dict, where: str = "") -> None:
     """Check new paths (raw lines) and added lines of a patch.
 
     `git diff-tree --stdin` output starts each commit with its id, which sets
-    the label. Binary files have no added lines and are skipped implicitly.
+    the label. Lines split only at newlines, as binary content may hold other
+    line-break characters.
     """
     path = ""
     in_hunk = False
-    for line in patch.splitlines():
+    for line in patch.split("\n"):
         if COMMIT_LINE.fullmatch(line):
             where, in_hunk = f" in commit {line[:12]}", False
         elif line.startswith(":") and not in_hunk:
