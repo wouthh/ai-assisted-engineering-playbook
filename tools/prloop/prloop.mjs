@@ -759,8 +759,12 @@ let tasksetOk;
 const hasTaskset = () => (tasksetOk ??= spawnSync('taskset', ['-V'], { stdio: 'ignore' }).status === 0);
 let cpuWarned = false;
 
+// Read-only: a scope this process has not probed is reported as not probed instead of starting a transient unit.
 export function cpusLine(cfg, cpus = cpusNow(), deps = {}) {
-  const g = gateLauncher(gateCpuSet(cfg.gateCpus, cpus), cpus.allowed, deps);
+  let unprobed = false;
+  const scope = (l) => (scopeProbes.has(l) ? scopeProbes.get(l) : (unprobed = true));
+  const g = gateLauncher(gateCpuSet(cfg.gateCpus, cpus), cpus.allowed, { scope, ...deps });
+  if (unprobed) g.via += ', not probed yet';
   const classes = cpus.classes ? `performance ${formatCpuList(cpus.classes.performance)}, efficiency ${formatCpuList(cpus.classes.efficiency)}` : 'one class';
   return `usable ${formatCpuList(cpus.allowed)} of online ${formatCpuList(cpus.online ?? cpus.allowed)} (${classes}), gate cpus ${formatCpuList(g.cpus)} (${cfg.gateCpus}, ${g.via}${g.warning ? `: ${g.warning}` : ''})`;
 }
@@ -788,8 +792,13 @@ export async function runGate(gate, cwd, cfg, deps = {}) {
     const busyName = busy();
     if (busyName) slots = Math.min(slots, cfg.gateSlotsWhenBusy ?? slots);
     // A multi-slot gate keeps its full cost: one that needs more than the lower limit waits for the workload to end.
-    const fits = !busyName || slotsInUse(dir) + Math.max(1, cost) <= slots;
-    if (slots > 0 && fits && (release = acquireSlots(dir, slots, Math.max(1, cost)))) break;
+    // Counted after claiming, own claims included: processes that claim at once all see the overshoot and back off,
+    // where a count before claiming would let each pass on the same stale number.
+    if (slots > 0 && (!busyName || Math.max(1, cost) <= slots) && (release = acquireSlots(dir, slots, Math.max(1, cost)))) {
+      if (!busyName || slotsInUse(dir) <= slots) break;
+      release();
+      release = null;
+    }
     if (!logged) { logged = true; log({ event: 'waiting_for_gate_slot', slots, inUse: slotsInUse(dir), ...(busyName ? { busy: busyName } : {}) }); }
     await pause(SLOT_POLL);
   }
