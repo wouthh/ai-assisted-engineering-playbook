@@ -2376,6 +2376,20 @@ test('with --gate-tmpdir an agent run gets a private TMPDIR there, removed when 
   assert.notEqual(process.env.TMPDIR, dir); // prloop's own environment is untouched
 });
 
+test('an agent temp dir prloop cannot remove does not turn into a PR error', { skip: process.getuid?.() === 0 && 'root can remove read-only dirs' }, async (t) => {
+  const base = mkdtempSync(join(tmpdir(), 'prloop-agent-tmp-'));
+  const seen = join(base, 'seen');
+  t.after(() => { try { chmodSync(join(readFileSync(seen, 'utf8').trim(), 'ro'), 0o700); } catch {} rmSync(base, { recursive: true, force: true }); });
+  // A read-only subdir with a file makes the recursive removal fail, as a still-writing child does with ENOTEMPTY.
+  const body = `echo "$TMPDIR" > "${seen}"; mkdir "$TMPDIR/ro"; touch "$TMPDIR/ro/f"; chmod 500 "$TMPDIR/ro"`;
+  const { res } = await runNoResultAgent(t, false, { body, extra: { gateTmpdir: join(base, 'tmp') } });
+  assert.equal(res.verdict, 'blocked', JSON.stringify(res));
+  assert.doesNotMatch(res.reason, /prloop error|EACCES|ENOTEMPTY/); // the agent's own verdict, not the cleanup failure
+  const dir = readFileSync(seen, 'utf8').trim();
+  assert.ok(existsSync(dir)); // left for the dead-owner reclaim
+  assert.deepEqual(sweepTmp(join(base, 'tmp'), { dryRun: true }), { dir: join(base, 'tmp'), live: 1, stale: 0, removed: 0 }); // named for it
+});
+
 test('run kills an agent that outlives --agent-timeout and blocks with "agent timed out"', async (t) => {
   const started = Date.now();
   const base = mkdtempSync(join(tmpdir(), 'prloop-agent-gc-'));
