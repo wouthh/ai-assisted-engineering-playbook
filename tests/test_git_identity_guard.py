@@ -686,6 +686,34 @@ class ForbiddenTermTests(GuardFixture):
         self.git("update-ref", "refs/remotes/public/feature/start", "HEAD")
         self.assertEqual(self.push().returncode, 0)
 
+    def test_remote_with_only_non_url_settings_is_skipped(self) -> None:
+        # A global remote.<name>.prune lists the name in `git remote` without
+        # configuring it in this repository, so get-url fails for it.
+        global_config = self.base / "global.gitconfig"
+        global_config.write_text('[remote "ghost"]\n\tprune = true\n', encoding="utf-8")
+        self.env["GIT_CONFIG_GLOBAL"] = str(global_config)
+        self.stage("notes.txt", "clean\n")
+        result = self.guard()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.commit("Start")
+        result = self.push()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_checked_remote_glob_excludes_nested_exempt_namespace(self) -> None:
+        exempt = "git@example.invalid:cv.git"
+        self.configure(forbidden_terms_exempt_remotes=[exempt])
+        self.git("remote", "rename", "origin", "a")
+        self.git("config", "remote.a/b.url", exempt)
+        self.commit("Start")
+        self.git("update-ref", "refs/remotes/a/main", "HEAD")
+        commit = self.commit(f"About {self.TERM}")
+        self.git("update-ref", "refs/remotes/a/b/main", "HEAD")
+        self.assert_term_refused(self.push(), f"commit {commit[:12]} message contains")
+
+    def test_refused_comment_address_never_echoes_a_term(self) -> None:
+        path = self.message(f"Add notes\n# Co-authored-by: X <{self.TERM.lower()}@mail.invalid.x>\n")
+        self.assert_term_refused(self.guard("--commit-msg", path), "commit message contains")
+
     def test_term_in_pushed_ref_name_is_refused(self) -> None:
         self.commit("Start")
         for ref in (f"refs/heads/{self.TERM}", f"refs/tags/x-{self.TERM.lower()}"):
