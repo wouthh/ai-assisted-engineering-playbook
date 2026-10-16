@@ -388,7 +388,9 @@ def kept_message(text: str, comments: bool) -> str:
     if comment == "auto":
         return text  # Git picks the character per message; check every line.
     scissors = f"{comment} {'-' * 24} >8 {'-' * 24}"
-    lines = text.splitlines()
+    # Git splits lines only at \n; splitlines() would also break at U+2028
+    # and similar, turning part of a kept line into a dropped comment.
+    lines = text.split("\n")
     kept = []
     for number, line in enumerate(lines):
         if line == scissors:
