@@ -1989,7 +1989,7 @@ function trapSignals() {
   watcher.unref();
   watcher.stdin.unref();
   const finish = (name) => {
-    for (const d of owned) rmSync(d, { recursive: true, force: true });
+    for (const d of owned) dropScratch(d);
     process.exit(128 + osConstants.signals[name]);
   };
   for (const name of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(name, async () => {
@@ -2023,7 +2023,12 @@ const scratch = (cfg, prefix) => {
   owned.add(d);
   return d;
 };
-const dropScratch = (d) => { rmSync(d, { recursive: true, force: true }); owned.delete(d); };
+// Cleanup never fails a run: a dir the agent left unremovable (a child still writing, a read-only subdir) gets one
+// warning and stays for sweepTmp, which reclaims it once this prloop has exited.
+const dropScratch = (d) => {
+  try { rmSync(d, { recursive: true, force: true, maxRetries: 3 }); } catch (e) { logStderr({ event: 'tmp_cleanup_failed', dir: d, code: e.code }); }
+  owned.delete(d);
+};
 const TMP_NAME = /^prloop-(?:gate|agent|agent-out|review)-(?:(\d+)\.(\d*)\.(\d*)-)?[A-Za-z0-9]{6}$/;
 const LEGACY_TMP_AGE = 24 * 36e5;
 // Removes this user's prloop scratch dirs under `dir` whose owner process is gone; a live owner's dir is never touched.
