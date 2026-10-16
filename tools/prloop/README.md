@@ -188,6 +188,17 @@ The manual alternative, for an agent that drives one PR itself. Every command pr
 | `prloop lock-status [<dir>]` | Whether another process holds the [worktree lock](#fix-agents) of `<dir>` (default: the current directory), with its PID, purpose and start date. | 0 free, 50 locked |
 | `prloop reset-rounds <pr>` | Resets the PR's round counter once, in the state file only, and logs it. See [At the round cap](#at-the-round-cap). | 0, 40 |
 
+### What each command reads and writes
+
+Each command acts only when invoked:
+
+- `status` and `ready` only read the project. `run` and `ready` also read prloop's own default branch with `git ls-remote` to warn when the installed copy is outdated (see [Install](#install)).
+- `wait` reads, and posts a read-only [local review](#local-reviewer-fallback) only when the bot is unavailable or `--reviewer local` is set.
+- `sync` pushes the PR branch.
+- `run` starts agents and, only with `--merge`, merges PRs it gated.
+- `run --status` reads GitHub once per repository and marks PRs merged, closed or reopened outside a run in local state, leaving it unchanged when GitHub is unreachable.
+- `reset-rounds` writes only local state.
+
 `wait` verdicts:
 
 | Verdict | Exit | Meaning |

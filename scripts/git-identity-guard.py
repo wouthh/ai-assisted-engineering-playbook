@@ -5,18 +5,22 @@ Run as a global configured Git hook. The guard only reads Git state and
 refuses; it never changes configuration, identities, or commits.
 
 Identity mode (default) checks configured and effective author and committer
-emails, plus author metadata preserved by cherry-pick and rebase. Commit
+emails and names, plus author metadata preserved by cherry-pick and rebase. Commit
 message mode (--commit-msg FILE) additionally refuses email addresses in the
 message that are not on the allowlist, such as co-author trailers. Push mode
-(--pre-push) also checks the author, committer and message of every outgoing
-commit that no remote-tracking branch already contains.
+(--pre-push) also checks the author and committer email and name and the
+message of every outgoing commit that no remote-tracking branch already
+contains.
 
 Private values live in a local JSON configuration file, never in this script:
 
     {
       "expected_email": "12345+name@users.noreply.github.com",
+      "allowed_names": ["Your Name"],
       "allowed_message_emails": ["release-bot@example.com"]
     }
+
+allowed_names is required: without it every guarded operation is refused.
 
 The file is read from $GIT_IDENTITY_GUARD_CONFIG, otherwise
 $XDG_CONFIG_HOME/git-identity-guard/config.json, otherwise
@@ -35,8 +39,8 @@ import sys
 
 USAGE = """usage: git-identity-guard.py [--commit-msg FILE | --pre-push] [HOOK-ARGUMENTS...]
 
-Refuse Git operations whose identity or commit message email does not match
-the local guard configuration. Exits 0 when allowed and 1 when refused.
+Refuse Git operations whose identity (email or name) or commit message email
+does not match the local guard configuration. Exits 0 when allowed and 1 when refused.
 
   --commit-msg FILE  also check email addresses in the commit message FILE
   --pre-push         also check outgoing commits read from standard input
@@ -114,12 +118,20 @@ def load_config() -> dict:
         raise Refusal(f"guard configuration {str(path)!r} is missing or invalid") from exc
     expected = data.get("expected_email") if isinstance(data, dict) else None
     extras = data.get("allowed_message_emails", []) if isinstance(data, dict) else None
+    names = data.get("allowed_names") if isinstance(data, dict) else None
     if not isinstance(expected, str) or not CONFIG_EMAIL.fullmatch(expected):
         raise Refusal("guard configuration needs a valid expected_email")
     if not isinstance(extras, list) or not all(
             isinstance(item, str) and CONFIG_EMAIL.fullmatch(item) for item in extras):
         raise Refusal("allowed_message_emails must be a list of email addresses")
-    return {"expected": expected,
+    if names is None:
+        raise Refusal(f"guard configuration {str(path)!r} has no allowed_names; add "
+                      '"allowed_names": ["Your Name"] listing every permitted '
+                      "author and committer name")
+    if not isinstance(names, list) or not names or not all(
+            isinstance(item, str) and item.strip() for item in names):
+        raise Refusal("allowed_names must be a non-empty list of names")
+    return {"expected": expected, "names": set(names),
             "message_allowed": {expected.lower(), *(e.lower() for e in extras)}}
 
 
@@ -128,11 +140,23 @@ def require_email(label: str, email: str | None, expected: str) -> None:
         raise Refusal(f"{label} email {email!r} is not the configured address")
 
 
+def require_name(label: str, name: str | None, names: set[str]) -> None:
+    # Exact match: case or whitespace variants are different recorded names.
+    if name not in names:
+        raise Refusal(f"{label} name {name!r} is not in allowed_names")
+
+
+def require_ident(label: str, name: str | None, email: str | None,
+                  config: dict) -> None:
+    require_email(label, email, config["expected"])
+    require_name(label, name, config["names"])
+
+
 def git_path(name: str) -> pathlib.Path:
     return pathlib.Path(git("rev-parse", "--git-path", name))
 
 
-def check_source_author(path: pathlib.Path, label: str, expected: str) -> None:
+def check_source_author(path: pathlib.Path, label: str, config: dict) -> None:
     if not path.is_file():
         return
     sha = path.read_text().strip()
@@ -142,22 +166,24 @@ def check_source_author(path: pathlib.Path, label: str, expected: str) -> None:
     # verification programs and message encodings must not affect this check.
     header = git("cat-file", "commit", sha, raw=True).partition(b"\n\n")[0]
     authors = [line for line in header.splitlines() if line.startswith(b"author ")]
-    match = re.fullmatch(br"author .* <([^<>]*)> -?\d+ [+-]\d{4}", authors[0]) \
+    match = re.fullmatch(br"author ([^<>]*) <([^<>]*)> -?\d+ [+-]\d{4}", authors[0]) \
         if len(authors) == 1 else None
     if not match:
         raise Refusal(f"could not parse {label} raw identity")
-    require_email(label, match.group(1).decode("utf-8"), expected)
+    require_ident(label, match.group(1).decode("utf-8"),
+                  match.group(2).decode("utf-8"), config)
 
 
-def check_author_script(path: pathlib.Path, label: str, expected: str) -> None:
+def check_author_script(path: pathlib.Path, label: str, config: dict) -> None:
     if not path.is_file():
         return
     # Parse Git's shell-quoted data as text. Never execute/source this file.
     tokens = shlex.split(path.read_text(), comments=False, posix=True)
     emails = [t.split("=", 1)[1] for t in tokens if t.startswith("GIT_AUTHOR_EMAIL=")]
-    if len(emails) != 1:
+    names = [t.split("=", 1)[1] for t in tokens if t.startswith("GIT_AUTHOR_NAME=")]
+    if len(emails) != 1 or len(names) != 1:
         raise Refusal(f"could not validate {label} author metadata")
-    require_email(label, emails[0], expected)
+    require_ident(label, names[0], emails[0], config)
 
 
 def disposable_repository() -> bool:
@@ -185,33 +211,39 @@ def disposable_repository() -> bool:
                            missing_ok=True) is None
 
 
-def check_identity(expected: str) -> None:
+def check_identity(config: dict) -> None:
+    expected = config["expected"]
     # Catch a wrong default even when role-specific settings happen to mask it.
     for key in ("user.email", "author.email", "committer.email"):
         email = git("config", "--get", key, missing_ok=True)
         if email is None and key != "user.email":
             continue
         require_email(key, email, expected)
+    for key in ("user.name", "author.name", "committer.name"):
+        name = git("config", "--get", key, missing_ok=True)
+        if name is None and key != "user.name":
+            continue
+        require_name(key, name, config["names"])
 
     for role in ("COMMITTER", "AUTHOR"):
         ident = git("var", f"GIT_{role}_IDENT")
-        match = re.search(r"<([^<>]*)> -?\d+ [+-]\d{4}$", ident)
+        match = re.fullmatch(r"([^<>]*) <([^<>]*)> -?\d+ [+-]\d{4}", ident)
         if not match:
             raise Refusal(f"could not parse effective {role.lower()} identity")
-        require_email(role.lower(), match.group(1), expected)
+        require_ident(role.lower(), match.group(1), match.group(2), config)
 
     # The sequencer can pass a preserved author directly to commit-tree without
     # exporting it to the prepare-commit-msg hook. Inspect its local source too.
     check_source_author(git_path("CHERRY_PICK_HEAD"), "cherry-pick source author",
-                        expected)
+                        config)
     for directory in ("rebase-merge", "rebase-apply"):
         folder = git_path(directory)
         if not folder.is_dir():
             continue
-        check_author_script(folder / "author-script", f"{directory} author", expected)
-        check_source_author(git_path("REBASE_HEAD"), "rebase source author", expected)
+        check_author_script(folder / "author-script", f"{directory} author", config)
+        check_source_author(git_path("REBASE_HEAD"), "rebase source author", config)
         for name in ("stopped-sha", "original-commit"):
-            check_source_author(folder / name, f"{directory} source author", expected)
+            check_source_author(folder / name, f"{directory} source author", config)
 
 
 def message_email_allowed(email: str, allowed: set[str]) -> bool:
@@ -301,7 +333,6 @@ def check_message(path: pathlib.Path, allowed: set[str]) -> None:
 
 def check_outgoing(updates: str, config: dict) -> None:
     """Check commits a push would publish that no remote-tracking ref has."""
-    expected = config["expected"]
     for line in updates.splitlines():
         fields = line.split()
         if len(fields) != 4:
@@ -314,12 +345,13 @@ def check_outgoing(updates: str, config: dict) -> None:
             raw = git("cat-file", "commit", commit, raw=True)
             header, _, body = raw.partition(b"\n\n")
             for role in (b"author", b"committer"):
-                match = re.search(rb"^" + role + rb" .* <([^<>]*)> -?\d+ [+-]\d{4}$",
+                match = re.search(rb"^" + role + rb" ([^<>\n]*) <([^<>]*)> -?\d+ [+-]\d{4}$",
                                   header, re.MULTILINE)
                 if not match:
                     raise Refusal(f"could not parse {role.decode()} of commit {commit[:12]}")
-                require_email(f"commit {commit[:12]} {role.decode()}",
-                              match.group(1).decode("utf-8", "replace"), expected)
+                require_ident(f"commit {commit[:12]} {role.decode()}",
+                              match.group(1).decode("utf-8", "replace"),
+                              match.group(2).decode("utf-8", "replace"), config)
             check_message_text(body.decode("utf-8", "replace"),
                                config["message_allowed"], f"commit {commit[:12]} message")
 
@@ -344,16 +376,17 @@ def main(argv: list[str]) -> int:
         if not push and disposable_repository():
             return 0
         config = load_config()
-        check_identity(config["expected"])
+        check_identity(config)
         if message is not None:
             check_message(message, config["message_allowed"])
         if push:
             check_outgoing(updates, config)
     except (Refusal, OSError, UnicodeError) as exc:
         print(f"Git identity guard: refusing this operation: {exc}.", file=sys.stderr)
-        print("Use the configured email for user, author and committer settings "
-              "and in commit messages. This guard does not change identities or "
-              "rewrite commits.", file=sys.stderr)
+        print("Use the configured email and an allowed name for user, author and "
+              "committer settings, and only allowed emails in commit messages. "
+              "This guard does not change identities or rewrite commits.",
+              file=sys.stderr)
         return 1
     return 0
 
