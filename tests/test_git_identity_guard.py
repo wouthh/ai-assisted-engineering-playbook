@@ -592,6 +592,18 @@ class ForbiddenTermTests(GuardFixture):
         self.stage("notes.txt", f"{self.TERM}\n")
         self.assert_term_refused(self.guard(), "an added line")
 
+    def test_commits_only_on_an_exempt_remote_are_checked_for_another(self) -> None:
+        exempt = "git@example.invalid:cv.git"
+        self.configure(forbidden_terms_exempt_remotes=[exempt])
+        self.git("remote", "set-url", "origin", exempt)
+        self.commit("Start")
+        self.git("update-ref", "refs/remotes/public/main", "HEAD")
+        commit = self.commit(f"About {self.TERM}")
+        self.assertEqual(self.push(url=exempt).returncode, 0)
+        self.git("update-ref", "refs/remotes/origin/main", "HEAD")
+        self.git("remote", "add", "public", self.REMOTE)
+        self.assert_term_refused(self.push(), f"commit {commit[:12]} message contains")
+
     def test_exempt_fetch_url_with_public_push_url_is_checked(self) -> None:
         self.configure(forbidden_terms_exempt_remotes=[self.REMOTE])
         self.git("remote", "set-url", "--push", "origin", "https://example.invalid/public.git")
