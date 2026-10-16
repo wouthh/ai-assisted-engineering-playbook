@@ -40,7 +40,8 @@ check; every other outgoing message is checked as usual.
 forbidden_terms_exempt_remotes lists exact remote URLs. A push to one of them
 skips the forbidden-term checks; other operations skip them only when every
 configured remote pushes to an exempt URL. A push to any other URL also
-checks commits that only exempt remotes' tracking refs contain.
+checks commits that only the tracking refs of remotes with any exempt fetch or
+push URL contain.
 
 The file is read from $GIT_IDENTITY_GUARD_CONFIG, otherwise
 $XDG_CONFIG_HOME/git-identity-guard/config.json, otherwise
@@ -450,11 +451,11 @@ def check_outgoing(updates: str, config: dict) -> None:
     """Check commits a push would publish that no checked remote-tracking ref has."""
     outgoing = []
     # Commits only an exempt remote has were never term-checked, so they are
-    # outgoing too: leave out the tracking refs of remotes whose fetch and
-    # push URLs are all exempt.
+    # outgoing too: leave out the tracking refs of remotes with any exempt
+    # fetch or push URL, since a push or fetch through it skipped the checks.
     excludes = [f"--exclude={name}/*"
                 for name, kinds in (remote_urls().items() if config["terms"] else ())
-                if all(url in config["exempt_remotes"]
+                if any(url in config["exempt_remotes"]
                        for urls in kinds.values() for url in urls)]
     for line in updates.splitlines():
         fields = line.split()
@@ -463,6 +464,7 @@ def check_outgoing(updates: str, config: dict) -> None:
         local_oid = fields[1]
         if ZERO_OID.fullmatch(local_oid):
             continue  # Branch deletion: nothing is published.
+        check_terms(f"{fields[0]} {fields[2]}", "a pushed ref name", config)
         # An annotated tag publishes its own message and tagger, possibly
         # through a chain of tags; rev-list below only sees the commits.
         oid = local_oid
