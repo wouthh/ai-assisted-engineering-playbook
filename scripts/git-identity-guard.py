@@ -17,10 +17,16 @@ Private values live in a local JSON configuration file, never in this script:
     {
       "expected_email": "12345+name@users.noreply.github.com",
       "allowed_names": ["Your Name"],
-      "allowed_message_emails": ["release-bot@example.com"]
+      "allowed_message_emails": ["release-bot@example.com"],
+      "allowed_foreign_identities": ["Release Bot <release-bot@example.com>"]
     }
 
 allowed_names is required: without it every guarded operation is refused.
+allowed_foreign_identities is optional and only affects push mode: an outgoing
+commit's author or committer that exactly matches one "Name <email>" entry is
+accepted, for history that legitimately contains other people's commits. A
+commit whose author and committer both match is also exempt from the message
+check; every other outgoing message is checked as usual.
 
 The file is read from $GIT_IDENTITY_GUARD_CONFIG, otherwise
 $XDG_CONFIG_HOME/git-identity-guard/config.json, otherwise
@@ -75,6 +81,7 @@ PACKAGE_VERSION = re.compile(
     r"(?:@[A-Za-z0-9][\w.-]*/)?[A-Za-z0-9][\w.-]*"
     r"@v?[0-9]+(?:\.[0-9]+){0,2}(?:[-+][0-9A-Za-z.-]+)?")
 CONFIG_EMAIL = re.compile(r"[^@\s]+@[^@\s]+")
+CONFIG_IDENT = re.compile(r"([^<>]*[^<>\s]) <([^@\s<>]+@[^@\s<>]+)>")
 GITHUB_USER_NOREPLY = re.compile(
     r"(?:[1-9][0-9]*\+)?[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?"
     r"@users\.noreply\.github\.com")
@@ -119,6 +126,7 @@ def load_config() -> dict:
     expected = data.get("expected_email") if isinstance(data, dict) else None
     extras = data.get("allowed_message_emails", []) if isinstance(data, dict) else None
     names = data.get("allowed_names") if isinstance(data, dict) else None
+    foreign = data.get("allowed_foreign_identities", []) if isinstance(data, dict) else None
     if not isinstance(expected, str) or not CONFIG_EMAIL.fullmatch(expected):
         raise Refusal("guard configuration needs a valid expected_email")
     if not isinstance(extras, list) or not all(
@@ -131,7 +139,11 @@ def load_config() -> dict:
     if not isinstance(names, list) or not names or not all(
             isinstance(item, str) and item.strip() for item in names):
         raise Refusal("allowed_names must be a non-empty list of names")
+    if not isinstance(foreign, list) or not all(
+            isinstance(item, str) and CONFIG_IDENT.fullmatch(item) for item in foreign):
+        raise Refusal('allowed_foreign_identities must be a list of "Name <email>" strings')
     return {"expected": expected, "names": set(names),
+            "foreign": {CONFIG_IDENT.fullmatch(item).groups() for item in foreign},
             "message_allowed": {expected.lower(), *(e.lower() for e in extras)}}
 
 
@@ -344,14 +356,24 @@ def check_outgoing(updates: str, config: dict) -> None:
         for commit in commits.split():
             raw = git("cat-file", "commit", commit, raw=True)
             header, _, body = raw.partition(b"\n\n")
+            foreign_roles = 0
             for role in (b"author", b"committer"):
                 match = re.search(rb"^" + role + rb" ([^<>\n]*) <([^<>]*)> -?\d+ [+-]\d{4}$",
                                   header, re.MULTILINE)
                 if not match:
                     raise Refusal(f"could not parse {role.decode()} of commit {commit[:12]}")
-                require_ident(f"commit {commit[:12]} {role.decode()}",
-                              match.group(1).decode("utf-8", "replace"),
-                              match.group(2).decode("utf-8", "replace"), config)
+                name = match.group(1).decode("utf-8", "replace")
+                email = match.group(2).decode("utf-8", "replace")
+                # Exact name and email, so a known bot name with another
+                # address is still refused.
+                if (name, email) in config["foreign"]:
+                    foreign_roles += 1
+                    continue
+                require_ident(f"commit {commit[:12]} {role.decode()}", name, email, config)
+            if foreign_roles == 2:
+                # Written and committed entirely by others (a bot commit merged
+                # on the hosting platform); its message is not ours to police.
+                continue
             check_message_text(body.decode("utf-8", "replace"),
                                config["message_allowed"], f"commit {commit[:12]} message")
 

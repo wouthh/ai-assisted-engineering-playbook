@@ -376,6 +376,65 @@ class PushTests(GuardFixture):
         self.assertEqual(result.returncode, 0, result.stderr)
 
 
+class ForeignIdentityTests(GuardFixture):
+    BOT = {"GIT_AUTHOR_NAME": "Synthetic Bot[bot]", "GIT_AUTHOR_EMAIL": "1+bot@example.invalid",
+           "GIT_COMMITTER_NAME": "Synthetic Host", "GIT_COMMITTER_EMAIL": "host@example.invalid"}
+    ALLOWED = ["Synthetic Bot[bot] <1+bot@example.invalid>",
+               "Synthetic Host <host@example.invalid>"]
+
+    def allow(self, identities: object) -> None:
+        self.write_config({"expected_email": EXPECTED, "allowed_names": [NAME],
+                           "allowed_foreign_identities": identities})
+
+    def push_foreign_commit(self) -> subprocess.CompletedProcess[str]:
+        self.commit("Bump dependency", env={**self.env, **self.BOT})
+        head = self.commit("Add feature")
+        updates = f"refs/heads/main {head} refs/heads/main {ZERO}\n"
+        return self.guard("--pre-push", "origin", "url", stdin=updates)
+
+    def test_configured_foreign_identities_pass_on_push(self) -> None:
+        self.allow(self.ALLOWED)
+        result = self.push_foreign_commit()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_fully_foreign_commit_message_is_not_checked(self) -> None:
+        self.allow(self.ALLOWED)
+        head = self.commit(f"Bump dependency\n\nSigned-off-by: Bot <{OTHER}>",
+                           env={**self.env, **self.BOT})
+        updates = f"refs/heads/main {head} refs/heads/main {ZERO}\n"
+        result = self.guard("--pre-push", "origin", "url", stdin=updates)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_partly_foreign_commit_message_is_still_checked(self) -> None:
+        self.allow(self.ALLOWED)
+        env = {**self.env, "GIT_COMMITTER_NAME": "Synthetic Host",
+               "GIT_COMMITTER_EMAIL": "host@example.invalid"}
+        head = self.commit(f"Add feature\n\nCo-authored-by: Agent <{OTHER}>", env=env)
+        updates = f"refs/heads/main {head} refs/heads/main {ZERO}\n"
+        self.assert_refused(self.guard("--pre-push", "origin", "url", stdin=updates),
+                            "message line 3")
+
+    def test_unconfigured_foreign_identity_is_refused_on_push(self) -> None:
+        self.assert_refused(self.push_foreign_commit(), "author email")
+
+    def test_near_miss_foreign_identity_is_refused_on_push(self) -> None:
+        self.allow(["Synthetic Bot[bot] <2+bot@example.invalid>", self.ALLOWED[1]])
+        self.assert_refused(self.push_foreign_commit(), "author email")
+
+    def test_foreign_identity_is_refused_for_own_settings(self) -> None:
+        self.allow(self.ALLOWED)
+        self.git("config", "user.name", "Synthetic Host")
+        self.git("config", "user.email", "host@example.invalid")
+        self.assert_refused(self.guard(), "user.email email")
+
+    def test_malformed_foreign_identities_are_refused(self) -> None:
+        for value in ("Synthetic Host <host@example.invalid>", [42],
+                      ["host@example.invalid"], ["<host@example.invalid>"]):
+            with self.subTest(value=value):
+                self.allow(value)
+                self.assert_refused(self.guard(), "allowed_foreign_identities")
+
+
 class DisposableRepositoryTests(GuardFixture):
     def test_direct_push_from_temporary_repository_is_checked(self) -> None:
         self.git("remote", "remove", "origin")
