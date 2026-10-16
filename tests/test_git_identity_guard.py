@@ -561,6 +561,11 @@ class ForbiddenTermTests(GuardFixture):
         trailer = self.message(f"Add notes\n{scissors}\nCo-authored-by: Synthetic <{OTHER}>\n")
         self.assert_refused(self.guard("--commit-msg", trailer), "not on the allowlist")
 
+    def test_unicode_line_separator_does_not_hide_a_term(self) -> None:
+        # Git keeps "Thanks\u2028# <term>" as one non-comment line.
+        termed = self.message(f"Add notes\n\nThanks\u2028# {self.TERM}\n")
+        self.assert_term_refused(self.guard("--commit-msg", termed), "commit message contains")
+
     def test_prepare_commit_msg_arguments_skip_the_staged_check(self) -> None:
         self.stage("notes.txt", f"{self.TERM}\n")
         result = self.guard(self.message("Add notes\n"), "message")
