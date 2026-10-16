@@ -384,20 +384,20 @@ def check_message(path: pathlib.Path, config: dict) -> None:
 
 
 def remote_urls() -> dict[str, dict[str, list[str]]]:
-    """Configured remotes by name, each with its url and pushurl values."""
-    remotes: dict[str, dict[str, list[str]]] = {}
-    lines = git("config", "--get-regexp", r"^remote\..*\.(push)?url$", missing_ok=True)
-    for line in (lines or "").splitlines():
-        key, _, value = line.partition(" ")
-        name, _, kind = key.removeprefix("remote.").rpartition(".")
-        remotes.setdefault(name, {}).setdefault(kind, []).append(value)
-    return remotes
+    """Configured remotes by name, each with its fetch and push URLs.
+
+    Git resolves them after url.<base>.insteadOf and pushInsteadOf, as it does
+    for the URL it passes to the pre-push hook (a push URL falls back to the
+    fetch URL).
+    """
+    return {name: {kind: git("remote", "get-url", *flags, "--all", name).splitlines()
+                   for kind, flags in (("url", ()), ("pushurl", ("--push",)))}
+            for name in git("remote").split()}
 
 
 def push_urls() -> list[str]:
-    """URLs a push to any configured remote goes to (pushurl replaces url)."""
-    return [url for kinds in remote_urls().values()
-            for url in kinds.get("pushurl") or kinds.get("url", [])]
+    """URLs a push to any configured remote goes to."""
+    return [url for kinds in remote_urls().values() for url in kinds["pushurl"]]
 
 
 def terms_exempt(config: dict, push_url: str | None) -> bool:
@@ -451,12 +451,15 @@ def check_outgoing(updates: str, config: dict) -> None:
     """Check commits a push would publish that no checked remote-tracking ref has."""
     outgoing = []
     # Commits only an exempt remote has were never term-checked, so they are
-    # outgoing too: leave out the tracking refs of remotes with any exempt
-    # fetch or push URL, since a push or fetch through it skipped the checks.
-    excludes = [f"--exclude={name}/*"
-                for name, kinds in (remote_urls().items() if config["terms"] else ())
-                if any(url in config["exempt_remotes"]
-                       for urls in kinds.values() for url in urls)]
+    # outgoing too. Only the default tracking refs of remotes without any
+    # exempt fetch or push URL count as checked; refs anywhere else (another
+    # fetch refspec, or an exempt remote's namespace) do not.
+    published = ["--remotes"] if not config["terms"] else [
+        # Escaped, so a configured remote name never matches as a pattern.
+        "--glob=refs/remotes/" + re.sub(r"([*?[\\])", r"\\\1", name) + "/*"
+        for name, kinds in remote_urls().items()
+        if not any(url in config["exempt_remotes"]
+                   for urls in kinds.values() for url in urls)]
     for line in updates.splitlines():
         fields = line.split()
         if len(fields) != 4:
@@ -472,7 +475,7 @@ def check_outgoing(updates: str, config: dict) -> None:
             tag = git("cat-file", "tag", oid, raw=True).decode("utf-8", "replace")
             check_terms(tag, f"tag {oid[:12]}", config)
             oid = tag.partition("\n")[0].removeprefix("object ")
-        commits = git("rev-list", local_oid, "--not", *excludes, "--remotes")
+        commits = git("rev-list", local_oid, "--not", *published)
         for commit in commits.split():
             outgoing.append(commit)
             raw = git("cat-file", "commit", commit, raw=True)
