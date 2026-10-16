@@ -16,7 +16,8 @@ Optional forbidden_terms (case-insensitive substrings, such as a private name
 that must never be published) are refused in commit messages, identities,
 added lines and new paths of the staged change (pre-commit, pre-merge-commit
 and pre-applypatch, which run without hook arguments), and in the messages,
-identities, added lines and new paths of every outgoing commit on push.
+identities, added lines and new paths of every outgoing commit and in pushed
+annotated tags on push.
 Refusals never print the term or the matching text.
 
 Private values live in a local JSON configuration file, never in this script:
@@ -36,8 +37,9 @@ commit's author or committer that exactly matches one "Name <email>" entry is
 accepted, for history that legitimately contains other people's commits. A
 commit whose author and committer both match is also exempt from the message
 check; every other outgoing message is checked as usual.
-forbidden_terms_exempt_remotes lists exact remote URLs; a repository with any
-matching fetch or push URL skips the forbidden-term checks.
+forbidden_terms_exempt_remotes lists exact remote URLs. A push to one of them
+skips the forbidden-term checks; other operations skip them only when every
+configured remote pushes to an exempt URL.
 
 The file is read from $GIT_IDENTITY_GUARD_CONFIG, otherwise
 $XDG_CONFIG_HOME/git-identity-guard/config.json, otherwise
@@ -379,10 +381,25 @@ def check_message(path: pathlib.Path, config: dict) -> None:
     check_message_text(text, config["message_allowed"], "commit message")
 
 
-def terms_exempt(config: dict) -> bool:
-    urls = git("config", "--get-regexp", r"^remote\..*\.(push)?url$", missing_ok=True)
-    return any(line.partition(" ")[2] in config["exempt_remotes"]
-               for line in (urls or "").splitlines())
+def push_urls() -> list[str]:
+    """URLs a push to any configured remote goes to (pushurl replaces url)."""
+    remotes: dict[str, dict[str, list[str]]] = {}
+    lines = git("config", "--get-regexp", r"^remote\..*\.(push)?url$", missing_ok=True)
+    for line in (lines or "").splitlines():
+        key, _, value = line.partition(" ")
+        name, _, kind = key.rpartition(".")
+        remotes.setdefault(name, {}).setdefault(kind, []).append(value)
+    return [url for kinds in remotes.values()
+            for url in kinds.get("pushurl") or kinds.get("url", [])]
+
+
+def terms_exempt(config: dict, push_url: str | None) -> bool:
+    # A push is exempt only when its actual destination is; other operations
+    # only when every remote a later push could reach is exempt.
+    if push_url is not None:
+        return push_url in config["exempt_remotes"]
+    urls = push_urls()
+    return bool(urls) and all(url in config["exempt_remotes"] for url in urls)
 
 
 DIFF_OPTIONS = ("--patch-with-raw", "-U0", "-M", "--no-color", "--no-ext-diff",
@@ -433,6 +450,13 @@ def check_outgoing(updates: str, config: dict) -> None:
         local_oid = fields[1]
         if ZERO_OID.fullmatch(local_oid):
             continue  # Branch deletion: nothing is published.
+        # An annotated tag publishes its own message and tagger, possibly
+        # through a chain of tags; rev-list below only sees the commits.
+        oid = local_oid
+        while config["terms"] and git("cat-file", "-t", oid) == "tag":
+            tag = git("cat-file", "tag", oid, raw=True).decode("utf-8", "replace")
+            check_terms(tag, f"tag {oid[:12]}", config)
+            oid = tag.partition("\n")[0].removeprefix("object ")
         commits = git("rev-list", local_oid, "--not", "--remotes")
         for commit in commits.split():
             outgoing.append(commit)
@@ -491,7 +515,9 @@ def main(argv: list[str]) -> int:
         if not push and disposable_repository():
             return 0
         config = load_config()
-        if config["terms"] and terms_exempt(config):
+        # Git passes the remote name and the URL actually pushed to.
+        push_url = (argv[2] if len(argv) > 2 else "") if push else None
+        if config["terms"] and terms_exempt(config, push_url):
             config["terms"] = []
         check_identity(config)
         if message is not None:

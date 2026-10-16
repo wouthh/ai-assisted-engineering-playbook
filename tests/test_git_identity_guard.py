@@ -480,10 +480,11 @@ class ForbiddenTermTests(GuardFixture):
         target.write_text(text, encoding="utf-8")
         self.git("add", path)
 
-    def push(self) -> subprocess.CompletedProcess[str]:
-        head = self.git("rev-parse", "HEAD").stdout.strip()
-        updates = f"refs/heads/main {head} refs/heads/main {ZERO}\n"
-        return self.guard("--pre-push", "origin", "url", stdin=updates)
+    def push(self, url: str = REMOTE, ref: str = "refs/heads/main",
+             oid: str = "") -> subprocess.CompletedProcess[str]:
+        oid = oid or self.git("rev-parse", "HEAD").stdout.strip()
+        updates = f"{ref} {oid} {ref} {ZERO}\n"
+        return self.guard("--pre-push", "origin", url, stdin=updates)
 
     def test_term_in_commit_message_is_refused(self) -> None:
         path = self.message(f"Thanks {self.TERM} <{self.TERM.lower()}@mail.invalid.x>\n")
@@ -570,6 +571,35 @@ class ForbiddenTermTests(GuardFixture):
         self.commit(f"About {self.TERM}")
         result = self.push()
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_term_in_pushed_annotated_tag_is_refused(self) -> None:
+        self.commit("Start")
+        self.git("tag", "-a", "v1", "-m", f"Thanks {self.TERM}")
+        self.git("tag", "-a", "v1-outer", "-m", "Clean", "v1")
+        for ref in ("v1", "v1-outer"):
+            with self.subTest(ref=ref):
+                oid = self.git("rev-parse", ref).stdout.strip()
+                self.assert_term_refused(self.push(ref=f"refs/tags/{ref}", oid=oid), "tag ")
+
+    def test_exemption_follows_the_push_destination(self) -> None:
+        exempt = "git@example.invalid:cv.git"
+        self.configure(forbidden_terms_exempt_remotes=[exempt])
+        self.git("remote", "add", "private", exempt)
+        self.commit(f"About {self.TERM}")
+        self.assertEqual(self.push(url=exempt).returncode, 0)
+        self.assert_term_refused(self.push(), "message contains")
+        # The public origin keeps commit-time checks on as well.
+        self.stage("notes.txt", f"{self.TERM}\n")
+        self.assert_term_refused(self.guard(), "an added line")
+
+    def test_exempt_fetch_url_with_public_push_url_is_checked(self) -> None:
+        self.configure(forbidden_terms_exempt_remotes=[self.REMOTE])
+        self.git("remote", "set-url", "--push", "origin", "https://example.invalid/public.git")
+        self.stage("notes.txt", f"{self.TERM}\n")
+        self.assert_term_refused(self.guard(), "an added line")
+        self.commit(f"About {self.TERM}")
+        self.assert_term_refused(self.push(url="https://example.invalid/public.git"),
+                                 "message contains")
 
     def test_exempt_push_url_counts(self) -> None:
         self.configure(forbidden_terms_exempt_remotes=["git@example.invalid:cv.git"])
