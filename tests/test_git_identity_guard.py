@@ -613,6 +613,25 @@ class ForbiddenTermTests(GuardFixture):
         self.assert_term_refused(self.push(url="https://example.invalid/public.git"),
                                  "message contains")
 
+    def test_commits_pushed_through_an_exempt_push_url_are_checked_for_another(self) -> None:
+        exempt = "git@example.invalid:cv.git"
+        self.configure(forbidden_terms_exempt_remotes=[exempt])
+        self.git("remote", "set-url", "--push", "origin", exempt)
+        self.commit("Start")
+        self.git("update-ref", "refs/remotes/public/main", "HEAD")
+        commit = self.commit(f"About {self.TERM}")
+        self.assertEqual(self.push(url=exempt).returncode, 0)
+        self.git("update-ref", "refs/remotes/origin/main", "HEAD")
+        self.git("remote", "add", "public", "https://example.invalid/public.git")
+        self.assert_term_refused(self.push(url="https://example.invalid/public.git"),
+                                 f"commit {commit[:12]} message contains")
+
+    def test_term_in_pushed_ref_name_is_refused(self) -> None:
+        self.commit("Start")
+        for ref in (f"refs/heads/{self.TERM}", f"refs/tags/x-{self.TERM.lower()}"):
+            with self.subTest(ref=ref):
+                self.assert_term_refused(self.push(ref=ref), "a pushed ref name")
+
     def test_exempt_push_url_counts(self) -> None:
         self.configure(forbidden_terms_exempt_remotes=["git@example.invalid:cv.git"])
         self.git("remote", "set-url", "--push", "origin", "git@example.invalid:cv.git")
