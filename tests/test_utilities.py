@@ -1834,6 +1834,12 @@ class GuidanceConsistencyTests(unittest.TestCase):
                 self.assertIn("Never supervise it through a detached process plus a `pgrep -f` watcher", text)
                 self.assertIn("clear that PR's state file before rerunning, instead of spending `prloop reset-rounds`", text)
 
+    def test_supervisor_starts_from_main_checkout_in_every_guide(self) -> None:
+        for path in ("AGENTS.md", "templates/AGENTS.template.md", "docs/review-wait-loop.md", "examples/fictional-order-service/README.md"):
+            with self.subTest(path=path):
+                text = (ROOT / path).read_text(encoding="utf-8")
+                self.assertIn("started from the repository's main checkout rather than a PR worktree that is removed after its merge", text)
+
     def test_shared_scratch_and_agent_capacity_rules_are_mirrored(self) -> None:
         for path in ("templates/AGENTS.template.md", "docs/implementation-loop.md"):
             with self.subTest(path=path):
