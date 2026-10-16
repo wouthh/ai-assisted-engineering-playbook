@@ -1,6 +1,6 @@
 # Git identity guard
 
-`scripts/git-identity-guard.py` is a global Git hook that refuses commits, merges, patches and pushes when they would record an unexpected author or committer email, or when a commit message contains an email address that is not on an allowlist. It is useful when AI coding agents commit on your behalf: agents can inherit the wrong identity from a sandbox or tool default, and some add co-author trailers with their own address.
+`scripts/git-identity-guard.py` is a global Git hook that refuses commits, merges, patches and pushes when they would record an unexpected author or committer email or a name outside an allowlist, or when a commit message contains an email address that is not on an allowlist. It is useful when AI coding agents commit on your behalf: agents can inherit the wrong identity from a sandbox or tool default (an email, or a name such as a tool or bot name), and some add co-author trailers with their own address.
 
 The guard only reads Git state and exits non-zero to refuse. It never changes configuration, identities or commits, and it needs only Python's standard library and a Git release that supports configuration-based hooks. Older releases accept the `hook.<name>.*` keys but silently ignore them; after installing, confirm that `git hook list commit-msg` names the guard.
 
@@ -8,9 +8,12 @@ The guard only reads Git state and exits non-zero to refuse. It never changes co
 
 Identity mode (default):
 
-- `user.email`, `author.email` and `committer.email` from the effective Git configuration;
-- the effective author and committer identity (`git var`), which includes `GIT_AUTHOR_*` and `GIT_COMMITTER_*` environment overrides;
-- author metadata preserved by cherry-pick and rebase, read from raw commit headers and Git's operation files without executing them.
+- `user.email`, `author.email` and `committer.email` from the effective Git configuration must equal `expected_email`;
+- `user.name`, `author.name` and `committer.name` from the effective Git configuration must each be in `allowed_names`;
+- the effective author and committer identity (`git var`), which includes `GIT_AUTHOR_*` and `GIT_COMMITTER_*` environment overrides, must have the expected email and an allowed name;
+- author email and name preserved by cherry-pick and rebase, read from raw commit headers and Git's operation files without executing them.
+
+Names match exactly: a different case, extra whitespace or another spelling is a different name and must be listed separately.
 
 Commit message mode (`--commit-msg FILE`) runs the identity checks and then refuses any email address in the message that is not allowed. Every line is checked, including comment lines: a hook cannot tell whether Git will strip them, and `git commit -m` keeps them. As a consequence, `git commit -v` is refused when the included diff contains an address that is not allowed. The check fails closed. Text between `<` and `>`, the form Git trailers such as `Co-authored-by: Name <address>` use, is rejoined exactly across whitespace and lines and must match the allowlist as a whole; this is also where unusual allowlisted addresses such as quoted local parts or domain literals are matched. Outside angle brackets, every word that contains `@` (words are split at whitespace, commas and semicolons, then trimmed of opening brackets and quotes at the start and of closing brackets and punctuation at the end; characters that are valid at the start of an address, such as `!`, `'` or `{`, are kept) is treated as an address, unless the whole word is a mention such as `@name` (letters, digits, `_` and `-` only), a package scope such as `@scope/name`, or a package version of the form `name@MAJOR[.MINOR[.PATCH]][-prerelease]`, optionally scoped as `@scope/name@1.2.3`. Addresses with a numeric host such as `user@127.0.0.1`, addresses split by whitespace such as `name @domain` or `name @ domain` (a standalone `@` joins its neighbouring words, even across lines), and dotted decorators such as `@pytest.fixture` are therefore refused. An allowed address must be the entire word, with exactly one `@`. Unusual address syntax, quoted local parts, domain literals and URLs with user information are therefore refused unless they match the allowlist exactly. Allowed addresses are:
 
@@ -18,7 +21,7 @@ Commit message mode (`--commit-msg FILE`) runs the identity checks and then refu
 - GitHub's generic `noreply` and `support` addresses and `users.noreply.github.com` addresses;
 - reserved documentation domains: `example.com`, `example.net`, `example.org`, and names ending in `.example`, `.invalid` or `.test`.
 
-Push mode (`--pre-push`) runs the identity checks and then reads the update list Git supplies on standard input. Every outgoing commit that no remote-tracking branch already contains must have the expected author and committer email and an allowed message. Commits that other people wrote are accepted once they are reachable from a remote-tracking branch, so fetch them into one before pushing a branch that contains them.
+Push mode (`--pre-push`) runs the identity checks and then reads the update list Git supplies on standard input. Every outgoing commit that no remote-tracking branch already contains must have the expected author and committer email, author and committer names in `allowed_names`, and an allowed message. Commits that other people wrote are accepted once they are reachable from a remote-tracking branch, so fetch them into one before pushing a branch that contains them.
 
 A repository whose Git directory is under `/tmp`, `/var/tmp` or `$TMPDIR`, and which has no remote URL, is treated as disposable and skipped. Test suites that create throwaway repositories with synthetic identities therefore keep working. Push mode never uses this exemption, because `git push <url>` publishes even from a repository without a configured remote. `$TMPDIR` is ignored when it is your home directory or one of its parents. Worktrees of real repositories keep their Git directory elsewhere and stay guarded.
 
@@ -29,11 +32,14 @@ Personal values live in a private JSON file, never in the script:
 ```json
 {
   "expected_email": "12345+your-name@users.noreply.github.com",
+  "allowed_names": ["Your Name"],
   "allowed_message_emails": []
 }
 ```
 
-The guard reads `$GIT_IDENTITY_GUARD_CONFIG` if set, otherwise `$XDG_CONFIG_HOME/git-identity-guard/config.json`, otherwise `~/.config/git-identity-guard/config.json`. A missing or invalid file refuses every guarded operation, so a broken setup fails closed. Keep the file readable only by you (`chmod 600`).
+`allowed_names` is required and must be a non-empty list. A configuration without it refuses every guarded operation with a message naming the key, so upgrading the script without updating the configuration fails closed rather than silently skipping name checks. Add every name you commit under, for example `"allowed_names": ["Your Name"]`.
+
+The guard reads `$GIT_IDENTITY_GUARD_CONFIG` if set, otherwise `$XDG_CONFIG_HOME/git-identity-guard/config.json`, otherwise `~/.config/git-identity-guard/config.json`. A missing or invalid file, including one without `allowed_names`, refuses every guarded operation, so a broken setup fails closed. Keep the file readable only by you (`chmod 600`).
 
 ## Installation
 
