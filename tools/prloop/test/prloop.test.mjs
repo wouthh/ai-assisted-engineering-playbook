@@ -1328,6 +1328,18 @@ test('the tmp sweep removes scratch of dead owners and old unowned leftovers, ne
   assert.match(tmpLine({ gateTmpdir: dir }), new RegExp(`^prloop temp dirs in ${dir}: 3 in use, 0 left over by dead owners`));
 });
 
+test('the tmp sweep skips a dead owner\'s dir it cannot remove instead of throwing', { skip: process.getuid?.() === 0 && 'root can remove read-only dirs' }, (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'prloop-sweep-ro-'));
+  const ro = join(dir, `prloop-agent-${deadPid()}..${ns}-Ro1234`, 'ro');
+  t.after(() => { chmodSync(ro, 0o700); rmSync(dir, { recursive: true, force: true }); });
+  mkdirSync(ro, { recursive: true });
+  writeFileSync(join(ro, 'f'), '');
+  chmodSync(ro, 0o500);
+  assert.deepEqual(sweepTmp(dir), { dir, live: 0, stale: 1, removed: 0 });
+  assert.doesNotThrow(() => reclaimTmp({ gateTmpdir: dir }));
+  assert.ok(existsSync(ro));
+});
+
 test('a gate\'s whole process tree stops when prloop is killed with SIGKILL', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'prloop-sigkill-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));

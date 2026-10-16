@@ -2048,7 +2048,11 @@ export function sweepTmp(dir, { dryRun = false, now = Date.now() } = {}) {
     const stale = m[1] ? m[3] === pidNs && !alive(Number(m[1]), m[2] || null) : now - st.mtimeMs > LEGACY_TMP_AGE;
     if (!stale) r.live++;
     else if (dryRun) r.stale++;
-    else { rmSync(join(dir, f), { recursive: true, force: true }); r.removed++; }
+    else {
+      // An unremovable dir (a read-only subdir) stays counted as left over; it must never fail `run` or `ready`.
+      try { rmSync(join(dir, f), { recursive: true, force: true, maxRetries: 3 }); r.removed++; }
+      catch (e) { r.stale++; logStderr({ event: 'tmp_cleanup_failed', dir: join(dir, f), code: e.code }); }
+    }
   }
   return r;
 }
