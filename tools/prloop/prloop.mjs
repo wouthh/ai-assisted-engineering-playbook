@@ -43,8 +43,8 @@ Options (flag or env):
   --timeout <dur>           PRLOOP_TIMEOUT         default: 40m after the request
   --ack-timeout <dur>       PRLOOP_ACK_TIMEOUT     default: 3m without any reaction
   --interval <dur>          PRLOOP_INTERVAL        default: 75s between polls
-  --quota-window <dur>      PRLOOP_QUOTA_WINDOW    default: 16h; run skips review requests while a quota reply this
-                                                   recent is newer than any successful review (machine-wide memory)
+  --quota-window <dur>      PRLOOP_QUOTA_WINDOW    default: 6h; run and ready skip review requests this long after a
+                                                   quota reply naming no reset time, unless a newer review succeeded
   --reviewer-backoff <list> PRLOOP_REVIEWER_BACKOFF  default: 2m,5m,10m; run re-requests after other reviewer errors
   --max-local-reviews <n>   PRLOOP_MAX_LOCAL_REVIEWS  default: 3 per PR
   --agent claude|codex|none PRLOOP_AGENT           fix agent and local reviewer; --model, --effort
@@ -246,8 +246,8 @@ export function config(opts, env = process.env, { machine = {}, repo = {} } = {}
     forceGate: !!opts.forceGate,
     agentTimeout: parseDuration(opts.agentTimeout ?? env.PRLOOP_AGENT_TIMEOUT ?? '90m', 'agent-timeout'),
     trigger: String(opts.trigger ?? env.PRLOOP_TRIGGER ?? '@codex review'),
-    // How long a quota reply blocks review requests when no newer success arrives: a staleness fallback only.
-    quotaWindow: parseDuration(opts.quotaWindow ?? env.PRLOOP_QUOTA_WINDOW ?? machine.quotaWindow ?? '16h', 'quota-window'),
+    // How long a quota reply blocks review requests when it names no reset time and no newer success arrives.
+    quotaWindow: parseDuration(opts.quotaWindow ?? env.PRLOOP_QUOTA_WINDOW ?? machine.quotaWindow ?? '6h', 'quota-window'),
     // Waits before each re-request after a reviewer error that is not a quota reply; its length is the retry count.
     reviewerBackoff: String(opts.reviewerBackoff ?? env.PRLOOP_REVIEWER_BACKOFF ?? machine.reviewerBackoff ?? '2m,5m,10m')
       .split(',').map((d) => parseDuration(d.trim(), 'reviewer-backoff')),
@@ -1632,6 +1632,17 @@ const newer = (a, b) => (!b || (a && a > b) ? a : b);
 
 const reviewerKey = (l) => l.replace(/\[bot\]$/i, '');
 
+// The reset time a quota reply names ("try again in 3 hours", "resets at 2026-01-01T12:00Z"), or null. Only a time
+// after the reply and within a week counts; anything else falls back to --quota-window.
+const UNITS = { m: 6e4, h: 36e5, d: 864e5 };
+export function quotaResetHint(body, at) {
+  const t = Date.parse(at);
+  const rel = /(?:try again|resets?|available again)\s+(?:in|after)\s+(?:about\s+)?(\d+(?:\.\d+)?)\s*(m|min|mins|minutes?|h|hrs?|hours?|d|days?)\b/i.exec(body);
+  const abs = /resets?\s+(?:at|on)\s+([^\n]+?)(?:\.\s|\.?$|\n)/im.exec(body);
+  const ms = rel ? t + Number(rel[1]) * UNITS[rel[2][0].toLowerCase()] : abs ? Date.parse(abs[1]) : NaN;
+  return Number.isFinite(ms) && ms > t && ms - t <= 7 * UNITS.d ? new Date(ms).toISOString() : null;
+}
+
 // Every quota reply and success by the reviewer bot in one PR snapshot: issue comments and their reactions, PR-body
 // reactions, reviews and review-thread comments. Only a completed review counts as a success: a review submission, its
 // thread comments, an issue comment matching --clean-regex, or a 👍. Any other bot comment (such as the Codex review
@@ -1639,7 +1650,10 @@ const reviewerKey = (l) => l.replace(/\[bot\]$/i, '');
 export function reviewerEvents(pr, cfg) {
   dropNullNodes(pr);
   const ev = [];
-  const add = (n, at, kind) => { const t = iso(at), l = login(n); if (t && kind && cfg.reviewer.test(l)) ev.push({ login: reviewerKey(l), kind, at: t }); };
+  const add = (n, at, kind) => {
+    const t = iso(at), l = login(n), until = kind === 'quota' && t && quotaResetHint(n.body, t);
+    if (t && kind && cfg.reviewer.test(l)) ev.push({ login: reviewerKey(l), kind, at: t, ...(until ? { until } : {}) });
+  };
   const text = (n, at, ok = true) => n?.body && add(n, at, cfg.unavailable.test(n.body) ? (QUOTA.test(n.body) ? 'quota' : null) : ok ? 'ok' : null);
   const thumbs = (rs) => (rs ?? []).forEach((r) => add(r, r.createdAt, r.content === 'THUMBS_UP' ? 'ok' : null));
   thumbs(pr.reactions?.nodes);
@@ -1651,7 +1665,8 @@ export function reviewerEvents(pr, cfg) {
 
 const reviewerStateFile = () => join(stateDir(), 'reviewer-state.json');
 // Records the events under the repository owner (a newer time replaces an older one, never the reverse; `okFrom` names
-// the PR of the newest success) and returns the newest blockedAt and okAt (with okFrom) over that owner's recorded logins
+// the PR of the newest success, `blockedUntil` the reset time the newest quota reply named) and returns the newest
+// blockedAt (with blockedUntil, its login `key` and any `probe`) and okAt (with okFrom) over that owner's recorded logins
 // the reviewer regex matches. The file is rewritten through a temporary file and a rename under a one-slot claim, so
 // concurrent writers never lose an update or leave a partial file.
 export function recordReviewerEvents(events, cfg, owner, source) {
@@ -1660,28 +1675,53 @@ export function recordReviewerEvents(events, cfg, owner, source) {
     let all = {};
     try { all = JSON.parse(readFileSync(f, 'utf8')); } catch { /* first use */ }
     const before = JSON.stringify(all), mine = all[owner] ??= {};
-    const put = (entry, k, at, from) => {
-      if (newer(at, iso(entry[k])) === at && at !== entry[k]) { entry[k] = at; if (k === 'okAt') from ? entry.okFrom = from : delete entry.okFrom; }
+    const put = (entry, k, at, from, until) => {
+      if (newer(at, iso(entry[k])) !== at || at === entry[k]) return;
+      entry[k] = at;
+      if (k === 'okAt') from ? entry.okFrom = from : delete entry.okFrom;
+      else until ? entry.blockedUntil = until : delete entry.blockedUntil;
     };
     // One-time migration: entries written under `x[bot]` before logins were normalized merge into `x`, newest wins.
     for (const l of Object.keys(mine).filter((l) => reviewerKey(l) !== l)) {
       const old = mine[l], entry = mine[reviewerKey(l)] ??= {};
       delete mine[l];
-      if (old.blockedAt) put(entry, 'blockedAt', iso(old.blockedAt));
+      if (old.blockedAt) put(entry, 'blockedAt', iso(old.blockedAt), undefined, old.blockedUntil);
       if (old.okAt) put(entry, 'okAt', iso(old.okAt), old.okFrom);
     }
-    for (const e of events) put(mine[reviewerKey(e.login)] ??= {}, e.kind === 'quota' ? 'blockedAt' : 'okAt', e.at, source);
+    for (const e of events) put(mine[reviewerKey(e.login)] ??= {}, e.kind === 'quota' ? 'blockedAt' : 'okAt', e.at, source, e.until);
     if (JSON.stringify(all) !== before) {
       const tmp = `${f}.${process.pid}.${randomUUID()}.tmp`;
       writeFileSync(tmp, JSON.stringify(all, null, 2), { mode: 0o600 });
       renameSync(tmp, f);
     }
     return Object.entries(mine).filter(([l]) => cfg.reviewer.test(l) || cfg.reviewer.test(`${l}[bot]`))
-      .reduce((m, [, e]) => {
-        const blockedAt = newer(iso(e.blockedAt), m.blockedAt), ok = iso(e.okAt);
+      .reduce((m, [key, e]) => {
+        const b = iso(e.blockedAt), ok = iso(e.okAt);
+        const block = b && !(m.blockedAt >= b) ? { blockedAt: b, blockedUntil: e.blockedUntil, key, probe: e.probe } : m;
         const best = ok && !(m.okAt >= ok) ? { okAt: ok, okFrom: e.okFrom } : m;
-        return JSON.parse(JSON.stringify({ blockedAt, okAt: best.okAt, okFrom: best.okFrom })); // drops unset fields
+        return JSON.parse(JSON.stringify({ blockedAt: block.blockedAt, blockedUntil: block.blockedUntil, key: block.key, probe: block.probe,
+          okAt: best.okAt, okFrom: best.okFrom })); // drops unset fields
       }, {});
+  });
+}
+
+// Single-flight probe once a quota block has expired: the first PR to claim it (machine-wide, per owner and reviewer)
+// may request one cloud review; every other PR keeps reviewing locally until that probe's request is answered or
+// `ttl` passes. A quota reply to the probe is a newer blockedAt (a new cooldown); a success clears the block.
+// Returns the probe ({ at, from, for }) and whether `source` holds it.
+export function claimReviewerProbe(owner, key, blockedAt, source, nowMs, ttl) {
+  return withClaim(reviewerStateFile(), () => {
+    const f = reviewerStateFile();
+    let all = {};
+    try { all = JSON.parse(readFileSync(f, 'utf8')); } catch { /* first use */ }
+    const entry = (all[owner] ??= {})[key] ??= {};
+    const p = entry.probe;
+    if (p?.for === blockedAt && Date.parse(p.at) + ttl > nowMs) return { probe: p, mine: p.from === source };
+    entry.probe = { at: new Date(nowMs).toISOString(), from: source, for: blockedAt };
+    const tmp = `${f}.${process.pid}.${randomUUID()}.tmp`;
+    writeFileSync(tmp, JSON.stringify(all, null, 2), { mode: 0o600 });
+    renameSync(tmp, f);
+    return { probe: entry.probe, mine: true };
   });
 }
 
@@ -1694,18 +1734,29 @@ export const errorFrame = (e) => { const f = e?.stack?.split('\n').find((l) => /
 //   retry    re-request now (retry n of --reviewer-backoff);
 //   local    (auto) review locally instead of requesting: the reviewer is quota-blocked or errors used up the retries;
 //   blocked  (cloud) the same, without a local fallback;
-//   none     the usual flow, which may request a review; returned (instead of null) only while quota-blocked or when a
-//            success newer than the last quota reply cleared it.
+//   none     the usual flow, which may request a review; returned (instead of null) only while quota-blocked, when a
+//            success newer than the last quota reply cleared it, or with `probe` when this PR holds the single probe.
+// A quota block lasts until the reset time its reply named, else --quota-window after the reply. After that, one PR
+// claims the probe (claimReviewerProbe) and may request; the others stay blocked until the probe's expiry.
 // While quota-blocked every decision but backoff and retry carries blockedAt and until, so `run` tells any fix agent it
 // spawns (a gate failure, a request while threads were unresolved) to review locally instead of requesting. Once a newer
 // success clears a quota reply, wait and none carry `available` (its time and source PR) so `run` can log what unblocked it.
 export function reviewerDecision(pr, s, cfg, nowMs = Date.now(), owner) {
   if (cfg.mode === 'local') return null;
-  const shared = recordReviewerEvents(reviewerEvents(pr, cfg), cfg, owner, pr.url ?? (pr.number ? `#${pr.number}` : undefined));
+  const source = pr.url ?? (pr.number ? `#${pr.number}` : undefined);
+  const shared = recordReviewerEvents(reviewerEvents(pr, cfg), cfg, owner, source);
   const cleared = !!shared.blockedAt && shared.okAt >= shared.blockedAt;
-  const blockedAt = shared.blockedAt && !cleared && nowMs - Date.parse(shared.blockedAt) < cfg.quotaWindow ? shared.blockedAt : null;
-  const quota = blockedAt ? { blockedAt, until: new Date(Date.parse(blockedAt) + cfg.quotaWindow).toISOString() }
-    : cleared ? { available: { at: shared.okAt, source: shared.okFrom ?? null } } : {};
+  const untilMs = Date.parse(shared.blockedUntil ?? '') || Date.parse(shared.blockedAt) + cfg.quotaWindow;
+  let blockedAt = shared.blockedAt && !cleared && nowMs < untilMs ? shared.blockedAt : null, until = blockedAt && new Date(untilMs).toISOString(), probe;
+  // Expired and not cleared: only the PR holding the probe may request; a PR that would post nothing claims nothing.
+  if (shared.blockedAt && !cleared && !blockedAt && ['not_requested', 'timeout', 'findings', 'requested_while_unresolved'].includes(s.verdict)) {
+    const ttl = cfg.ackTimeout + cfg.timeout;
+    const c = claimReviewerProbe(owner, shared.key, shared.blockedAt, source, nowMs, ttl);
+    if (c.mine) probe = c.probe;
+    else { blockedAt = shared.blockedAt; until = new Date(Date.parse(c.probe.at) + ttl).toISOString(); }
+  }
+  const quota = blockedAt ? { blockedAt, until }
+    : cleared ? { available: { at: shared.okAt, source: shared.okFrom ?? null } } : probe ? { probe } : {};
   if (s.verdict === 'pending') return { action: 'wait', ...quota };
   const fallback = (reason) => ({ action: cfg.mode === 'auto' ? 'local' : 'blocked', reason });
   if (s.verdict === 'unavailable' && s.reviewerState.state === 'unavailable') {
@@ -1718,10 +1769,11 @@ export function reviewerDecision(pr, s, cfg, nowMs = Date.now(), owner) {
       const due = Date.parse(errors.at(-1)[1]) + cfg.reviewerBackoff[n - 1];
       return nowMs >= due ? { action: 'retry', n } : { action: 'backoff', n, wait: due - nowMs };
     }
-    return null; // a quota reply to this request: the usual unavailable handling
+    // A quota reply to this request: the usual unavailable handling, still carrying the block so no fix agent requests.
+    return blockedAt ? { action: 'none', ...quota } : null;
   }
   if (blockedAt && ['not_requested', 'timeout', 'findings'].includes(s.verdict)) return { ...fallback(`the reviewer reported its quota used up at ${blockedAt}`), ...quota };
-  return blockedAt || cleared ? { action: 'none', ...quota } : null;
+  return blockedAt || cleared || probe ? { action: 'none', ...quota } : null;
 }
 
 // ---------- supervisor ----------
@@ -2405,6 +2457,10 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
       st.quotaSeen = undefined;
       logSaved(st, { phase: 'reviewer_available', reason, okAt: d.available.at, source: d.available.source });
     }
+    if (d?.probe && st.probeLogged !== d.probe.for) {
+      st.probeLogged = d.probe.for;
+      logSaved(st, { phase: 'reviewer_probe', reason: `the quota block of ${d.probe.for} expired: this PR may request one cloud review; other PRs keep reviewing locally until it is answered` });
+    }
     if (gateFailure && s.verdict !== 'findings') {
       if (!cwd) return block(st, `no worktree has ${s.branch} checked out; pass --worktree`);
       return slot() && fix(st, s, cwd, { verdict: 'gate_failed', trigger: 'gate_failed', gateFailure, missing: [`the full gate passing on head ${short(s.head)}`], localReview: quotaLocal });
@@ -2645,8 +2701,13 @@ export async function main(argv) {
       const lock = !dir || (token && lockClaims(dir).some((c) => c.token === token)) ? { release() {} } : takeLock(cwd, `ready of PR #${prArg}`);
       if (lock.holder) return out({ verdict: 'error', error: lockMessage(cwd, lock.holder) }, EXIT.error);
       try {
-        let s = classify(fetchPr(repo, prArg), cfg);
-        const gate = await readyGate(s, cfg, cwd, { repo, adopt: lock.adopt });
+        const raw = fetchPr(repo, prArg);
+        let s = classify(raw, cfg);
+        // While the cloud reviewer is out of quota (shared machine-wide with `run`), no request is posted and the gate
+        // is not deferred for one: the head is reviewed locally.
+        const d = reviewerDecision(raw, s, cfg, Date.now(), repo.split('/')[0]);
+        const local = d?.blockedAt ? { trigger: 'local', cloudReviewUntil: d.until } : null;
+        const gate = await readyGate(s, local ? { ...cfg, reviewBeforeGate: false } : cfg, cwd, { repo, adopt: lock.adopt });
         if (gate?.cached) console.error(`gate already passed for head ${gate.cached} (${gate.run.source ?? 'unknown'} pass)`);
         const lastGate = lastGateSummary(gate?.run ?? loadState(repo, prArg).lastGate);
         if (gate && !gate.ok) return out({ ready: false, pr: s.pr, head: s.head, gate: 'failed', gateKind: gate.run?.gateKind, exitCode: gate.status, tail: gate.tail, lastGate,
@@ -2658,7 +2719,8 @@ export async function main(argv) {
         const pipelined = gate?.deferred ? { gate: 'deferred', next: 'post the review request; the full gate runs next, in parallel (`prloop run` runs it, or call `prloop ready` again after the request)' }
           : gate && cfg.reviewBeforeGate ? { gate: 'passed' } : {};
         const { gateKind } = gateFor(cfg, cwd, s);
-        return out({ ready: !missing.length, pr: s.pr, head: s.head, missing, trigger: cfg.trigger, ...(cfg.gate ? { gateKind } : {}), ...pipelined, ...(lastGate ? { lastGate } : {}) }, missing.length ? EXIT.blocked : 0);
+        const next = local && { next: `do not post a review request: the cloud reviewer is out of quota until ${d.until}; \`prloop run\` reviews this head locally` };
+        return out({ ready: !missing.length, pr: s.pr, head: s.head, missing, trigger: cfg.trigger, ...(cfg.gate ? { gateKind } : {}), ...pipelined, ...local, ...next, ...(lastGate ? { lastGate } : {}) }, missing.length ? EXIT.blocked : 0);
       } finally { lock.release(); }
     }
     if (cmd === 'wait') {

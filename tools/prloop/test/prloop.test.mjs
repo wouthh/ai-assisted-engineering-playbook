@@ -6,7 +6,7 @@ import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import {
-  EXIT, OUTPUT_TAIL, main, errorFrame, reviewerEvents, recordReviewerEvents, reviewerDecision, approvedFor, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, permissionDenied, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, sweepTmp, tmpLine, reclaimTmp, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, recordEvent, saveState, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, gateProvenance, treeRss, recordGatePass, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, reconcileStates, syncBranch, unionLines, unionResult, waitFor,
+  EXIT, OUTPUT_TAIL, main, errorFrame, reviewerEvents, recordReviewerEvents, quotaResetHint, reviewerDecision, approvedFor, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, permissionDenied, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, sweepTmp, tmpLine, reclaimTmp, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, recordEvent, saveState, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, gateProvenance, treeRss, recordGatePass, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, reconcileStates, syncBranch, unionLines, unionResult, waitFor,
   MERGEABILITY_WAIT, gateFor, limits, busyProcess, machineCpus, gateCpuSet, gateLauncher, cpusLine, parseCpuList, formatCpuList, lowImpactRound, severeFinding,
 } from '../prloop.mjs';
 
@@ -3752,7 +3752,7 @@ test('reviewer memory 1: eyes on the current head means wait, and no trigger is 
   assert.ok(!posted(calls));
 });
 
-test('reviewer memory 2: a quota reply under 16 h old blocks the request, runs a local review and is recorded', async (t) => {
+test('reviewer memory 2: a quota reply under 6 h old blocks the request, runs a local review and is recorded', async (t) => {
   const state = tempState(t);
   const pr = noRequest(fixture());
   pr.comments.nodes.push(botComment('IC_q', QUOTA, '09:30')); // the newest bot message, before this head
@@ -3766,12 +3766,12 @@ test('reviewer memory 2: a quota reply under 16 h old blocks the request, runs a
   assert.ok(!posted(calls));
 });
 
-test('reviewer memory 3: the same quota reply over 16 h old no longer blocks: a normal request follows', async (t) => {
+test('reviewer memory 3: the same quota reply over 6 h old no longer blocks: this PR claims the probe and requests', async (t) => {
   tempState(t);
   const pr = noRequest(fixture());
   pr.comments.nodes.push(botComment('IC_q', QUOTA, '09:30'));
-  assert.equal(decide(pr, ms('09:30') + 17 * H), null);
-  const { res } = await runReviewerCase(t, { nowMs: ms('09:30') + 17 * H, mutate: (p) => noRequest(p).comments.nodes.push(botComment('IC_q', QUOTA, '09:30')) });
+  assert.deepEqual(decide(pr, ms('09:30') + 7 * H), { action: 'none', probe: { at: new Date(ms('09:30') + 7 * H).toISOString(), from: pr.url, for: '2026-01-01T09:30:00.000Z' } });
+  const { res } = await runReviewerCase(t, { nowMs: ms('09:30') + 7 * H, mutate: (p) => noRequest(p).comments.nodes.push(botComment('IC_q', QUOTA, '09:30')) });
   assert.equal(res.verdict, 'not_requested', JSON.stringify(res)); // handed to a fix agent that posts the request
   assert.match(res.prompt, /not_requested/);
 });
@@ -3794,12 +3794,12 @@ test('reviewer memory 4: a newer successful review or thumbs-up, here or on anot
   assert.deepEqual(decide(pr, ms('10:10')).available, { at: '2026-01-01T09:50:00.000Z', source: 'https://github.com/example-org/other/pull/9' });
 });
 
-test('reviewer memory 5: the shared state alone blocks under 16 h and falls back to a local review', async (t) => {
+test('reviewer memory 5: the shared state alone blocks under 6 h and falls back to a local review', async (t) => {
   tempState(t);
   recordReviewerEvents([{ login: BOT.login, kind: 'quota', at: '2026-01-01T09:30:00.000Z' }], cfg, OWNER);
   const pr = noRequest(fixture()); // no quota reply on this PR; its only bot signal is an older 👍 at 09:01
   assert.equal(decide(pr, ms('10:10')).action, 'local');
-  assert.equal(decide(pr, ms('09:30') + 16 * H), null);
+  assert.equal(decide(pr, ms('09:30') + 6 * H).probe.from, pr.url);
   const { phases, calls } = await runReviewerCase(t, { nowMs: ms('10:10'), mutate: noRequest,
     shared: { [OWNER]: { [BOT.login]: { blockedAt: '2026-01-01T09:30:00.000Z' } } } });
   assert.ok(phases.includes('local_review'), phases.join());
@@ -3822,7 +3822,7 @@ test('reviewer memory 7: a newer event replaces an older one in the shared state
   rec('ok', '2026-01-01T08:00:00.000Z');
   assert.deepEqual(sharedFile(state)[OWNER][BOT.login], { blockedAt: '2026-01-01T10:00:00.000Z', okAt: '2026-01-01T08:00:00.000Z' });
   const merged = rec('quota', '2026-01-01T11:00:00.000Z');
-  assert.deepEqual(merged, { blockedAt: '2026-01-01T11:00:00.000Z', okAt: '2026-01-01T08:00:00.000Z' });
+  assert.deepEqual(merged, { blockedAt: '2026-01-01T11:00:00.000Z', key: BOT.login, okAt: '2026-01-01T08:00:00.000Z' });
   // Logins the reviewer regex does not match are kept but never read for this reviewer.
   recordReviewerEvents([{ login: 'other-bot', kind: 'quota', at: '2026-01-01T12:00:00.000Z' }], cfg, OWNER);
   assert.equal(rec('ok', '2026-01-01T07:00:00.000Z').blockedAt, '2026-01-01T11:00:00.000Z');
@@ -3894,7 +3894,7 @@ test('reviewer memory 11: cloud mode with a quota block blocks without a local f
   const { res, phases, calls } = await runReviewerCase(t, { nowMs: ms('10:10'), mutate: noRequest, shared, extra: { mode: 'cloud' } });
   assert.equal(res.verdict, 'blocked');
   assert.match(res.reason, /quota used up at 2026-01-01T09:30/);
-  assert.match(res.next, /rerun after 2026-01-02T01:30/);
+  assert.match(res.next, /rerun after 2026-01-01T15:30/);
   assert.ok(!phases.includes('local_review') && !posted(calls), phases.join());
 });
 
@@ -3921,7 +3921,7 @@ test('reviewer memory 13: while quota-blocked, fix agents for a gate failure or 
 });
 
 test('reviewer memory options: window and backoff come from flags, environment or the machine file', () => {
-  assert.equal(cfg.quotaWindow, 16 * H);
+  assert.equal(cfg.quotaWindow, 6 * H);
   assert.deepEqual(cfg.reviewerBackoff, [2 * 6e4, 5 * 6e4, 10 * 6e4]);
   assert.equal(config({}, {}, { machine: { quotaWindow: '8h' } }).quotaWindow, 8 * H);
   assert.equal(config({}, { PRLOOP_QUOTA_WINDOW: '4h' }, { machine: { quotaWindow: '8h' } }).quotaWindow, 4 * H);
@@ -4016,6 +4016,79 @@ test('reviewer memory 17: a fix agent spawned while blocked (state under `[bot]`
   assert.match(res.prompt, /Do not post a review request/);
   assert.ok(!posted(calls));
   assert.deepEqual(Object.keys(sharedFile(state)[OWNER]), [BOT.login]);
+});
+
+// ---------- quota cooldown and single-flight probe ----------
+const otherPr = (pr) => Object.assign(structuredClone(pr), { number: 8, url: 'https://github.com/example-org/example-repo/pull/8' });
+
+test('quota reset hint: a relative or absolute reset time after the reply, within a week', () => {
+  const t = '2026-01-01T09:30:00.000Z';
+  assert.equal(quotaResetHint('Usage limit reached. Try again in 3 hours.', t), '2026-01-01T12:30:00.000Z');
+  assert.equal(quotaResetHint('Your quota resets in 45 minutes', t), '2026-01-01T10:15:00.000Z');
+  assert.equal(quotaResetHint('Your limit resets at 2026-01-01T20:00:00Z.', t), '2026-01-01T20:00:00.000Z');
+  assert.equal(quotaResetHint(QUOTA, t), null);
+  assert.equal(quotaResetHint('Your limit resets at 2025-12-31T20:00:00Z.', t), null); // before the reply
+  assert.equal(quotaResetHint('Try again in 30 days.', t), null); // beyond a week
+});
+
+test('quota cooldown: a reply blocks requests on that PR and every other PR until the reset it names', (t) => {
+  const state = tempState(t);
+  const pr = noRequest(fixture());
+  pr.comments.nodes.push(botComment('IC_q', `${QUOTA} Try again in 2 hours.`, '09:30'));
+  const d = decide(pr, ms('11:00'));
+  assert.deepEqual([d.action, d.until], ['local', '2026-01-01T11:30:00.000Z']);
+  assert.equal(sharedFile(state)[OWNER][BOT.login].blockedUntil, '2026-01-01T11:30:00.000Z');
+  const other = otherPr(noRequest(fixture())); // no quota reply of its own
+  assert.equal(decide(other, ms('11:00')).action, 'local');
+  assert.equal(decide(other, ms('11:31')).probe?.from, other.url); // the named reset, not the 6 h window, ended it
+});
+
+test('quota cooldown: after expiry exactly one PR requests; a second quota reply starts a new cooldown', (t) => {
+  const state = tempState(t);
+  recordReviewerEvents([{ login: BOT.login, kind: 'quota', at: '2026-01-01T09:30:00.000Z' }], cfg, OWNER);
+  const a = noRequest(fixture()), b = otherPr(a), later = ms('09:30') + 7 * H, ttl = cfg.ackTimeout + cfg.timeout;
+  assert.deepEqual(decide(a, later), { action: 'none', probe: { at: new Date(later).toISOString(), from: a.url, for: '2026-01-01T09:30:00.000Z' } });
+  const db = decide(b, later + 6e4);
+  assert.deepEqual([db.action, db.until], ['local', new Date(later + ttl).toISOString()]); // b waits for a's probe
+  assert.equal(decide(a, later + 6e4).action, 'none'); // a still holds it
+  assert.equal(decide(b, later + ttl + 1).probe?.from, b.url); // an unanswered probe expires and passes on
+  // The probe's request gets another quota reply: every PR is blocked again for a new window, without a probe.
+  const replied = structuredClone(a);
+  replied.comments.nodes.push(botComment('IC_q2', QUOTA, '17:00'));
+  recordReviewerEvents(reviewerEvents(replied, cfg), cfg, OWNER, a.url);
+  assert.equal(sharedFile(state)[OWNER][BOT.login].blockedAt, '2026-01-01T17:00:00.000Z');
+  const again = decide(b, ms('17:10'));
+  assert.deepEqual([again.action, again.until], ['local', '2026-01-01T23:00:00.000Z']);
+});
+
+test('quota cooldown: run posts no request on another PR while a probe is out, and a quota reply is no round', async (t) => {
+  const later = ms('09:30') + 7 * H;
+  const shared = { [OWNER]: { [BOT.login]: { blockedAt: '2026-01-01T09:30:00.000Z', probe: { at: new Date(later).toISOString(), from: 'https://github.com/example-org/example-repo/pull/8', for: '2026-01-01T09:30:00.000Z' } } } };
+  const { phases, calls, res } = await runReviewerCase(t, { nowMs: later + 6e4, mutate: noRequest, shared });
+  assert.ok(phases.includes('local_review') && !posted(calls), phases.join());
+  assert.equal(res.rounds ?? 0, 0);
+});
+
+test('ready while the cloud reviewer is out of quota: no deferred gate, trigger local, no request asked for', (t) => {
+  const state = tempState(t);
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  writeFileSync(join(state, 'heads.json'), JSON.stringify({ 'example-org/example-repo#7': { sha: head, at: at('09:00') } }));
+  const blockedAt = new Date(Date.now() - H).toISOString();
+  writeFileSync(join(state, 'reviewer-state.json'), JSON.stringify({ [OWNER]: { [BOT.login]: { blockedAt } } }));
+  const pr = noRequest(fixture());
+  Object.assign(pr, { headRefName: 'feat', headRefOid: head, mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE' });
+  const calls = fakeGh(t, r.dir, pr);
+  const ran = join(r.dir, 'ran');
+  const res = spawnSync(process.execPath, [PRLOOP, 'ready', '7', '--repo', 'example-org/example-repo', '--gate', `touch "${ran}"`, '--review-before-gate', 'true'],
+    { cwd: r.work, encoding: 'utf8', env: { ...process.env, PRLOOP_LOCK_TOKEN: '', PRLOOP_GATE_WEIGHT: 'light', PRLOOP_MAX_LOAD: '100000', PRLOOP_MIN_FREE_MEM: '1K' } });
+  const out = JSON.parse(res.stdout);
+  assert.deepEqual(pick(out, ['ready', 'gate', 'trigger', 'cloudReviewUntil']), { ready: true, gate: 'passed', trigger: 'local', cloudReviewUntil: new Date(Date.parse(blockedAt) + 6 * H).toISOString() });
+  assert.match(out.next, /do not post a review request/);
+  assert.equal(existsSync(ran), true);
+  assert.ok(!posted(calls()));
 });
 
 // Null or partial GraphQL nodes (a deleted comment, a review without a submitted time, a thread without comments).
