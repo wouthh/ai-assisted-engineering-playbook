@@ -2815,6 +2815,13 @@ test('ready prints only its result line: routine tmp reclaims and cached gates s
   assert.match(readdirSync(notes).map((f) => readFileSync(join(notes, f), 'utf8')).join(''), /"event":"reclaimed_tmp"/);
 });
 
+test('a command that logs no note writes nothing to the state directory', (t) => {
+  const state = tempState(t);
+  const res = spawnSync(process.execPath, [PRLOOP, 'status'], { encoding: 'utf8', env: { ...process.env, PRLOOP_LOCK_TOKEN: '' } });
+  assert.match(res.stdout + res.stderr, /needs a PR number/);
+  assert.deepEqual(readdirSync(state), []);
+});
+
 test('a SIGKILLed ready\'s gate is stopped by the watcher, which frees the worktree lock the gate adopted', (t) => {
   tempState(t);
   const r = gitRepo();
