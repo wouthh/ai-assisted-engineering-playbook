@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -1800,6 +1801,14 @@ class GuidanceConsistencyTests(unittest.TestCase):
         self.assertIn('git diff --check "$BASE" HEAD', workflow)
         self.assertNotIn("run: git diff --check\n", workflow)
         self.assertNotIn("run: git diff --cached --check", workflow)
+
+    def test_hosted_workflow_tests_documented_node_minimum(self) -> None:
+        workflow = (ROOT / ".github/workflows/check.yml").read_text(encoding="utf-8")
+        for path in ("tools/prloop/README.md", "tools/prloop/prloop.mjs"):
+            minimum = re.search(r"Node (\d+)\+", (ROOT / path).read_text(encoding="utf-8")).group(1)
+            with self.subTest(path=path):
+                self.assertRegex(workflow, rf'node: \[[^\]]*"{minimum}"')
+        self.assertIn("node-version: ${{ matrix.node }}", workflow)
 
     def test_instruction_correction_after_false_finding_requires_authority(self) -> None:
         required = {
