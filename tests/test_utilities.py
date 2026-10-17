@@ -1794,6 +1794,13 @@ class RedactionTests(unittest.TestCase):
 
 
 class GuidanceConsistencyTests(unittest.TestCase):
+    def test_hosted_workflow_checks_whitespace_in_committed_range(self) -> None:
+        workflow = (ROOT / ".github/workflows/check.yml").read_text(encoding="utf-8")
+        self.assertIn("fetch-depth: 0", workflow)
+        self.assertIn('git diff --check "$BASE" HEAD', workflow)
+        self.assertNotIn("run: git diff --check\n", workflow)
+        self.assertNotIn("run: git diff --cached --check", workflow)
+
     def test_instruction_correction_after_false_finding_requires_authority(self) -> None:
         required = {
             "templates/AGENTS.template.md": "review-guidelines entry in a normal PR when instruction maintenance and publication are already authorized; otherwise report the gap",
