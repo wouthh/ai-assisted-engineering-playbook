@@ -1,0 +1,30 @@
+name: check
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: python3 -m unittest discover -s tests -v
+      - run: python3 -m unittest discover -s examples/fictional-order-service/tests -v
+      - run: bash -n scripts/repo-preflight.sh
+      - run: ./scripts/repo-preflight.sh --help
+      - run: python3 -m py_compile scripts/check-change-scope.py scripts/check-report-redaction.py scripts/git-identity-guard.py examples/fictional-order-service/src/order_rules.py
+      - run: python3 scripts/check-change-scope.py --help
+      - run: python3 scripts/check-report-redaction.py --help
+      - run: node --test
+      - run: ./bin/prloop --help
+      - run: python3 scripts/git-identity-guard.py --help
+      - run: git diff --check
+      - run: git diff --cached --check

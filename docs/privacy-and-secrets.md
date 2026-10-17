@@ -38,7 +38,13 @@ Do not use empty example files or realistic key-shaped strings.
 
 Scanner output can be sensitive even when the scanner labels a finding. Stream raw output through a sanitizer before persistence, store private evidence with restrictive permissions, and publish only category-level results.
 
-The included [redaction check](../scripts/check-report-redaction.py) verifies configured synthetic patterns without printing matched content. It is not a maintained credential detector. Use established scanners and human review for actual repositories.
+The included [redaction check](../scripts/check-report-redaction.py) checks text reports against named regular expressions, such as configured synthetic patterns. Findings report the rule, file, and line without printing matched content. It is a defense-in-depth check, not a maintained credential detector or a replacement for privacy review and human inspection. Use established scanners and human review for actual repositories.
+
+```bash
+python3 scripts/check-report-redaction.py \
+  --patterns synthetic-patterns.tsv \
+  report.txt
+```
 
 ## Public documentation
 
