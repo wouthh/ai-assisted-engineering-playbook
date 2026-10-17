@@ -1185,7 +1185,8 @@ const hasMarkers = (cwd, f) => { try { return MARKER.test(readFileSync(join(cwd,
 // With `regenerate`, conflicts limited to generated files take the base side and the command runs once at the end.
 // `resume` (`sync --continue`) leaves manual conflicts in the working tree instead of aborting, and on the next call
 // continues the sync in progress: the caller resolved them by hand.
-export function syncBranch({ cwd, branch, base, baseOid, head, settings, union = [], generated = [], regenerate, approvedRegenerate = [], setup, remote = 'origin', rebase: forceRebase = false, resume = false }) {
+export async function syncBranch({ cwd, branch, base, baseOid, head, settings, union = [], generated = [], regenerate, approvedRegenerate = [], cfg = {}, deps = {}, remote = 'origin', rebase: forceRebase = false, resume = false }) {
+  const { setup } = cfg;
   // A fork PR's branch usually tracks its own remote; push there, not to the base repository.
   const headRemote = tryGit(['config', `branch.${branch}.remote`], cwd) || remote;
   // Sync to the fetched base branch: GitHub's baseRefOid can lag far behind it, and a branch that contains that
@@ -1452,7 +1453,8 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
       // virtualenv) must not ride along in the regeneration commit.
       const status = () => git(['status', '--porcelain', '-z', '--untracked-files=all'], cwd);
       const clean = status();
-      const r = spawnSync('sh', ['-c', setup], { cwd, stdio: 'ignore' });
+      // Heavy work like before a gate: admitted and slotted through runGate (`cfg`, `deps`), one slot even for a light gate.
+      const r = await runGate(`${setup}\n`, cwd, { ...cfg, gateCost: Math.max(1, cfg.gateCost ?? 1) }, deps);
       if (r.status !== 0) return fail(`setup command failed before regenerating (${setup}, exit ${r.status}); run it in the checkout to see why`);
       if (status() !== clean) return fail(`setup command changed tracked or unignored files before regenerating (${setup}); make it leave the tree clean (ignore its output, keep the lockfile current) and rerun \`prloop sync\``);
       writeFileSync(prep.file, prep.key);
@@ -2362,11 +2364,11 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
 
   // Locked like a standalone sync, so two supervisors never fetch, merge or push in one checkout at once.
   // Returns the sync result only when the branch was already up to date; otherwise it handled the outcome.
-  function syncPr(st, s, raw, cwd, slot, rebase = opts.merge === 'rebase') {
+  async function syncPr(st, s, raw, cwd, slot, rebase = opts.merge === 'rebase') {
     const lock = takeLock(cwd, `sync of PR #${st.pr}`);
     if (lock.holder) return lockedOut(st, cwd, lock.holder);
     let v;
-    try { v = syncBranch({ cwd, branch: s.branch, base: s.base, baseOid: raw.baseRefOid, head: s.head, settings: raw.repoSettings, union: opts.union, generated: opts.generated, regenerate: opts.regenerate, approvedRegenerate: approvedFor(opts.approvedRegenerate, repo), setup: cfg.setup, rebase }); } finally { lock.release(); }
+    try { v = await syncBranch({ cwd, branch: s.branch, base: s.base, baseOid: raw.baseRefOid, head: s.head, settings: raw.repoSettings, union: opts.union, generated: opts.generated, regenerate: opts.regenerate, approvedRegenerate: approvedFor(opts.approvedRegenerate, repo), cfg, deps: { metrics, now, log: ({ event: phase, ...e }) => logEvent(st, { phase, ...e }) }, rebase }); } finally { lock.release(); }
     if (v.verdict === 'error') return block(st, `sync failed: ${v.error}`);
     if (v.verdict === 'synced' && v.unchanged && s.verdict === 'clean') {
       st.carry = recordCarry(repo, st.pr, s.head, v);
@@ -2378,7 +2380,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
   }
 
   // Merges a head that passed every merge check (a clean review, or a low-impact early merge `low`).
-  function mergeNow(st, s, raw, cwd, slot, low) {
+  async function mergeNow(st, s, raw, cwd, slot, low) {
     if (s.mergeable !== 'MERGEABLE') return s.mergeable === 'UNKNOWN' ? undefined : block(st, `GitHub reports mergeable=${s.mergeable}`);
     const merge = () => sh('gh', ['pr', 'merge', String(st.pr), '--repo', repo, `--${opts.merge}`, '--match-head-commit', s.head]);
     try { merge(); } catch (e) {
@@ -2389,7 +2391,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
       if (opts.merge !== 'rebase' || st.mergeRetried || !/merge commits?|can(?:no|')t be rebased/i.test(why)) return block(st, `GitHub refused the merge: ${why}`);
       st.mergeRetried = true;
       logEvent(st, { phase: 'merge_refused', reason: `${why}; syncing (linearize) and retrying once` });
-      const v = syncPr(st, s, raw, cwd, slot, true);
+      const v = await syncPr(st, s, raw, cwd, slot, true);
       if (v?.verdict !== 'up_to_date') return v;
       try { merge(); } catch (e2) { return block(st, `GitHub refused the merge again: ${String(e2.stderr || e2.message).trim().slice(0, 300)}`); }
     }
@@ -2434,7 +2436,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     // state before a merge; an unchanged patch carries the clean review, so this costs no new review.
     if (s.mergeState === 'BEHIND' || s.mergeState === 'DIRTY' || s.mergeable === 'CONFLICTING') {
       if (!cwd) return block(st, `PR is ${s.mergeState} and no worktree has ${s.branch}; pass --worktree`);
-      const v = syncPr(st, s, raw, cwd, slot);
+      const v = await syncPr(st, s, raw, cwd, slot);
       if (v?.verdict !== 'up_to_date') return v;
     }
     // GitHub computes mergeability lazily and reports UNKNOWN right after the base or head moved. `clean` is terminal,
@@ -2444,7 +2446,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
       st.unknownSince ??= now();
       if (now() - st.unknownSince < MERGEABILITY_WAIT) return;
       if (!cwd) return block(st, `GitHub mergeability stayed UNKNOWN and no worktree has ${s.branch}; pass --worktree`);
-      const v = syncPr(st, s, raw, cwd, slot);
+      const v = await syncPr(st, s, raw, cwd, slot);
       if (v?.verdict !== 'up_to_date') return v;
     }
     // Pipelined review: once the head is requested (or already reviewed clean), prloop runs the gate itself, in parallel
@@ -2789,7 +2791,7 @@ export async function main(argv) {
       try {
         const pr = fetchPr(repo, prArg);
         const clean = classify(pr, cfg).verdict === 'clean';
-        const v = syncBranch({ cwd, branch: pr.headRefName, base: pr.baseRefName, baseOid: pr.baseRefOid, head: pr.headRefOid, settings: pr.repoSettings, union: opts.union, generated: opts.generated, regenerate: opts.regenerate, approvedRegenerate: approvedFor(opts.approvedRegenerate, repo), setup: cfg.setup, resume: !!opts.continue });
+        const v = await syncBranch({ cwd, branch: pr.headRefName, base: pr.baseRefName, baseOid: pr.baseRefOid, head: pr.headRefOid, settings: pr.repoSettings, union: opts.union, generated: opts.generated, regenerate: opts.regenerate, approvedRegenerate: approvedFor(opts.approvedRegenerate, repo), cfg, resume: !!opts.continue });
         const carry = v.verdict === 'synced' && v.unchanged && clean ? recordCarry(repo, prArg, pr.headRefOid, v) : undefined;
         return out({ pr: Number(prArg), ...v, carry }, v.verdict === 'conflict' ? EXIT.conflict : v.verdict === 'error' ? EXIT.error : 0);
       } finally { lock.release(); }
