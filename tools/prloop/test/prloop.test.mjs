@@ -3521,22 +3521,35 @@ test('setup: installs dependencies before any gate kind in a fresh worktree, onc
   const runs = () => (existsSync(join(r.dir, 'setup-runs')) ? readFileSync(join(r.dir, 'setup-runs'), 'utf8').split('\n').filter(Boolean).length : 0);
   // Without setup the docs gate fails on the missing tool, as in a fresh worktree.
   assert.equal((await readyGate(pr(), c, r.work, deps)).ok, false);
-  const g = await readyGate(pr(), { ...c, setup }, r.work, deps);
+  // A trailing comment in setup or gate cannot swallow the join; the fresh setup takes a slot even before a docs gate.
+  const slotted = `${setup} && ls ../slots | wc -l > ../setup-slots # install deps`;
+  const g = await readyGate(pr(), { ...c, setup: slotted, docsGate: `${c.docsGate} # docs` }, r.work, deps);
   assert.deepEqual(pick(g.run, ['gateKind', 'status']), { gateKind: 'docs', status: 0 });
   assert.equal(runs(), 1);
+  assert.notEqual(readFileSync(join(r.dir, 'setup-slots'), 'utf8').trim(), '0');
+  const g2 = await readyGate(pr(), { ...c, setup }, r.work, deps);
+  assert.equal(g2.run.status, 0);
+  assert.equal(runs(), 2);
   assert.equal(gatePassed(c.docsGate, r.work), pr().head); // cached under the gate command alone
   // A new head with the same lockfiles reuses the setup; the full gate kind gets it too.
   r.commit('code', { 'app.txt': 'two\n' });
   assert.equal((await readyGate(pr(), { ...c, setup }, r.work, deps)).run.gateKind, 'full');
-  assert.equal(runs(), 1);
+  assert.equal(runs(), 2);
+  // Unrelated files whose names contain "lock" keep the install; a changed manifest without "lock" in its name reruns it.
+  r.commit('clock', { 'clock.ts': 'x\n', 'docs/deadlock.md': 'x\n' });
+  assert.equal((await readyGate(pr(), { ...c, setup }, r.work, deps)).ok, true);
+  assert.equal(runs(), 2);
+  r.commit('reqs', { 'requirements.txt': 'a==1\n' });
+  assert.equal((await readyGate(pr(), { ...c, setup }, r.work, deps)).ok, true);
+  assert.equal(runs(), 3);
   // A changed lockfile, or a removed install with a changed command, runs it again.
   r.commit('bump', { 'package-lock.json': 'v2\n' });
   assert.equal((await readyGate(pr(), { ...c, setup }, r.work, deps)).ok, true);
-  assert.equal(runs(), 2);
+  assert.equal(runs(), 4);
   rmSync(join(r.work, 'node_modules'), { recursive: true });
   r.commit('code 2', { 'app.txt': 'three\n' });
   assert.equal((await readyGate(pr(), { ...c, setup: `${setup} && true` }, r.work, deps)).ok, true);
-  assert.equal(runs(), 3);
+  assert.equal(runs(), 5);
   // A failing setup fails the gate and is retried next time.
   r.commit('code 3', { 'app.txt': 'four\n' });
   assert.equal((await readyGate(pr(), { ...c, setup: 'exit 4' }, r.work, deps)).ok, false);
