@@ -1750,7 +1750,8 @@ export function reviewerDecision(pr, s, cfg, nowMs = Date.now(), owner) {
   let blockedAt = shared.blockedAt && !cleared && nowMs < untilMs ? shared.blockedAt : null, until = blockedAt && new Date(untilMs).toISOString(), probe;
   // Expired and not cleared: only the PR holding the probe may request; a PR that would post nothing claims nothing.
   if (shared.blockedAt && !cleared && !blockedAt && ['not_requested', 'timeout', 'findings', 'requested_while_unresolved'].includes(s.verdict)) {
-    const ttl = cfg.ackTimeout + cfg.timeout;
+    // The probe is claimed when its fix agent starts, so it lasts that agent's run (gate included) plus the request's wait.
+    const ttl = cfg.agentTimeout + cfg.ackTimeout + cfg.timeout;
     const c = claimReviewerProbe(owner, shared.key, shared.blockedAt, source, nowMs, ttl);
     if (c.mine) probe = c.probe;
     else { blockedAt = shared.blockedAt; until = new Date(Date.parse(c.probe.at) + ttl).toISOString(); }
@@ -2706,8 +2707,9 @@ export async function main(argv) {
         // While the cloud reviewer is out of quota (shared machine-wide with `run`), no request is posted and the gate
         // is not deferred for one: the head is reviewed locally.
         const d = reviewerDecision(raw, s, cfg, Date.now(), repo.split('/')[0]);
-        const local = d?.blockedAt ? { trigger: 'local', cloudReviewUntil: d.until } : null;
-        const gate = await readyGate(s, local ? { ...cfg, reviewBeforeGate: false } : cfg, cwd, { repo, adopt: lock.adopt });
+        // Only `auto` falls back to a local review; `cloud` blocks the PR until the cooldown or probe ends.
+        const quota = d?.blockedAt ? { cloudReviewUntil: d.until, trigger: cfg.mode === 'auto' ? 'local' : 'blocked' } : null;
+        const gate = await readyGate(s, quota ? { ...cfg, reviewBeforeGate: false } : cfg, cwd, { repo, adopt: lock.adopt });
         if (gate?.cached) console.error(`gate already passed for head ${gate.cached} (${gate.run.source ?? 'unknown'} pass)`);
         const lastGate = lastGateSummary(gate?.run ?? loadState(repo, prArg).lastGate);
         if (gate && !gate.ok) return out({ ready: false, pr: s.pr, head: s.head, gate: 'failed', gateKind: gate.run?.gateKind, exitCode: gate.status, tail: gate.tail, lastGate,
@@ -2719,8 +2721,8 @@ export async function main(argv) {
         const pipelined = gate?.deferred ? { gate: 'deferred', next: 'post the review request; the full gate runs next, in parallel (`prloop run` runs it, or call `prloop ready` again after the request)' }
           : gate && cfg.reviewBeforeGate ? { gate: 'passed' } : {};
         const { gateKind } = gateFor(cfg, cwd, s);
-        const next = local && { next: `do not post a review request: the cloud reviewer is out of quota until ${d.until}; \`prloop run\` reviews this head locally` };
-        return out({ ready: !missing.length, pr: s.pr, head: s.head, missing, trigger: cfg.trigger, ...(cfg.gate ? { gateKind } : {}), ...pipelined, ...local, ...next, ...(lastGate ? { lastGate } : {}) }, missing.length ? EXIT.blocked : 0);
+        const next = quota && { next: `do not post a review request: the cloud reviewer is out of quota until ${d.until}; \`prloop run\` ${cfg.mode === 'auto' ? 'reviews this head locally' : 'keeps this PR blocked until then'}` };
+        return out({ ready: !missing.length, pr: s.pr, head: s.head, missing, trigger: cfg.trigger, ...(cfg.gate ? { gateKind } : {}), ...pipelined, ...quota, ...next, ...(lastGate ? { lastGate } : {}) }, missing.length ? EXIT.blocked : 0);
       } finally { lock.release(); }
     }
     if (cmd === 'wait') {
