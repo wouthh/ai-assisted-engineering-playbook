@@ -23,7 +23,7 @@ Describe what this repository owns and the audience it serves.
 - Identify allowed areas for ordinary work.
 - Identify changes that require a separate plan or explicit approval.
 - Separate implementation from merge, deployment, provider access, and destructive recovery.
-- Scripts and tools that coordinators run in the background print only when a human or agent must act, or a single line when done; everything else goes to a log file.
+- Every script and tool that agents or coordinators run (review loops, waiters, helpers, gates, project scripts, deploy and migration runners) prints nothing when nothing needs to happen. It handles routine cases itself (such as a review bot's quota reply) and prints only when a human or agent must act or decide, or one short line when a requested run is done; everything else goes to a log file. When writing or changing a script, apply this, and fix an existing script that breaks it in the same change when the fix is small.
 - Keep no permanent compatibility code for state from before a change: no legacy branches, aliases, shims, or fallbacks for old data or names. First check whether any real environment still holds the old state; if none does, just make the change, and if one does, prefer a one-time migration that converts that state (data, receipts, names) so the code only knows the new shape.
 
 ## Architecture and invariants

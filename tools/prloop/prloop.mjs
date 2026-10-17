@@ -509,7 +509,8 @@ export function classify(pr, cfg, nowMs = Date.now()) {
 const GiB = 2 ** 30;
 const SLOT_POLL = 5e3;
 const gib = (b) => (b / GiB).toFixed(1);
-// Diagnostics go to stderr, except during `run`: there they go to its run log, so the summary is its only output.
+// Diagnostics never reach the terminal: `run` writes them to its run log, every other command to a daily notes log
+// (pruned with the agent and gate logs), so a command's verdict is its only output.
 let noteLog = null;
 const logNote = (e) => {
   const line = JSON.stringify({ at: new Date().toISOString(), ...e });
@@ -2031,7 +2032,7 @@ export function saveAgentLog(repo, pr, r, now = Date.now()) {
 
 // Run on startup of `run`, `ready` and `wait`: deletes agent and gate logs older than 14 days.
 export function pruneAgentLogs(now = Date.now()) {
-  for (const dir of ['agents', 'gates'].map((d) => join(stateDir(), d))) {
+  for (const dir of ['agents', 'gates', 'notes'].map((d) => join(stateDir(), d))) {
     for (const f of existsSync(dir) ? readdirSync(dir) : []) {
       try { if (now - statSync(join(dir, f)).mtimeMs > 14 * 864e5) rmSync(join(dir, f)); } catch { /* gone */ }
     }
@@ -2720,11 +2721,16 @@ export async function main(argv) {
     if (cmd === 'run') {
       mkdirSync(stateDir(), { recursive: true });
       opts.log = noteLog = runLogPath();
+    } else {
+      mkdirSync(join(stateDir(), 'notes'), { recursive: true });
+      noteLog = join(stateDir(), 'notes', `notes-${new Date().toISOString().slice(0, 10)}.jsonl`);
     }
     if (cmd === 'run' || cmd === 'ready') {
       const c = selfCheck(SCRIPT_DIR);
       if (c?.warning && (opts.requireCurrent || process.env.PRLOOP_REQUIRE_CURRENT === '1')) return out({ verdict: 'error', error: c.warning }, EXIT.error);
       if (c) logNote({ event: 'self_check', ...c });
+      // Only an outdated or modified prloop needs someone to act; `run` reports it in its run log.
+      if (c?.warning && cmd === 'ready') console.error(`prloop: ${c.warning}`);
       reclaimTmp(cfg);
     }
     if (cmd === 'run') {
@@ -2764,14 +2770,13 @@ export async function main(argv) {
         // Only `auto` falls back to a local review; `cloud` blocks the PR until the cooldown or probe ends.
         const quota = d?.blockedAt ? { trigger: cfg.mode === 'auto' ? 'local' : 'blocked' } : null;
         const gate = await readyGate(s, quota ? { ...cfg, reviewBeforeGate: false } : cfg, cwd, { repo, adopt: lock.adopt });
-        if (gate?.cached) console.error(`gate already passed for head ${gate.cached} (${gate.run.source ?? 'unknown'} pass)`);
         if (gate && !gate.ok) return out({ ready: false, head: s.head, gate: 'failed', tail: gate.tail, log: gate.run?.log,
           next: 'rerun the failing tests or step with its focused command, fix until it passes, then run `prloop ready` again' }, EXIT.blocked);
         // Waiting for admission or a slot can outlast a push from elsewhere: judge the PR as it is now, not the gated snapshot.
         if (gate && !gate.deferred) s = classify(fetchPr(repo, prArg), cfg);
         // A deferred gate (pipelined review) runs after the request: an untested head does not block the request.
         const missing = [...s.reasons, ...localGate(s, process.cwd(), gateFor(cfg, process.cwd(), s).gate)].filter((r) => !(gate?.deferred && r.includes('not marked tested')));
-        const pipelined = gate?.deferred ? { gate: 'deferred', next: 'post the review request; the full gate runs next, in parallel (`prloop run` runs it, or call `prloop ready` again after the request)' }
+        const pipelined = gate?.cached ? { gate: 'cached', gateSource: gate.run.source ?? 'unknown' } : gate?.deferred ? { gate: 'deferred', next: 'post the review request; the full gate runs next, in parallel (`prloop run` runs it, or call `prloop ready` again after the request)' }
           : gate && cfg.reviewBeforeGate ? { gate: 'passed' } : {};
         const next = quota && { next: `do not post a review request: the cloud reviewer is out of quota until ${d.until}; \`prloop run\` ${cfg.mode === 'auto' ? 'reviews this head locally' : 'keeps this PR blocked until then'}` };
         return out({ ready: !missing.length, head: s.head, missing, trigger: cfg.trigger, ...pipelined, ...quota, ...next }, missing.length ? EXIT.blocked : 0);
