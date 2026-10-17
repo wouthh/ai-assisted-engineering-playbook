@@ -1856,11 +1856,12 @@ test('reset-rounds resets the counter once, logs it, and refuses a second reset'
   writeFileSync(join(dir, 'example-org__example-repo__7.json'), JSON.stringify({ repo: 'example-org/example-repo', pr: 7, phase: 'blocked', rounds: 7, seen: { a: ['T1'] } }));
   assert.deepEqual(pick(resetRounds('example-org/example-repo', 7), ['previousRounds', 'rounds']), { previousRounds: 7, rounds: 0 });
   const [pr] = runStatus('example-org/example-repo').prs;
-  assert.deepEqual([pr.rounds, pr.roundResets, pr.events.at(-1).phase], [0, 1, 'rounds_reset']);
+  assert.deepEqual([pr.rounds, pr.events.at(-1).phase], [0, 'rounds_reset']);
+  assert.equal(JSON.parse(readFileSync(join(dir, 'example-org__example-repo__7.json'), 'utf8')).roundResets, 1);
   assert.throws(() => resetRounds('example-org/example-repo', 7), /already reset once/);
 });
 
-test('configuration errors are JSON errors, and an unknown --agent is rejected', async (t) => {
+test('configuration errors are one-line errors (JSON outside run), and an unknown --agent is rejected', async (t) => {
   assert.throws(() => config({ agent: 'nonee' }, {}), /--agent must be claude, codex or none/);
   assert.throws(() => config({}, { PRLOOP_AGENT: 'Claude' }), /--agent must be/);
   assert.throws(() => config({ maxLocalReviews: 'three' }, {}), /--max-local-reviews must be/);
@@ -1873,12 +1874,14 @@ test('configuration errors are JSON errors, and an unknown --agent is rejected',
   }
   assert.deepEqual(pick(config({}, {}), ['maxRounds', 'maxAgents', 'deadline']), { maxRounds: 6, maxAgents: 2, deadline: 6 * 36e5 });
   const logs = [];
-  t.mock.method(console, 'log', (l) => logs.push(JSON.parse(l)));
+  t.mock.method(console, 'log', (l) => logs.push(l));
   assert.equal(await main(['status', '7', '--repo', 'example-org/example-repo', '--timeout', 'bad']), EXIT.error);
   assert.equal(await main(['run', '--repo', 'example-org/example-repo', '--pr', '7', '--agent', 'nonee']), EXIT.error);
   assert.equal(await main(['run', '--repo', 'example-org/example-repo', '--pr', '7', '--max-rounds', 'x']), EXIT.error);
-  assert.deepEqual(logs.map((l) => l.verdict), ['error', 'error', 'error']);
-  assert.match(logs[1].error, /--agent must be/);
+  assert.equal(JSON.parse(logs[0]).verdict, 'error');
+  assert.match(logs[1], /^prloop run error: --agent must be/);
+  assert.match(logs[2], /^prloop run error: --max-rounds must be/);
+  assert.equal(logs.length, 3);
 });
 
 test('plain strips badges, markup and the reviewer footer', () => {
@@ -2420,11 +2423,10 @@ test('agent usage: totals from a recorded claude wrapper, blank for output witho
   addUsage(st, wrapper);
   addUsage(st, wrapper);
   assert.deepEqual(st.usage, { agentRuns: 3, turns: 28, costUsd: 0.8364, inputTokens: 318400, outputTokens: 6800 });
-  // A run records the agent's usage in the state file, `run --status` and the final summary.
-  const { res } = await runNoResultAgent(t, false, { body: `cat "${fileURLToPath(new URL('./claude-wrapper.json', import.meta.url))}"` });
+  // A run records the agent's usage in the state file.
+  await runNoResultAgent(t, false, { body: `cat "${fileURLToPath(new URL('./claude-wrapper.json', import.meta.url))}"` });
   const expected = { agentRuns: 1, turns: 14, costUsd: 0.4182, inputTokens: 159200, outputTokens: 3400 };
-  assert.deepEqual(res.usage, expected);
-  assert.deepEqual(runStatus('example-org/example-repo').prs[0].usage, expected);
+  assert.deepEqual(JSON.parse(readFileSync(join(process.env.XDG_STATE_HOME, 'prloop', 'example-org__example-repo__7.json'), 'utf8')).usage, expected);
 });
 
 test('with --gate-tmpdir an agent run gets a private TMPDIR there, removed when it ends', async (t) => {
@@ -3427,7 +3429,7 @@ test('a gate run writes its whole output to an owner-only gate log and records t
   assert.ok(run.durationMs >= 0 && Date.parse(run.end) >= Date.parse(run.start));
   assert.deepEqual(pick(gateProvenance(gate, r.work), ['head', 'source', 'ok', 'log', 'durationMs']), { head, source: 'prloop', ok: true, log: run.log, durationMs: run.durationMs });
   const [st] = runStatus('example-org/example-repo').prs;
-  assert.deepEqual(pick(st.lastGate, ['head', 'status', 'log', 'durationMs']), { head: head.slice(0, 7), status: 0, log: run.log, durationMs: run.durationMs });
+  assert.deepEqual(st.lastGate, { head: head.slice(0, 7), status: 0, log: run.log });
   assert.deepEqual(pick(st.events.at(-1), ['phase', 'status', 'durationMs', 'log']), { phase: 'gate_run', status: 0, durationMs: run.durationMs, log: run.log });
   const failed = await readyGate({ branch: 'feat', head, pr: 7 }, { ...cfg, gate: 'echo boom; exit 4', forceGate: true }, r.work, deps);
   assert.deepEqual([failed.ok, failed.run.status], [false, 4]);
@@ -4088,8 +4090,8 @@ const readyOutOfQuota = (t, mode) => {
   const res = spawnSync(process.execPath, [PRLOOP, 'ready', '7', '--repo', 'example-org/example-repo', '--gate', `touch "${ran}"`, '--review-before-gate', 'true', '--reviewer', mode],
     { cwd: r.work, encoding: 'utf8', env: { ...process.env, PRLOOP_LOCK_TOKEN: '', PRLOOP_GATE_WEIGHT: 'light', PRLOOP_MAX_LOAD: '100000', PRLOOP_MIN_FREE_MEM: '1K' } });
   const out = JSON.parse(res.stdout);
-  assert.deepEqual(pick(out, ['ready', 'gate', 'cloudReviewUntil']), { ready: true, gate: 'passed', cloudReviewUntil: new Date(Date.parse(blockedAt) + 6 * H).toISOString() });
-  assert.match(out.next, /do not post a review request/);
+  assert.deepEqual(pick(out, ['ready', 'gate']), { ready: true, gate: 'passed' });
+  assert.ok(out.next.includes(`do not post a review request: the cloud reviewer is out of quota until ${new Date(Date.parse(blockedAt) + 6 * H).toISOString()}`), out.next);
   assert.equal(existsSync(ran), true);
   assert.ok(!posted(calls()));
   return out;
@@ -4291,4 +4293,54 @@ test('maxLoad as a ratio scales with the usable CPUs; an absolute value stays ab
   assert.equal(limits(config({}, {}), m).maxLoad, 12);
   assert.throws(() => config({ maxLoad: '-1x' }, {}), /must be a positive/);
   assert.equal(config({}, agentEnv(config({ maxLoad: '0.5x' }, {}), {})).maxLoad, '0.5x'); // agents get the same ratio
+});
+
+// `prloop run` as a coordinator starts it in the background: stdout holds one summary line per PR and nothing else.
+function runQuietly(t, { mutate = () => {}, prState, shared, args = [] } = {}) {
+  const state = tempState(t);
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  writeFileSync(join(state, 'heads.json'), JSON.stringify({ 'example-org/example-repo#7': { sha: head, at: at('09:00') } }));
+  if (shared) writeFileSync(join(state, 'reviewer-state.json'), JSON.stringify(shared));
+  if (prState) writeFileSync(join(state, 'example-org__example-repo__7.json'), JSON.stringify({ repo: 'example-org/example-repo', pr: 7, rounds: 0, seen: {}, ...prState }));
+  const pr = fixture();
+  Object.assign(pr, { headRefName: 'feat', headRefOid: head, mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE' });
+  mutate(pr, r);
+  fakeGh(t, r.dir, pr);
+  const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('PRLOOP_')));
+  const res = spawnSync(process.execPath, [PRLOOP, 'run', '--repo', 'example-org/example-repo', '--pr', '7', '--agent', 'none', '--interval', '1s', '--deadline', '2m', ...args],
+    { cwd: r.work, encoding: 'utf8', env: { ...env, PRLOOP_MAX_LOAD: '100000', PRLOOP_MIN_FREE_MEM: '1K' } });
+  const logs = readdirSync(state).filter((f) => f.startsWith('run-')).map((f) => join(state, f));
+  return { res, head, logs };
+}
+
+test('a merged run prints exactly one line with the merged head, and nothing on stderr', (t) => {
+  const { res, head, logs } = runQuietly(t, { args: ['--merge', 'squash'], mutate: (pr, r) => {
+    markTested(pr.headRefOid, r.work);
+    request(pr).reactions.nodes.push({ content: 'THUMBS_UP', createdAt: at('10:30'), user: BOT });
+  } });
+  assert.equal(res.status, 0, res.stdout + res.stderr);
+  assert.equal(res.stdout, `example-org/example-repo#7 merged ${head}\n`);
+  assert.equal(res.stderr, '');
+  assert.equal(logs.length, 1);
+  assert.match(readFileSync(logs[0], 'utf8'), /"phase":"merged"/); // progress went to the run log
+});
+
+test('a blocked run prints one line with the reason and the run log, and nothing on stderr', (t) => {
+  const { res, head, logs } = runQuietly(t, { mutate: noRequest, prState: { rounds: 6 } });
+  assert.equal(res.status, EXIT.blocked, res.stdout + res.stderr);
+  assert.equal(res.stdout, `example-org/example-repo#7 blocked at ${head.slice(0, 7)}: max rounds (6) reached (log ${logs[0]})\n`);
+  assert.equal(res.stderr, '');
+});
+
+test('a run that handles a quota reply prints no quota text: the quota handling is in the run log only', (t) => {
+  const shared = { [OWNER]: { [BOT.login]: { blockedAt: new Date(Date.now() - H).toISOString() } } };
+  const { res, logs } = runQuietly(t, { mutate: noRequest, shared });
+  assert.equal(res.stderr, '');
+  assert.equal(res.stdout.split('\n').length, 2, res.stdout); // one line plus the final newline
+  assert.match(res.stdout, /^example-org\/example-repo#7 blocked at \w{7}: --agent none runs no local reviewer/);
+  assert.doesNotMatch(res.stdout, /quota|usage/i);
+  assert.match(readFileSync(logs[0], 'utf8'), /"phase":"reviewer_quota"/);
 });

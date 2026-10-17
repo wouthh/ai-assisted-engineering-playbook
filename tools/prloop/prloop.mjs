@@ -509,7 +509,12 @@ export function classify(pr, cfg, nowMs = Date.now()) {
 const GiB = 2 ** 30;
 const SLOT_POLL = 5e3;
 const gib = (b) => (b / GiB).toFixed(1);
-const logStderr = (e) => console.error(JSON.stringify({ at: new Date().toISOString(), ...e }));
+// Diagnostics go to stderr, except during `run`: there they go to its run log, so the summary is its only output.
+let noteLog = null;
+const logNote = (e) => {
+  const line = JSON.stringify({ at: new Date().toISOString(), ...e });
+  if (noteLog) appendFileSync(noteLog, `${line}\n`); else console.error(line);
+};
 // One directory per UID, whatever the session's environment: an interactive shell, cron, CI and sudo of one
 // account must share one slot pool, and a shared name would collide between accounts.
 export const slotDir = () => join('/tmp', `prloop-slots-${process.getuid?.() ?? 'user'}`);
@@ -538,7 +543,7 @@ export function admitStep(w, cfg, m, now, log) {
 }
 
 // Blocks until admitted; checks every --interval. Pass the same `w` to keep one wait period across calls.
-export async function admit(cfg, { metrics = machineMetrics, now = Date.now, pause = sleep, log = logStderr } = {}, w = {}) {
+export async function admit(cfg, { metrics = machineMetrics, now = Date.now, pause = sleep, log = logNote } = {}, w = {}) {
   for (;;) {
     const r = admitStep(w, cfg, metrics(), now(), log);
     if (r !== 'wait') return r;
@@ -807,7 +812,7 @@ export function cpusLine(cfg, cpus = cpusNow(), deps = {}) {
 // owner-only file. Returns { status, stdout, stderr, start, end, durationMs, peakLoad, peakRssMiB }; the peaks are
 // sampled every few seconds while the gate runs (peakRssMiB: the gate's whole process tree, null without /proc).
 export async function runGate(gate, cwd, cfg, deps = {}) {
-  const { dir = slotDir(), pause = sleep, log = logStderr, metrics = machineMetrics, busy = () => busyProcess(cfg.busyProcessPatterns), cpus = cpusNow() } = deps;
+  const { dir = slotDir(), pause = sleep, log = logNote, metrics = machineMetrics, busy = () => busyProcess(cfg.busyProcessPatterns), cpus = cpusNow() } = deps;
   const w = {};
   let release, logged = false, slots;
   const cost = cfg.gateCost ?? 1;
@@ -1467,7 +1472,7 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
 
 // Polls until the snapshot is no longer pending. Terminates because a request goes stale after
 // `cfg.timeout`; transient GitHub errors are retried until three fail in a row.
-export async function waitFor(repo, prNum, cfg, { interval, fetch = fetchPr, now = Date.now, pause = sleep, cwd = process.cwd(), runLocal = localReview, metrics = machineMetrics, log = logStderr }) {
+export async function waitFor(repo, prNum, cfg, { interval, fetch = fetchPr, now = Date.now, pause = sleep, cwd = process.cwd(), runLocal = localReview, metrics = machineMetrics, log = logNote }) {
   const resources = {}; // one resource wait across polls, as in `run`
   let reviewed; // { head, agentLog } of a local review that posted; reported only while that head is current
   for (let failures = 0; ; await pause(interval)) {
@@ -2128,7 +2133,7 @@ const scratch = (cfg, prefix) => {
 // Cleanup never fails a run: a dir the agent left unremovable (a child still writing, a read-only subdir) gets one
 // warning and stays for sweepTmp, which reclaims it once this prloop has exited.
 const dropScratch = (d) => {
-  try { rmSync(d, { recursive: true, force: true, maxRetries: 3 }); } catch (e) { logStderr({ event: 'tmp_cleanup_failed', dir: d, code: e.code }); }
+  try { rmSync(d, { recursive: true, force: true, maxRetries: 3 }); } catch (e) { logNote({ event: 'tmp_cleanup_failed', dir: d, code: e.code }); }
   owned.delete(d);
 };
 const TMP_NAME = /^prloop-(?:gate|agent|agent-out|review)-(?:(\d+)\.(\d*)\.(\d*)-)?[A-Za-z0-9]{6}$/;
@@ -2153,7 +2158,7 @@ export function sweepTmp(dir, { dryRun = false, now = Date.now() } = {}) {
     else {
       // An unremovable dir (a read-only subdir) stays counted as left over; it must never fail `run` or `ready`.
       try { rmSync(join(dir, f), { recursive: true, force: true, maxRetries: 3 }); r.removed++; }
-      catch (e) { r.stale++; logStderr({ event: 'tmp_cleanup_failed', dir: join(dir, f), code: e.code }); }
+      catch (e) { r.stale++; logNote({ event: 'tmp_cleanup_failed', dir: join(dir, f), code: e.code }); }
     }
   }
   return r;
@@ -2163,7 +2168,7 @@ const sweepFile = () => join(stateDir(), 'tmp-sweep.json');
 export function reclaimTmp(cfg) {
   const r = sweepTmp(tmpRoot(cfg));
   if (!r.removed) return;
-  logStderr({ event: 'reclaimed_tmp', dir: r.dir, removed: r.removed });
+  logNote({ event: 'reclaimed_tmp', dir: r.dir, removed: r.removed });
   mkdirSync(stateDir(), { recursive: true });
   writeFileSync(sweepFile(), JSON.stringify({ at: new Date().toISOString(), dir: r.dir, removed: r.removed }));
 }
@@ -2240,7 +2245,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
   const { maxAgents, maxRounds } = cfg;
   mkdirSync(stateDir(), { recursive: true });
   pruneAgentLogs();
-  const log = join(stateDir(), `run-${new Date().toISOString().replace(/[:.]/g, '-')}.jsonl`);
+  const log = opts.log ?? runLogPath();
   reconcileStates(repo, prs); // this run's own PRs are read live below
   // Rounds and seen findings persist across runs on purpose; `prloop reset-rounds` resets the rounds once.
   const states = prs.map((n) => ({ ...loadState(repo, n), repo, pr: n, log, phase: 'polling', reason: undefined, next: undefined, agentLog: undefined, mergeRetried: undefined, unknownSince: undefined }));
@@ -2389,7 +2394,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     // The worktree is found before classifying: an abbreviated reviewed commit resolves in its object database.
     try {
       raw = fetchPr(repo, st.pr);
-      if (!opts.worktree && !startGone && !existsSync(startDir)) { startGone = true; logStderr({ event: 'start_dir_removed', dir: startDir, gitDir }); }
+      if (!opts.worktree && !startGone && !existsSync(startDir)) { startGone = true; logNote({ event: 'start_dir_removed', dir: startDir, gitDir }); }
       cwd = opts.worktree ? resolve(opts.worktree) : findWorktree(raw.headRefName, gitDir);
       s = classify(raw, { ...cfg, cwd }, now()); st.failures = 0;
     } catch (e) {
@@ -2533,7 +2538,24 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     await Promise.race([sleep(cfg.interval), ...busy.values()]);
   }
   return states.map((st) => ({ pr: st.pr, verdict: st.phase === 'needs_agent' ? st.verdict : st.phase, reason: st.reason, head: st.head,
-    rounds: st.rounds, next: st.next, ...(st.usage ? { usage: st.usage } : {}), ...(st.agentLog ? { agentLog: st.agentLog } : {}), ...(st.prompt && st.phase === 'needs_agent' ? { prompt: st.prompt } : {}) }));
+    rounds: st.rounds, next: st.next, log, ...(st.agentLog ? { agentLog: st.agentLog } : {}), ...(st.prompt && st.phase === 'needs_agent' ? { prompt: st.prompt } : {}) }));
+}
+
+const runLogPath = () => join(stateDir(), `run-${new Date().toISOString().replace(/[:.]/g, '-')}.jsonl`);
+
+// The one stdout line `run` prints per PR: merged with its head, or what stopped it, with the run log to read.
+// A `needs_agent` prompt is too long for a line: it is saved owner-only next to the PR's state file instead.
+export function summaryLine(repo, r) {
+  const id = `${repo}#${r.pr}`;
+  if (r.verdict === 'merged') return `${id} merged ${r.head}`;
+  let prompt = '';
+  if (r.prompt) {
+    const file = statePath(repo, r.pr).replace(/\.json$/, '.prompt.md');
+    writeFileSync(file, r.prompt, { mode: 0o600 });
+    prompt = `; spawn an agent with the prompt in ${file}`;
+  }
+  const why = String(r.reason ?? r.next ?? '').replace(/\s+/g, ' ').trim().slice(0, 300);
+  return `${id} ${r.verdict}${r.head ? ` at ${short(r.head)}` : ''}${why ? `: ${why}` : ''}${prompt} (log ${r.log})`;
 }
 
 // What status views show of the last gate run: head, exit status, timing, provenance and log path.
@@ -2554,8 +2576,10 @@ export function runStatus(repoFilter, last = 5) {
       const mine = (f) => (e) => e.pr === st.pr && (f === st.log ? (e.repo ?? st.repo) : e.repo) === st.repo;
       let events = [];
       for (const f of [st.log, ...logs].filter(Boolean)) if ((events = read(f).filter(mine(f))).length) break;
-      return { repo: st.repo, pr: st.pr, phase: st.phase, head: short(st.head), rounds: st.rounds, roundResets: st.roundResets, reason: st.reason, next: st.next,
-        updatedAt: st.updatedAt, carry: st.carry, agentLog: st.agentLog, usage: st.usage, lastGate: lastGateSummary(st.lastGate), events: events.slice(-last) };
+      // Only what a coordinator acts on; the state file and the run log keep the rest.
+      return { repo: st.repo, pr: st.pr, phase: st.phase, head: short(st.head), rounds: st.rounds, reason: st.reason, next: st.next,
+        updatedAt: st.updatedAt, agentLog: st.agentLog, lastGate: st.lastGate && { ...pick(st.lastGate, ['status', 'log']), head: short(st.lastGate.head) }, log: st.log,
+        events: events.slice(-last).map(({ repo: _r, pr: _p, ...e }) => e) };
     });
   return { prs };
 }
@@ -2639,10 +2663,16 @@ export function selfCheck(dir) {
 
 export async function main(argv) {
   let opts;
-  try { opts = parseArgs(argv); } catch (e) { console.log(JSON.stringify({ verdict: 'error', error: e.message })); return EXIT.error; }
+  // `run` prints only its summary lines, or one line for an error that stopped it; other commands print JSON.
+  const quiet = () => opts ? opts._[0] === 'run' && !opts.status : argv[0] === 'run' && !argv.includes('--status');
+  const fail = (error) => {
+    console.log(quiet() ? `prloop run error: ${error.replace(/\s+/g, ' ')}${noteLog && existsSync(noteLog) ? ` (log ${noteLog})` : ''}` : JSON.stringify({ verdict: 'error', error }));
+    return EXIT.error;
+  };
+  try { opts = parseArgs(argv); } catch (e) { return fail(e.message); }
   const [cmd, prArg] = opts._;
   if (!cmd || opts.help || cmd === 'help') { console.log(HELP); return 0; }
-  const out = (obj, code) => { console.log(JSON.stringify(obj)); return code; };
+  const out = (obj, code) => (quiet() && obj.verdict === 'error' ? fail(obj.error) : (console.log(JSON.stringify(obj)), code));
   try {
     if (['ready', 'sync', 'mark-tested'].includes(cmd)) {
       const h = lockHolder(process.cwd());
@@ -2667,17 +2697,21 @@ export async function main(argv) {
     // The repository file names the method; merging itself still needs an explicit --merge.
     if (opts.merge === 'repo') opts.merge = repoFile.merge ?? (() => { throw new Error('--merge repo needs "merge" in .prloop.json'); })();
     if (cmd === 'run' && opts.status) { reconcileStates(opts.repo); return out({ machine: machineLine(cfg), cpus: cpusLine(cfg), tmp: tmpLine(cfg), ...runStatus(opts.repo) }, 0); }
+    if (cmd === 'run') {
+      mkdirSync(stateDir(), { recursive: true });
+      opts.log = noteLog = runLogPath();
+    }
     if (cmd === 'run' || cmd === 'ready') {
       const c = selfCheck(SCRIPT_DIR);
       if (c?.warning && (opts.requireCurrent || process.env.PRLOOP_REQUIRE_CURRENT === '1')) return out({ verdict: 'error', error: c.warning }, EXIT.error);
-      if (c) logStderr({ event: 'self_check', ...c });
+      if (c) logNote({ event: 'self_check', ...c });
       reclaimTmp(cfg);
     }
     if (cmd === 'run') {
       if (!opts.repo || !opts.pr) throw new Error('run needs --repo owner/name and --pr N[,N...]');
       if (opts.merge && !['rebase', 'squash', 'merge'].includes(opts.merge)) throw new Error('--merge must be rebase, squash, merge or repo');
       const results = await runAll(opts, cfg);
-      for (const r of results) console.log(JSON.stringify(r));
+      for (const r of results) console.log(summaryLine(opts.repo, r));
       return runExitCode(results);
     }
     if (!prArg) throw new Error(`${cmd} needs a PR number`);
@@ -2708,11 +2742,10 @@ export async function main(argv) {
         // is not deferred for one: the head is reviewed locally.
         const d = reviewerDecision(raw, s, cfg, Date.now(), repo.split('/')[0]);
         // Only `auto` falls back to a local review; `cloud` blocks the PR until the cooldown or probe ends.
-        const quota = d?.blockedAt ? { cloudReviewUntil: d.until, trigger: cfg.mode === 'auto' ? 'local' : 'blocked' } : null;
+        const quota = d?.blockedAt ? { trigger: cfg.mode === 'auto' ? 'local' : 'blocked' } : null;
         const gate = await readyGate(s, quota ? { ...cfg, reviewBeforeGate: false } : cfg, cwd, { repo, adopt: lock.adopt });
         if (gate?.cached) console.error(`gate already passed for head ${gate.cached} (${gate.run.source ?? 'unknown'} pass)`);
-        const lastGate = lastGateSummary(gate?.run ?? loadState(repo, prArg).lastGate);
-        if (gate && !gate.ok) return out({ ready: false, pr: s.pr, head: s.head, gate: 'failed', gateKind: gate.run?.gateKind, exitCode: gate.status, tail: gate.tail, lastGate,
+        if (gate && !gate.ok) return out({ ready: false, head: s.head, gate: 'failed', tail: gate.tail, log: gate.run?.log,
           next: 'rerun the failing tests or step with its focused command, fix until it passes, then run `prloop ready` again' }, EXIT.blocked);
         // Waiting for admission or a slot can outlast a push from elsewhere: judge the PR as it is now, not the gated snapshot.
         if (gate && !gate.deferred) s = classify(fetchPr(repo, prArg), cfg);
@@ -2720,9 +2753,8 @@ export async function main(argv) {
         const missing = [...s.reasons, ...localGate(s, process.cwd(), gateFor(cfg, process.cwd(), s).gate)].filter((r) => !(gate?.deferred && r.includes('not marked tested')));
         const pipelined = gate?.deferred ? { gate: 'deferred', next: 'post the review request; the full gate runs next, in parallel (`prloop run` runs it, or call `prloop ready` again after the request)' }
           : gate && cfg.reviewBeforeGate ? { gate: 'passed' } : {};
-        const { gateKind } = gateFor(cfg, cwd, s);
         const next = quota && { next: `do not post a review request: the cloud reviewer is out of quota until ${d.until}; \`prloop run\` ${cfg.mode === 'auto' ? 'reviews this head locally' : 'keeps this PR blocked until then'}` };
-        return out({ ready: !missing.length, pr: s.pr, head: s.head, missing, trigger: cfg.trigger, ...(cfg.gate ? { gateKind } : {}), ...pipelined, ...quota, ...next, ...(lastGate ? { lastGate } : {}) }, missing.length ? EXIT.blocked : 0);
+        return out({ ready: !missing.length, head: s.head, missing, trigger: cfg.trigger, ...pipelined, ...quota, ...next }, missing.length ? EXIT.blocked : 0);
       } finally { lock.release(); }
     }
     if (cmd === 'wait') {
@@ -2746,8 +2778,8 @@ export async function main(argv) {
     }
     throw new Error(`unknown command: ${cmd}`);
   } catch (e) {
-    return out({ verdict: 'error', error: String(e.stderr || e.message).trim().slice(0, 500) }, EXIT.error);
-  }
+    return fail(String(e.stderr || e.message).trim().slice(0, 500));
+  } finally { noteLog = null; }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) {
