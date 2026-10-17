@@ -5,7 +5,7 @@ import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { appendFileSync, chmodSync, closeSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { availableParallelism, constants as osConstants, freemem, homedir, loadavg, tmpdir, totalmem } from 'node:os';
-import { basename, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 export const EXIT = { clean: 0, findings: 10, not_requested: 20, requested_while_unresolved: 21, not_tested: 22, timeout: 30, unavailable: 31, error: 40, conflict: 41, blocked: 50 };
@@ -510,11 +510,14 @@ const GiB = 2 ** 30;
 const SLOT_POLL = 5e3;
 const gib = (b) => (b / GiB).toFixed(1);
 // Diagnostics never reach the terminal: `run` writes them to its run log, every other command to a daily notes log
-// (pruned with the agent and gate logs), so a command's verdict is its only output.
+// (pruned with the agent and gate logs), so a command's verdict is its only output. The notes directory is made on
+// the first note, so read-only commands write nothing to the state directory.
 let noteLog = null;
 const logNote = (e) => {
   const line = JSON.stringify({ at: new Date().toISOString(), ...e });
-  if (noteLog) appendFileSync(noteLog, `${line}\n`); else console.error(line);
+  if (!noteLog) return console.error(line);
+  mkdirSync(dirname(noteLog), { recursive: true });
+  appendFileSync(noteLog, `${line}\n`);
 };
 // One directory per UID, whatever the session's environment: an interactive shell, cron, CI and sudo of one
 // account must share one slot pool, and a shared name would collide between accounts.
@@ -2722,7 +2725,6 @@ export async function main(argv) {
       mkdirSync(stateDir(), { recursive: true });
       opts.log = noteLog = runLogPath();
     } else {
-      mkdirSync(join(stateDir(), 'notes'), { recursive: true });
       noteLog = join(stateDir(), 'notes', `notes-${new Date().toISOString().slice(0, 10)}.jsonl`);
     }
     if (cmd === 'run' || cmd === 'ready') {
