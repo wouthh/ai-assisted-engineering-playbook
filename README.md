@@ -62,59 +62,49 @@ A fictional example: a team asks an agent to add a discount rule to `acme/order-
 
 ## Tested utilities
 
-The repository-inspection helpers require trusted installed tools, a quiescent checkout, and configuration that remains stable throughout inspection. Stop other writers first. Their checks detect observed drift; they are not a sandbox or atomic isolation boundary against concurrent or hostile modification. If those prerequisites cannot be established, use a separately reviewed isolated inspection workflow instead. See [repository safety](docs/repository-safety.md).
-
-Both helpers discard inherited `GIT_TRACE*` variables before invoking Git, so caller-selected trace destinations do not create or append files during inspection.
+The repository-inspection helpers need trusted installed tools, a quiescent checkout, and stable configuration; they detect observed drift and are not a sandbox or atomic isolation boundary. See [repository safety](docs/repository-safety.md) for these prerequisites and the helpers' full behavior.
 
 ### Repository preflight
+
+Reports root, branch, HEAD, and upstream, and fails closed on a detached head, missing upstream, or dirty state. Details: [minimum preflight](docs/repository-safety.md#minimum-preflight).
 
 ```bash
 ./scripts/repo-preflight.sh /path/to/repository
 ```
 
-Reports repository root, branch, HEAD, upstream, and whether tracked or untracked changes exist. Under the prerequisites above, it performs no mutation and fails closed on a detached head, missing upstream, or dirty state. Both repository helpers support `--help` outside a repository without invoking Git.
-
 ### Change-scope check
 
+Fails when committed, local, or untracked changes fall outside an allowlist of paths and globs, including submodule contents. Details: [bound the diff](docs/repository-safety.md#bound-the-diff).
+
 ```bash
-python3 scripts/check-change-scope.py \
-  --repository /path/to/repository \
-  --base origin/main \
-  --allowlist approved-paths.txt
+python3 scripts/check-change-scope.py --repository /path/to/repository --base origin/main --allowlist approved-paths.txt
 ```
-
-Compares `BASE...HEAD` plus local changes and untracked files against newline-delimited path or glob rules. Empty lines are ignored; a `#` in column one starts a comment. All other whitespace is path-significant. A rule that begins with `#` or contains a line break can be written as a JSON string, keeping comment and path syntax unambiguous. A single `*` stays within one path segment; use `**` as its own segment for intentional recursive approval. Renames inspect both source and destination, and index flags that could hide changes fail closed. Repository-local clean/process filters also fail closed rather than executing, while ambient system and user Git configuration is isolated. The utility reports JSON-quoted path names and exits non-zero when anything is outside the approved scope.
-
-For repositories with submodules, initialize them through the repository's separately approved setup first. The read-only utilities never fetch or initialize missing modules. Scope rules apply to full nested file paths; changing a gitlink additionally requires approval of that gitlink path. Committed and staged gitlink targets are inspected independently of the current checkout. Both tools compare raw file bytes with the expected index checkout, including built-in normalization, and reject configured smudge drivers as well as clean/process filters.
 
 ### Report-redaction check
 
-```bash
-python3 scripts/check-report-redaction.py \
-  --patterns synthetic-patterns.tsv \
-  report.txt
-```
+Checks text reports against named patterns without printing matched content; it is not a secret scanner. Details: [redacted evidence](docs/privacy-and-secrets.md#redacted-evidence).
 
-Checks text reports against named regular expressions. Findings report the rule, file, and line without printing matched content. This is a defense-in-depth check, not a replacement for a maintained secret scanner, privacy review, or human inspection.
+```bash
+python3 scripts/check-report-redaction.py --patterns synthetic-patterns.tsv report.txt
+```
 
 ### Review wait loop (`prloop`)
 
+Polls PRs, gates review requests and starts a fresh agent only when there is work, so waiting on a reviewer bot costs few model tokens. Details: [the prloop reference](tools/prloop/README.md), [what each command reads and writes](tools/prloop/README.md#what-each-command-reads-and-writes), and [the review wait loop](docs/review-wait-loop.md).
+
 ```bash
 prloop run --repo owner/name --pr 42,43 --gate "npm test" --deadline 6h &   # background job of your shell
-prloop run --status --repo owner/name                        # cheap check-in
 ```
 
-Keeps PRs moving through an external reviewer bot with minimal model tokens: a plain script polls, gates review requests, syncs branches with their base, and starts a fresh agent only when there is work, with failsafes against loops. `prloop ready` and `prloop wait` are the manual, agent-in-the-loop alternative. It is a single dependency-free Node.js file that reads GitHub through `gh`, and several `prloop` processes share one machine safely through machine-wide gate slots and load and memory limits. Most commands only read; [the command reference](tools/prloop/README.md#what-each-command-reads-and-writes) lists what each one writes. See also [the review wait loop](docs/review-wait-loop.md).
-
 ### Git identity guard
+
+A global Git hook that refuses commits, patches, and pushes with an unexpected identity or unexpected email addresses in messages, such as agent co-author trailers; it is an accident guard, not a security boundary. Details: [the Git identity guard guide](docs/git-identity-guard.md).
 
 ```bash
 python3 scripts/git-identity-guard.py --help
 ```
 
-A global Git hook that refuses commits, merges, patches, and pushes recording an unexpected author or committer email or a name outside an allowlist, and commit, patch, and outgoing commit messages containing email addresses outside an allowlist, such as co-author trailers added by coding agents, and optionally configured forbidden terms (such as a private name) in messages, identities, added lines and new file paths. Personal values come from a private configuration file, never from the script, including an optional exact list of third-party identities (such as hosting-platform merges and dependency bots) that pushes may republish after a history rewrite. Throwaway test repositories in temporary storage without a remote URL are skipped. It is an accident guard: `--no-verify` and hosting-platform merges bypass it. See [the Git identity guard guide](docs/git-identity-guard.md) for installation, configuration, and limits.
-
-The inspection utilities and the Git identity guard use only Bash, Python's standard library, and Git; `prloop` uses Node.js, Git and the GitHub CLI. Tests create temporary synthetic repositories or use fixture JSON and never contact the network.
+The inspection utilities and the Git identity guard use only Bash, Python's standard library, and Git; `prloop` uses Node.js, Git and the GitHub CLI. Tests create temporary synthetic repositories or use fixture JSON and never contact the network. [AGENTS.md](AGENTS.md#validation) lists the validation gate. The hosted workflow runs the same gate; the local gate remains authoritative.
 
 ## Fictional delivery example
 
