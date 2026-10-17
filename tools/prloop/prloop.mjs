@@ -1035,7 +1035,10 @@ export async function readyGate(s, cfg, cwd, deps = {}) {
     // command and lockfiles. It is preparation, not validation: the gate cache stays keyed by the gate command alone.
     const setup = cfg.setup && setupKey(cfg.setup, cwd), setupFile = setup && join(git(['rev-parse', '--absolute-git-dir'], cwd), 'prloop-setup');
     const fresh = setup && !(existsSync(setupFile) && readFileSync(setupFile, 'utf8') === setup);
-    const r = await runGate(fresh ? `(${cfg.setup}) && (${cfg.gate})` : cfg.gate, cwd, cfg, { ...deps, logFile, adopt, admitted: () => markQueued(false) });
+    // Newlines end each part, so a trailing shell comment cannot swallow the closing parenthesis; a fresh setup is heavy
+    // work, so even a light (docs) gate then takes a slot.
+    const r = await runGate(fresh ? `(${cfg.setup}\n) && (${cfg.gate}\n)` : cfg.gate, cwd, fresh ? { ...cfg, gateCost: Math.max(1, cfg.gateCost ?? 1) } : cfg,
+      { ...deps, logFile, adopt, admitted: () => markQueued(false) });
     if (fresh && r.status === 0) writeFileSync(setupFile, setup);
     const run = { head: s.head, gateKind: cfg.gateKind, gate: cfg.gate, source: 'prloop', status: r.status, ...pick(r, ['start', 'end', 'durationMs', 'peakLoad', 'peakRssMiB']), log: logFile };
     if (deps.repo && s.pr) recordGateRun(deps.repo, s.pr, run);
@@ -1050,10 +1053,13 @@ export async function readyGate(s, cfg, cwd, deps = {}) {
   } finally { markQueued(false); release(); }
 }
 
-// When setup must run again in a worktree: a change of the command or of any tracked file at HEAD whose name contains
-// "lock" (package-lock.json, yarn.lock, pnpm-lock.yaml, Cargo.lock, uv.lock and the like).
+// Dependency manifests and lockfiles of common package managers, by basename.
+const DEPENDENCY_FILE = /^(package\.json|npm-shrinkwrap\.json|[\w.-]*[.-]lock(\.\w+)?|[\w.-]*\.lockb?|requirements[\w.-]*\.(txt|in)|constraints[\w.-]*\.txt|pyproject\.toml|setup\.(py|cfg)|Pipfile|go\.(mod|sum|work)|Cargo\.toml|Gemfile|[\w.-]*\.gemspec|composer\.json|pom\.xml|[\w.-]*\.gradle(\.kts)?|[\w.-]*\.csproj|packages\.config|mix\.exs|pubspec\.yaml|deno\.jsonc?)$/;
+
+// When setup must run again in a worktree: a change of the command or of any tracked dependency manifest or lockfile
+// at HEAD (package.json, package-lock.json, yarn.lock, requirements.txt, pyproject.toml, go.sum, Cargo.lock and the like).
 export function setupKey(setup, cwd) {
-  const locks = git(['ls-tree', '-r', 'HEAD'], cwd).split('\n').filter((l) => /lock/i.test(basename(l.split('\t')[1] ?? ''))).join('\n');
+  const locks = git(['ls-tree', '-r', 'HEAD'], cwd).split('\n').filter((l) => DEPENDENCY_FILE.test(basename(l.split('\t')[1] ?? ''))).join('\n');
   return createHash('sha256').update(`${setup}\0${locks}`).digest('hex');
 }
 
