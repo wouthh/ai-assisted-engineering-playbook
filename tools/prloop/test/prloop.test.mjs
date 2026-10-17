@@ -2788,6 +2788,33 @@ test('ready holds the worktree lock while its gate runs, so run waits for it', (
   assert.equal(lockHolder(r.work, null), null); // released when ready ends
 });
 
+test('ready prints only its result line: routine tmp reclaims and cached gates stay off the terminal', (t) => {
+  const state = tempState(t);
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  const pr = fixture();
+  Object.assign(pr, { headRefName: 'feat', headRefOid: r.run(r.work, 'rev-parse', 'HEAD'), mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE' });
+  fakeGh(t, r.dir, pr);
+  const tmp = join(r.dir, 'gate-tmp');
+  mkdirSync(join(tmp, `prloop-gate-${deadPid()}..${ns}-Quiet1`), { recursive: true }); // a dead owner's dir to reclaim
+  // A copy outside Git skips the self check, which warns (on stderr, by design) when the tested checkout is a branch.
+  const bin = mkdtempSync(join(tmpdir(), 'prloop-bin-'));
+  t.after(() => rmSync(bin, { recursive: true, force: true }));
+  writeFileSync(join(bin, 'prloop.mjs'), readFileSync(PRLOOP));
+  const ready = () => spawnSync(process.execPath, [join(bin, 'prloop.mjs'), 'ready', '7', '--repo', 'example-org/example-repo', '--gate', 'true'],
+    { cwd: r.work, encoding: 'utf8', env: { ...process.env, PRLOOP_LOCK_TOKEN: '', PRLOOP_GATE_TMPDIR: tmp, PRLOOP_GATE_SLOTS: '64', PRLOOP_MAX_LOAD: '100000', PRLOOP_MIN_FREE_MEM: '1K' } });
+  for (const gate of [undefined, 'cached']) {
+    const res = ready();
+    assert.equal(res.stderr, '');
+    assert.equal(res.stdout.trim().split('\n').length, 1, res.stdout);
+    assert.equal(JSON.parse(res.stdout).gate, gate);
+  }
+  assert.deepEqual(readdirSync(tmp), []);
+  const notes = join(state, 'notes');
+  assert.match(readdirSync(notes).map((f) => readFileSync(join(notes, f), 'utf8')).join(''), /"event":"reclaimed_tmp"/);
+});
+
 test('a SIGKILLed ready\'s gate is stopped by the watcher, which frees the worktree lock the gate adopted', (t) => {
   tempState(t);
   const r = gitRepo();
