@@ -3505,6 +3505,47 @@ test('docs-only gate: runs docsGate only when every changed path matches docsPat
   assert.throws(() => repoConfig(r.work), /docsPaths must be array/);
 });
 
+test('setup: installs dependencies before any gate kind in a fresh worktree, once per command and lockfiles', async (t) => {
+  tempState(t);
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  // A docs gate that needs an installed dev tool, which only the setup step provides (node_modules is ignored).
+  r.commit('deps', { '.gitignore': 'node_modules/\n', 'package-lock.json': 'v1\n' });
+  r.run(r.work, 'push', '-q', 'origin', 'feat:main');
+  mkdirSync(join(r.work, 'docs'));
+  r.commit('docs', { 'docs/a.md': 'y\n' });
+  const setup = 'mkdir -p node_modules/.bin && printf "#!/bin/sh\\n" > node_modules/.bin/doc-check && chmod +x node_modules/.bin/doc-check && echo run >> ../setup-runs';
+  const c = { ...cfg, gate: 'node_modules/.bin/doc-check && echo full', docsGate: 'node_modules/.bin/doc-check && echo docs', docsPaths: ['docs/**'] };
+  const pr = () => ({ branch: 'feat', base: 'main', head: r.run(r.work, 'rev-parse', 'HEAD') });
+  const deps = { ...idle(), dir: join(r.dir, 'slots') };
+  const runs = () => (existsSync(join(r.dir, 'setup-runs')) ? readFileSync(join(r.dir, 'setup-runs'), 'utf8').split('\n').filter(Boolean).length : 0);
+  // Without setup the docs gate fails on the missing tool, as in a fresh worktree.
+  assert.equal((await readyGate(pr(), c, r.work, deps)).ok, false);
+  const g = await readyGate(pr(), { ...c, setup }, r.work, deps);
+  assert.deepEqual(pick(g.run, ['gateKind', 'status']), { gateKind: 'docs', status: 0 });
+  assert.equal(runs(), 1);
+  assert.equal(gatePassed(c.docsGate, r.work), pr().head); // cached under the gate command alone
+  // A new head with the same lockfiles reuses the setup; the full gate kind gets it too.
+  r.commit('code', { 'app.txt': 'two\n' });
+  assert.equal((await readyGate(pr(), { ...c, setup }, r.work, deps)).run.gateKind, 'full');
+  assert.equal(runs(), 1);
+  // A changed lockfile, or a removed install with a changed command, runs it again.
+  r.commit('bump', { 'package-lock.json': 'v2\n' });
+  assert.equal((await readyGate(pr(), { ...c, setup }, r.work, deps)).ok, true);
+  assert.equal(runs(), 2);
+  rmSync(join(r.work, 'node_modules'), { recursive: true });
+  r.commit('code 2', { 'app.txt': 'three\n' });
+  assert.equal((await readyGate(pr(), { ...c, setup: `${setup} && true` }, r.work, deps)).ok, true);
+  assert.equal(runs(), 3);
+  // A failing setup fails the gate and is retried next time.
+  r.commit('code 3', { 'app.txt': 'four\n' });
+  assert.equal((await readyGate(pr(), { ...c, setup: 'exit 4' }, r.work, deps)).ok, false);
+  writeFileSync(join(r.work, '.prloop.json'), JSON.stringify({ setup: 'npm ci --ignore-scripts' }));
+  assert.equal(config({}, {}, { repo: repoConfig(r.work) }).setup, 'npm ci --ignore-scripts');
+  writeFileSync(join(r.work, '.prloop.json'), JSON.stringify({ setup: ['npm ci'] }));
+  assert.throws(() => repoConfig(r.work), /setup must be string/);
+});
+
 test('gate provenance: a self-reported pass counts for a merge only after gate-irrelevant changes from a prloop-run pass', async (t) => {
   tempState(t);
   const r = gitRepo();
