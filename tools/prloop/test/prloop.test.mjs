@@ -609,14 +609,14 @@ function divergeOnMain(r, files) {
 for (const settings of [{ merge: true, squash: true }, { merge: false, squash: false }]) {
   const method = settings.merge ? 'merge' : 'rebase';
 
-  test(`sync (${method}) resolves append-only conflicts by union`, (t) => {
+  test(`sync (${method}) resolves append-only conflicts by union`, async (t) => {
     const r = gitRepo();
     t.after(() => rmSync(r.dir, { recursive: true, force: true }));
     r.commit('feature', { 'log.csv': 'id\na\nfeature\n' });
     r.run(r.work, 'push', '-q', 'origin', 'feat');
     divergeOnMain(r, { 'log.csv': 'id\na\nbase\n' });
     const head = r.run(r.work, 'rev-parse', 'HEAD');
-    const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings, union: ['*.csv'] });
+    const v = await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings, union: ['*.csv'] });
     assert.equal(v.verdict, 'synced', JSON.stringify(v));
     assert.equal(v.method, method);
     assert.equal(readFileSync(join(r.work, 'log.csv'), 'utf8'), 'id\na\nbase\nfeature\n');
@@ -626,7 +626,7 @@ for (const settings of [{ merge: true, squash: true }, { merge: false, squash: f
   // Replaying commit by commit (a rebase) once re-added a row a later PR commit deleted, or duplicated one (#29).
   for (const [name, c1, c2, expected] of [['re-adds no row a later PR commit deleted', 'id\na\nY\nb\n', 'id\na\nX\n', 'id\na\nX\nb'],
     ['duplicates no row', 'id\na\nY\n', 'id\na\nY\nb\n', 'id\na\nX\nb\nY']]) {
-    test(`sync (${method}) by union ${name}`, (t) => {
+    test(`sync (${method}) by union ${name}`, async (t) => {
       const r = gitRepo();
       t.after(() => rmSync(r.dir, { recursive: true, force: true }));
       r.commit('feature', { 'log.csv': c1 });
@@ -634,7 +634,7 @@ for (const settings of [{ merge: true, squash: true }, { merge: false, squash: f
       r.run(r.work, 'push', '-q', 'origin', 'feat');
       divergeOnMain(r, { 'log.csv': 'id\na\nX\nb\n' });
       const head = r.run(r.work, 'rev-parse', 'HEAD');
-      const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings, union: ['*.csv'] });
+      const v = await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings, union: ['*.csv'] });
       assert.equal(v.verdict, 'synced', JSON.stringify(v));
       assert.equal(r.run(r.work, 'show', `${v.head}:log.csv`), expected);
       assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), v.head);
@@ -642,7 +642,7 @@ for (const settings of [{ merge: true, squash: true }, { merge: false, squash: f
     });
   }
 
-  test(`sync --continue (${method}) still corrects union files resolved before the pause`, (t) => {
+  test(`sync --continue (${method}) still corrects union files resolved before the pause`, async (t) => {
     const r = gitRepo();
     t.after(() => rmSync(r.dir, { recursive: true, force: true }));
     r.commit('feature', { 'log.csv': 'id\na\nY\nb\n' });
@@ -654,18 +654,18 @@ for (const settings of [{ merge: true, squash: true }, { merge: false, squash: f
     r.run(r.work, 'update-ref', 'refs/remotes/origin/main', 'origin/main~1');
     const head = r.run(r.work, 'rev-parse', 'HEAD');
     const args = { cwd: r.work, branch: 'feat', base: 'main', head, settings, union: ['*.csv'], resume: true };
-    let v = syncBranch(args);
+    let v = await syncBranch(args);
     assert.deepEqual([v.verdict, v.conflicts], ['conflict', ['app.txt']], JSON.stringify(v));
     writeFileSync(join(r.work, 'app.txt'), 'both\n');
     r.run(r.work, 'add', 'app.txt');
-    v = syncBranch(args);
+    v = await syncBranch(args);
     assert.equal(v.verdict, 'synced', JSON.stringify(v));
     assert.deepEqual(v.unioned, ['log.csv']);
     assert.equal(r.run(r.work, 'show', `${v.head}:log.csv`), 'id\na\nX\nb');
     assert.equal(r.run(r.work, 'status', '--porcelain'), '');
   });
 
-  test(`sync --continue (${method}) keeps the manual resolution when the union correction commit is rejected`, { skip: settings.merge && 'a merge needs no correction' }, (t) => {
+  test(`sync --continue (${method}) keeps the manual resolution when the union correction commit is rejected`, { skip: settings.merge && 'a merge needs no correction' }, async (t) => {
     const r = gitRepo();
     t.after(() => rmSync(r.dir, { recursive: true, force: true }));
     r.commit('feature', { 'log.csv': 'id\na\nY\nb\n' });
@@ -675,13 +675,13 @@ for (const settings of [{ merge: true, squash: true }, { merge: false, squash: f
     divergeOnMain(r, { 'log.csv': 'id\na\nX\nb\n', 'app.txt': 'base\n' });
     const head = r.run(r.work, 'rev-parse', 'HEAD');
     const args = { cwd: r.work, branch: 'feat', base: 'main', head, settings, union: ['*.csv'], resume: true };
-    assert.equal(syncBranch(args).verdict, 'conflict');
+    assert.equal((await syncBranch(args)).verdict, 'conflict');
     writeFileSync(join(r.work, 'app.txt'), 'both\n');
     r.run(r.work, 'add', 'app.txt');
     const hook = join(r.work, '.git', 'hooks', 'commit-msg');
     writeFileSync(hook, '#!/bin/sh\n! grep -q "Remove lines the union" "$1"\n');
     chmodSync(hook, 0o755);
-    const v = syncBranch(args);
+    const v = await syncBranch(args);
     assert.equal(v.verdict, 'error', JSON.stringify(v));
     assert.match(v.error, /local only/);
     assert.equal(r.run(r.work, 'show', 'HEAD:app.txt'), 'both');
@@ -689,14 +689,14 @@ for (const settings of [{ merge: true, squash: true }, { merge: false, squash: f
     assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
   });
 
-  test(`sync (${method}) aborts cleanly on other conflicts`, (t) => {
+  test(`sync (${method}) aborts cleanly on other conflicts`, async (t) => {
     const r = gitRepo();
     t.after(() => rmSync(r.dir, { recursive: true, force: true }));
     r.commit('feature', { 'app.txt': 'feature\n', 'log.csv': 'id\na\nfeature\n' });
     r.run(r.work, 'push', '-q', 'origin', 'feat');
     divergeOnMain(r, { 'app.txt': 'base\n', 'log.csv': 'id\na\nbase\n' });
     const head = r.run(r.work, 'rev-parse', 'HEAD');
-    const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings, union: ['*.csv'] });
+    const v = await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings, union: ['*.csv'] });
     assert.equal(v.verdict, 'conflict');
     assert.deepEqual(v.conflicts, ['app.txt']);
     assert.equal(r.run(r.work, 'rev-parse', 'HEAD'), head);
@@ -705,7 +705,7 @@ for (const settings of [{ merge: true, squash: true }, { merge: false, squash: f
   });
 }
 
-test('sync (rebase) fails closed when a later PR commit renamed a union file', (t) => {
+test('sync (rebase) fails closed when a later PR commit renamed a union file', async (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   r.commit('feature', { 'log.csv': 'id\na\nY\nb\n' });
@@ -714,7 +714,7 @@ test('sync (rebase) fails closed when a later PR commit renamed a union file', (
   r.run(r.work, 'push', '-q', 'origin', 'feat');
   divergeOnMain(r, { 'log.csv': 'id\na\nX\nb\n' });
   const head = r.run(r.work, 'rev-parse', 'HEAD');
-  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: false, squash: false }, union: ['*.csv'] });
+  const v = await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: false, squash: false }, union: ['*.csv'] });
   assert.equal(v.verdict, 'error', JSON.stringify(v));
   assert.match(v.error, /renamed or deleted/);
   assert.equal(r.run(r.work, 'rev-parse', 'HEAD'), head);
@@ -724,7 +724,7 @@ test('sync (rebase) fails closed when a later PR commit renamed a union file', (
 
 for (const settings of [{ merge: true, squash: true }, { merge: false, squash: false }]) {
   const method = settings.merge ? 'merge' : 'rebase';
-  test(`sync (${method}) fails closed when a PR commit renamed a union file and recreated it`, (t) => {
+  test(`sync (${method}) fails closed when a PR commit renamed a union file and recreated it`, async (t) => {
     const r = gitRepo();
     t.after(() => rmSync(r.dir, { recursive: true, force: true }));
     r.commit('feature', { 'log.csv': 'id\na\nY\n' });
@@ -733,7 +733,7 @@ for (const settings of [{ merge: true, squash: true }, { merge: false, squash: f
     r.run(r.work, 'push', '-q', 'origin', 'feat');
     divergeOnMain(r, { 'log.csv': 'id\na\nX\n' });
     const head = r.run(r.work, 'rev-parse', 'HEAD');
-    const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings, union: ['*.csv'] });
+    const v = await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings, union: ['*.csv'] });
     assert.equal(v.verdict, 'error', JSON.stringify(v));
     assert.match(v.error, /renamed or deleted and then recreated/);
     assert.equal(r.run(r.work, 'rev-parse', 'HEAD'), head);
@@ -742,7 +742,7 @@ for (const settings of [{ merge: true, squash: true }, { merge: false, squash: f
   });
 }
 
-test('sync (merge) fails closed when a PR merge commit renamed a union file and recreated it', (t) => {
+test('sync (merge) fails closed when a PR merge commit renamed a union file and recreated it', async (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   r.commit('feature', { 'log.csv': 'id\na\nY\n' });
@@ -755,13 +755,13 @@ test('sync (merge) fails closed when a PR merge commit renamed a union file and 
   r.run(r.work, 'push', '-q', 'origin', 'feat');
   divergeOnMain(r, { 'log.csv': 'id\na\nX\n' });
   const head = r.run(r.work, 'rev-parse', 'HEAD');
-  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true, squash: true }, union: ['*.csv'] });
+  const v = await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true, squash: true }, union: ['*.csv'] });
   assert.equal(v.verdict, 'error', JSON.stringify(v));
   assert.match(v.error, /renamed or deleted and then recreated/);
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
 });
 
-test('sync fails closed when a moved union file was rewritten below the default similarity threshold and recreated', (t) => {
+test('sync fails closed when a moved union file was rewritten below the default similarity threshold and recreated', async (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   r.commit('feature', { 'log.csv': 'id\na\nY\n' });
@@ -771,13 +771,13 @@ test('sync fails closed when a moved union file was rewritten below the default 
   r.run(r.work, 'push', '-q', 'origin', 'feat');
   divergeOnMain(r, { 'log.csv': 'id\na\nX\n' });
   const head = r.run(r.work, 'rev-parse', 'HEAD');
-  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true, squash: true }, union: ['*.csv'] });
+  const v = await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true, squash: true }, union: ['*.csv'] });
   assert.equal(v.verdict, 'error', JSON.stringify(v));
   assert.match(v.error, /renamed or deleted and then recreated/);
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
 });
 
-test('sync fails closed when a moved union file is a tiny part of a much larger new file and was recreated', (t) => {
+test('sync fails closed when a moved union file is a tiny part of a much larger new file and was recreated', async (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   const old = Array.from({ length: 100 }, (_, i) => `row${i}`).join('\n');
@@ -789,13 +789,13 @@ test('sync fails closed when a moved union file is a tiny part of a much larger 
   r.run(r.work, 'push', '-q', 'origin', 'feat');
   divergeOnMain(r, { 'log.csv': `${old}\nX\n` });
   const head = r.run(r.work, 'rev-parse', 'HEAD');
-  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true, squash: true }, union: ['*.csv'] });
+  const v = await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true, squash: true }, union: ['*.csv'] });
   assert.equal(v.verdict, 'error', JSON.stringify(v));
   assert.match(v.error, /renamed or deleted and then recreated/);
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
 });
 
-test('sync fails closed when an indented first union line moved into a much larger new file and the file was recreated', (t) => {
+test('sync fails closed when an indented first union line moved into a much larger new file and the file was recreated', async (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   r.commit('feature', { 'log.csv': '  - item\n' });
@@ -805,13 +805,13 @@ test('sync fails closed when an indented first union line moved into a much larg
   r.run(r.work, 'push', '-q', 'origin', 'feat');
   divergeOnMain(r, { 'log.csv': '  - item\nX\n' });
   const head = r.run(r.work, 'rev-parse', 'HEAD');
-  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true, squash: true }, union: ['*.csv'] });
+  const v = await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true, squash: true }, union: ['*.csv'] });
   assert.equal(v.verdict, 'error', JSON.stringify(v));
   assert.match(v.error, /renamed or deleted and then recreated/);
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
 });
 
-test('sync still unions a trimmed union file when the same commit added a submodule entry', (t) => {
+test('sync still unions a trimmed union file when the same commit added a submodule entry', async (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   r.commit('feature', { 'log.csv': 'id\na\nY\n' });
@@ -821,12 +821,12 @@ test('sync still unions a trimmed union file when the same commit added a submod
   r.run(r.work, 'push', '-q', 'origin', 'feat');
   divergeOnMain(r, { 'log.csv': 'id\na\nX\n' });
   const head = r.run(r.work, 'rev-parse', 'HEAD');
-  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true, squash: true }, union: ['*.csv'] });
+  const v = await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true, squash: true }, union: ['*.csv'] });
   assert.notEqual(v.verdict, 'error', JSON.stringify(v));
   assert.equal(r.run(r.work, 'show', 'HEAD:log.csv'), 'id\na\nX');
 });
 
-test('sync still finds a moved union line when the same commit added more paths than fit in one argv', (t) => {
+test('sync still finds a moved union line when the same commit added more paths than fit in one argv', async (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   r.commit('feature', { 'log.csv': 'id\na\nY\n' });
@@ -844,13 +844,13 @@ test('sync still finds a moved union line when the same commit added more paths 
   r.run(r.work, 'push', '-q', 'origin', 'feat');
   divergeOnMain(r, { 'log.csv': 'id\na\nX\n' });
   const head = r.run(r.work, 'rev-parse', 'HEAD');
-  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true, squash: true }, union: ['*.csv'] });
+  const v = await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true, squash: true }, union: ['*.csv'] });
   assert.equal(v.verdict, 'error', JSON.stringify(v));
   assert.match(v.error, /renamed or deleted and then recreated/);
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
 });
 
-test('sync fails closed when searching the files added next to a modified union file fails', (t) => {
+test('sync fails closed when searching the files added next to a modified union file fails', async (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   r.commit('feature', { 'log.csv': 'id\na\nY\n' });
@@ -863,13 +863,13 @@ test('sync fails closed when searching the files added next to a modified union 
   mkdirSync(join(r.dir, 'bin'));
   writeFileSync(join(r.dir, 'bin', 'git'), `#!/bin/sh\n[ "$1" = grep ] && exit 2\nexec ${real} "$@"\n`, { mode: 0o755 });
   process.env.PATH = `${join(r.dir, 'bin')}:${old}`;
-  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true, squash: true }, union: ['*.csv'] });
+  const v = await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true, squash: true }, union: ['*.csv'] });
   assert.equal(v.verdict, 'error', JSON.stringify(v));
   assert.match(v.error, /searching the files .* added failed/);
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
 });
 
-test('sync fails closed on a renamed and recreated union file even under a low diff.renameLimit', (t) => {
+test('sync fails closed on a renamed and recreated union file even under a low diff.renameLimit', async (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   // A limit below the candidate count makes git skip copy detection silently unless the scan disables it.
@@ -880,13 +880,13 @@ test('sync fails closed on a renamed and recreated union file even under a low d
   r.run(r.work, 'push', '-q', 'origin', 'feat');
   divergeOnMain(r, { 'log.csv': 'id\na\nX\n' });
   const head = r.run(r.work, 'rev-parse', 'HEAD');
-  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true, squash: true }, union: ['*.csv'] });
+  const v = await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true, squash: true }, union: ['*.csv'] });
   assert.equal(v.verdict, 'error', JSON.stringify(v));
   assert.match(v.error, /renamed or deleted and then recreated/);
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
 });
 
-test('sync fails closed when a union file whose name ends with a space was renamed and recreated', (t) => {
+test('sync fails closed when a union file whose name ends with a space was renamed and recreated', async (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   // z.csv conflicts too, so the spaced path is not the last line of git's (trimmed) conflict listing.
@@ -901,13 +901,13 @@ test('sync fails closed when a union file whose name ends with a space was renam
   r.run(r.work, 'push', '-q', 'origin', 'feat');
   divergeOnMain(r, { 'log.csv ': 'id\na\nX\n', 'z.csv': 'id\nX\n' });
   const head = r.run(r.work, 'rev-parse', 'HEAD');
-  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true, squash: true }, union: ['*.csv', '*.csv '] });
+  const v = await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true, squash: true }, union: ['*.csv', '*.csv '] });
   assert.equal(v.verdict, 'error', JSON.stringify(v));
   assert.match(v.error, /renamed or deleted and then recreated/);
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
 });
 
-test('sync --continue never writes a final union file through a symlink a later commit made', (t) => {
+test('sync --continue never writes a final union file through a symlink a later commit made', async (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   const outside = join(r.dir, 'outside.txt');
@@ -921,20 +921,20 @@ test('sync --continue never writes a final union file through a symlink a later 
   divergeOnMain(r, { 'log.csv': 'id\na\nbase\n' });
   const head = r.run(r.work, 'rev-parse', 'HEAD');
   const args = { cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: false, squash: false }, union: ['*.csv'], resume: true };
-  let v = syncBranch(args);
+  let v = await syncBranch(args);
   assert.equal(v.verdict, 'conflict', JSON.stringify(v));
   rmSync(join(r.work, 'log.csv~HEAD'), { force: true });
   rmSync(join(r.work, 'log.csv'), { force: true });
   symlinkSync(outside, join(r.work, 'log.csv'));
   r.run(r.work, 'add', '-A');
-  v = syncBranch(args);
+  v = await syncBranch(args);
   assert.equal(v.verdict, 'error', JSON.stringify(v));
   assert.match(v.error, /no longer a regular file/);
   assert.equal(readFileSync(outside, 'utf8'), 'keep\n');
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
 });
 
-test('sync --continue drops a partial union correction when a later union file became a symlink', (t) => {
+test('sync --continue drops a partial union correction when a later union file became a symlink', async (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   const outside = join(r.dir, 'outside.txt');
@@ -950,19 +950,19 @@ test('sync --continue drops a partial union correction when a later union file b
   divergeOnMain(r, { 'a.csv': 'id\na\nX\nb\n', 'log.csv': 'id\na\nbase\n' });
   const head = r.run(r.work, 'rev-parse', 'HEAD');
   const args = { cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: false, squash: false }, union: ['*.csv'], resume: true };
-  assert.equal(syncBranch(args).verdict, 'conflict');
+  assert.equal((await syncBranch(args)).verdict, 'conflict');
   rmSync(join(r.work, 'log.csv~HEAD'), { force: true });
   rmSync(join(r.work, 'log.csv'), { force: true });
   symlinkSync(outside, join(r.work, 'log.csv'));
   r.run(r.work, 'add', '-A');
-  const v = syncBranch(args);
+  const v = await syncBranch(args);
   assert.equal(v.verdict, 'error', JSON.stringify(v));
   assert.match(v.error, /no longer a regular file.*local only/);
   assert.equal(r.run(r.work, 'status', '--porcelain'), '');
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
 });
 
-test('sync refuses to resolve a union file that is a symlink', (t) => {
+test('sync refuses to resolve a union file that is a symlink', async (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   const link = (target, msg) => {
@@ -984,7 +984,7 @@ test('sync refuses to resolve a union file that is a symlink', (t) => {
   r.run(r.work, 'push', '-q', 'origin', 'main');
   r.run(r.work, 'switch', '-q', 'feat');
   const head = r.run(r.work, 'rev-parse', 'HEAD');
-  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true }, union: ['*.csv'] });
+  const v = await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true }, union: ['*.csv'] });
   assert.equal(v.verdict, 'conflict', JSON.stringify(v));
   assert.deepEqual(v.conflicts, ['log.csv']);
   for (const f of ['a.txt', 'b.txt', 'c.txt']) assert.equal(readFileSync(join(r.dir, f), 'utf8'), 'keep\n');
@@ -1107,18 +1107,18 @@ test('a worktree lock held by a dead process is reclaimed', (t) => {
   lock.release();
 });
 
-test('sync refuses a base ref that lacks the PR base commit', (t) => {
+test('sync refuses a base ref that lacks the PR base commit', async (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   r.commit('feature', { 'app.txt': 'feature\n' });
   r.run(r.work, 'push', '-q', 'origin', 'feat');
   const head = r.run(r.work, 'rev-parse', 'HEAD');
-  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', baseOid: head, head, settings: { merge: true } });
+  const v = await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', baseOid: head, head, settings: { merge: true } });
   assert.equal(v.verdict, 'error');
   assert.match(v.error, /does not contain the PR base commit/);
 });
 
-test('sync fetches the base into its remote-tracking ref in a single-branch clone', (t) => {
+test('sync fetches the base into its remote-tracking ref in a single-branch clone', async (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   r.commit('feature', { 'app.txt': 'feature\n' });
@@ -1128,7 +1128,7 @@ test('sync fetches the base into its remote-tracking ref in a single-branch clon
   divergeOnMain(r, { 'other.txt': 'main\n' });
   const main = r.run(r.work, 'rev-parse', 'main');
   r.run(r.work, 'update-ref', 'refs/remotes/origin/main', `${main}~1`); // a stale tracking ref
-  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', baseOid: main, head, settings: { merge: true } });
+  const v = await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', baseOid: main, head, settings: { merge: true } });
   assert.notEqual(v.verdict, 'error', JSON.stringify(v));
   assert.equal(r.run(r.work, 'rev-parse', 'origin/main'), main);
 });
@@ -1618,7 +1618,7 @@ test('the per-key gate lock records the gate shell, so it outlives a killed read
   assert.equal(lines.at(-2).split(' ')[0], lines.at(-1)); // the claim lists the gate shell's pid
 });
 
-test('sync linearizes a branch with merge commits on a rebase-only repository and reports the tree', (t) => {
+test('sync linearizes a branch with merge commits on a rebase-only repository and reports the tree', async (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   r.commit('feature', { 'app.txt': 'feature\n' });
@@ -1626,16 +1626,16 @@ test('sync linearizes a branch with merge commits on a rebase-only repository an
   r.run(r.work, 'merge', '-q', '--no-edit', 'main'); // contains the base, but through a merge commit
   r.run(r.work, 'push', '-q', 'origin', 'feat');
   const head = r.run(r.work, 'rev-parse', 'HEAD');
-  assert.equal(syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true } }).verdict, 'up_to_date');
-  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: false, squash: false } });
+  assert.equal((await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true } })).verdict, 'up_to_date');
+  const v = await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: false, squash: false } });
   assert.deepEqual(pick(v, ['verdict', 'method', 'linearized', 'treeUnchanged', 'unchanged']),
     { verdict: 'synced', method: 'rebase', linearized: true, treeUnchanged: true, unchanged: true });
   assert.equal(r.run(r.work, 'rev-list', '--merges', 'origin/main..origin/feat'), '');
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), v.head);
-  assert.equal(syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head: v.head, settings: { merge: false, squash: false } }).verdict, 'up_to_date');
+  assert.equal((await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head: v.head, settings: { merge: false, squash: false } })).verdict, 'up_to_date');
 });
 
-test('sync linearizes a branch with merge commits when the new base conflicts only in a union file', (t) => {
+test('sync linearizes a branch with merge commits when the new base conflicts only in a union file', async (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   r.commit('feature', { 'log.csv': 'id\na\nfeature\n' });
@@ -1644,14 +1644,14 @@ test('sync linearizes a branch with merge commits when the new base conflicts on
   r.run(r.work, 'push', '-q', 'origin', 'feat');
   divergeOnMain(r, { 'log.csv': 'id\na\nbase\n' }); // conflicts with the feature only in the union file
   const head = r.run(r.work, 'rev-parse', 'HEAD');
-  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: false, squash: false }, union: ['*.csv'] });
+  const v = await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: false, squash: false }, union: ['*.csv'] });
   assert.equal(v.verdict, 'synced', JSON.stringify(v));
   assert.equal(v.linearized, true);
   assert.equal(readFileSync(join(r.work, 'log.csv'), 'utf8'), 'id\na\nbase\nfeature\n');
   assert.equal(r.run(r.work, 'rev-list', '--merges', 'origin/main..origin/feat'), '');
 });
 
-test('sync refuses to linearize when a merge commit adds lines to a union file that later conflicts', (t) => {
+test('sync refuses to linearize when a merge commit adds lines to a union file that later conflicts', async (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   r.commit('feature', { 'log.csv': 'id\na\nfeature\n' });
@@ -1663,13 +1663,13 @@ test('sync refuses to linearize when a merge commit adds lines to a union file t
   r.run(r.work, 'push', '-q', 'origin', 'feat');
   divergeOnMain(r, { 'log.csv': 'id\na\nbase\n' });
   const head = r.run(r.work, 'rev-parse', 'HEAD');
-  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: false, squash: false }, union: ['*.csv'] });
+  const v = await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: false, squash: false }, union: ['*.csv'] });
   assert.equal(v.verdict, 'error', JSON.stringify(v));
   assert.match(v.error, /drop changes made in merge commits/);
   assert.deepEqual([r.run(r.work, 'rev-parse', 'HEAD'), r.run(r.work, 'rev-parse', 'origin/feat')], [head, head]);
 });
 
-test('sync refuses to linearize when a merge commit changes the mode of a union file that later conflicts', (t) => {
+test('sync refuses to linearize when a merge commit changes the mode of a union file that later conflicts', async (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   r.commit('feature', { 'log.csv': 'id\na\nfeature\n' });
@@ -1681,13 +1681,13 @@ test('sync refuses to linearize when a merge commit changes the mode of a union 
   r.run(r.work, 'push', '-q', 'origin', 'feat');
   divergeOnMain(r, { 'log.csv': 'id\na\nbase\n' });
   const head = r.run(r.work, 'rev-parse', 'HEAD');
-  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: false, squash: false }, union: ['*.csv'] });
+  const v = await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: false, squash: false }, union: ['*.csv'] });
   assert.equal(v.verdict, 'error', JSON.stringify(v));
   assert.match(v.error, /drop changes made in merge commits/);
   assert.deepEqual([r.run(r.work, 'rev-parse', 'HEAD'), r.run(r.work, 'rev-parse', 'origin/feat')], [head, head]);
 });
 
-test('sync refuses to linearize when a merge commit carries its own edits', (t) => {
+test('sync refuses to linearize when a merge commit carries its own edits', async (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   r.commit('feature', { 'app.txt': 'feature\n' });
@@ -1698,7 +1698,7 @@ test('sync refuses to linearize when a merge commit carries its own edits', (t) 
   r.run(r.work, 'commit', '-qm', 'merge main');
   r.run(r.work, 'push', '-q', 'origin', 'feat');
   const head = r.run(r.work, 'rev-parse', 'HEAD');
-  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: false, squash: false } });
+  const v = await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: false, squash: false } });
   assert.equal(v.verdict, 'error', JSON.stringify(v));
   assert.match(v.error, /drop changes made in merge commits/);
   assert.deepEqual([r.run(r.work, 'rev-parse', 'HEAD'), r.run(r.work, 'rev-parse', 'origin/feat')], [head, head]);
@@ -1890,7 +1890,7 @@ test('plain strips badges, markup and the reviewer footer', () => {
   assert.equal(plain('### Review\n\nSuggestions below.\n\n<details> <summary>About</summary>\nboilerplate\n</details>\n'), 'Review Suggestions below.');
 });
 
-test('sync pushes a fork branch to its own remote, not to origin', (t) => {
+test('sync pushes a fork branch to its own remote, not to origin', async (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   const fork = join(r.dir, 'fork.git');
@@ -1900,7 +1900,7 @@ test('sync pushes a fork branch to its own remote, not to origin', (t) => {
   r.run(r.work, 'push', '-q', '-u', 'fork', 'feat');
   divergeOnMain(r, { 'log.csv': 'id\na\nbase\n' });
   const head = r.run(r.work, 'rev-parse', 'HEAD');
-  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true } });
+  const v = await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true } });
   assert.equal(v.verdict, 'synced', JSON.stringify(v));
   assert.equal(r.run(fork, 'rev-parse', 'feat'), v.head);
   assert.equal(r.run(r.work, 'ls-remote', 'origin', 'feat'), '');
@@ -1920,7 +1920,7 @@ test('a SHA that returns as the head gets a fresh observation time', async (t) =
   assert.ok(headSeenAt('o/n#7', 'S') > first); // rewound and fast-forwarded back
 });
 
-test('sync compares and merges against the fetched base, not a stale reported base commit', (t) => {
+test('sync compares and merges against the fetched base, not a stale reported base commit', async (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   r.commit('feature', { 'app.txt': 'feature\n' });
@@ -1929,12 +1929,12 @@ test('sync compares and merges against the fetched base, not a stale reported ba
   const baseOid = r.run(r.work, 'rev-parse', 'main'); // what GitHub still reports
   divergeOnMain(r, { 'extra.txt': 'newer base\n' });
   const head = r.run(r.work, 'rev-parse', 'HEAD');
-  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', baseOid, head, settings: { merge: true } });
+  const v = await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', baseOid, head, settings: { merge: true } });
   assert.equal(v.verdict, 'synced', JSON.stringify(v));
   assert.equal(r.run(r.work, 'cat-file', '-p', 'HEAD:extra.txt'), 'newer base');
 });
 
-test('sync reports a conflict with the fetched base even when the branch contains the reported base, naming generated files', (t) => {
+test('sync reports a conflict with the fetched base even when the branch contains the reported base, naming generated files', async (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   r.commit('feature', { 'gen.txt': 'feature build\n', 'app.txt': 'feature\n' }); // only the base marks gen.txt generated
@@ -1942,7 +1942,7 @@ test('sync reports a conflict with the fetched base even when the branch contain
   const baseOid = r.run(r.work, 'rev-parse', 'main'); // the branch already contains it: up to date by GitHub's stale view
   divergeOnMain(r, { '.gitattributes': 'gen.txt linguist-generated\n', 'gen.txt': 'base build\n', 'app.txt': 'base\n' });
   const head = r.run(r.work, 'rev-parse', 'HEAD');
-  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', baseOid, head, settings: { merge: true } });
+  const v = await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', baseOid, head, settings: { merge: true } });
   assert.equal(v.verdict, 'conflict', JSON.stringify(v));
   assert.deepEqual(v.conflicts.sort(), ['app.txt', 'gen.txt']);
   assert.deepEqual(v.generated, ['gen.txt']);
@@ -2032,7 +2032,7 @@ test('--agent none never runs a local reviewer', async () => {
   assert.match(v.reason, /--agent none/);
 });
 
-test('sync clears only the old head marker, not other PR heads', (t) => {
+test('sync clears only the old head marker, not other PR heads', async (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   const other = r.run(r.work, 'rev-parse', 'HEAD');
@@ -2042,7 +2042,7 @@ test('sync clears only the old head marker, not other PR heads', (t) => {
   const head = r.run(r.work, 'rev-parse', 'HEAD');
   markTested(head, r.work);
   divergeOnMain(r, { 'log.csv': 'id\na\nbase\n' });
-  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true } });
+  const v = await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true } });
   assert.equal(v.verdict, 'synced', JSON.stringify(v));
   assert.equal(isTested(head, r.work), false);
   assert.equal(isTested(other, r.work), true);
@@ -2121,21 +2121,21 @@ test('a new request on the synced head supersedes the carried clean verdict', ()
 for (const settings of [{ merge: true, squash: true }, { merge: false, squash: false }]) {
   const method = settings.merge ? 'merge' : 'rebase';
 
-  test(`sync (${method}) reports the PR's own change unchanged, including union-merged files`, (t) => {
+  test(`sync (${method}) reports the PR's own change unchanged, including union-merged files`, async (t) => {
     const r = gitRepo();
     t.after(() => rmSync(r.dir, { recursive: true, force: true }));
     r.commit('feature', { 'app.txt': 'feature\n', 'log.csv': 'id\na\nfeature\n' });
     r.run(r.work, 'push', '-q', 'origin', 'feat');
     divergeOnMain(r, { 'other.txt': 'base\n', 'log.csv': 'id\na\nbase\n' });
     const head = r.run(r.work, 'rev-parse', 'HEAD');
-    const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings, union: ['*.csv'] });
+    const v = await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings, union: ['*.csv'] });
     assert.equal(v.verdict, 'synced', JSON.stringify(v));
     assert.deepEqual(v.unioned, ['log.csv']);
     assert.equal(v.unchanged, true);
     assert.equal(v.patchId, patchId(r.work, 'origin/main', head, ['log.csv']));
   });
 
-  test(`sync (${method}) reports a changed patch-id when the base changes the PR's context`, (t) => {
+  test(`sync (${method}) reports a changed patch-id when the base changes the PR's context`, async (t) => {
     const r = gitRepo();
     t.after(() => rmSync(r.dir, { recursive: true, force: true }));
     const lines = (over) => `${Array.from({ length: 10 }, (_, i) => over[i] ?? `line ${i}`).join('\n')}\n`;
@@ -2145,7 +2145,7 @@ for (const settings of [{ merge: true, squash: true }, { merge: false, squash: f
     r.run(r.work, 'push', '-q', 'origin', 'feat');
     divergeOnMain(r, { 'app.txt': lines({ 6: 'base' }) }); // merges cleanly, but inside the PR hunk's context
     const head = r.run(r.work, 'rev-parse', 'HEAD');
-    const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings });
+    const v = await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings });
     assert.equal(v.verdict, 'synced', JSON.stringify(v));
     assert.equal(v.unchanged, false);
   });
@@ -3080,7 +3080,7 @@ test('pipelined run: a clean review without a worktree to gate it is blocked, no
 for (const settings of [{ merge: true, squash: true }, { merge: false, squash: false }]) {
   const method = settings.merge ? 'merge' : 'rebase';
 
-  test(`sync (${method}) resolves conflicts limited to generated files: base side, one regenerate, commit, push`, (t) => {
+  test(`sync (${method}) resolves conflicts limited to generated files: base side, one regenerate, commit, push`, async (t) => {
     const r = gitRepo();
     t.after(() => rmSync(r.dir, { recursive: true, force: true }));
     const runs = join(r.dir, 'regen-runs');
@@ -3090,7 +3090,7 @@ for (const settings of [{ merge: true, squash: true }, { merge: false, squash: f
     r.run(r.work, 'push', '-q', 'origin', 'feat');
     divergeOnMain(r, { 'gen.txt': 'base build\n', 'log.csv': 'id\na\nbase\n' });
     const head = r.run(r.work, 'rev-parse', 'HEAD');
-    const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings, generated: ['*.txt'], regenerate });
+    const v = await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings, generated: ['*.txt'], regenerate });
     assert.equal(v.verdict, 'synced', JSON.stringify(v));
     assert.deepEqual(v.regenerated, ['gen.txt']);
     assert.equal(v.unchanged, false);
@@ -3101,14 +3101,14 @@ for (const settings of [{ merge: true, squash: true }, { merge: false, squash: f
     assert.equal(r.run(r.work, 'status', '--porcelain'), '');
   });
 
-  test(`sync (${method}) still aborts and reports when a generated conflict comes with a manual one`, (t) => {
+  test(`sync (${method}) still aborts and reports when a generated conflict comes with a manual one`, async (t) => {
     const r = gitRepo();
     t.after(() => rmSync(r.dir, { recursive: true, force: true }));
     r.commit('feature', { '.gitattributes': 'gen.txt linguist-generated\n', 'gen.txt': 'feature\n', 'app.txt': 'feature\n' });
     r.run(r.work, 'push', '-q', 'origin', 'feat');
     divergeOnMain(r, { '.gitattributes': 'gen.txt linguist-generated\n', 'gen.txt': 'base\n', 'app.txt': 'base\n' });
     const head = r.run(r.work, 'rev-parse', 'HEAD');
-    const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings, regenerate: 'true' });
+    const v = await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings, regenerate: 'true' });
     assert.equal(v.verdict, 'conflict', JSON.stringify(v));
     assert.deepEqual([v.conflicts, v.generated], [['app.txt'], ['gen.txt']]); // the attribute marks it generated
     assert.match(v.next, /prloop sync <pr> --continue/);
@@ -3116,7 +3116,7 @@ for (const settings of [{ merge: true, squash: true }, { merge: false, squash: f
     assert.equal(r.run(r.work, 'status', '--porcelain'), '');
   });
 
-  test(`sync --continue (${method}) leaves manual conflicts in place, then continues, regenerates and pushes`, (t) => {
+  test(`sync --continue (${method}) leaves manual conflicts in place, then continues, regenerates and pushes`, async (t) => {
     const r = gitRepo();
     t.after(() => rmSync(r.dir, { recursive: true, force: true }));
     r.commit('feature', { 'gen.txt': 'feature\n', 'app.txt': 'feature\n', 'log.csv': 'id\na\nfeature\n' });
@@ -3124,28 +3124,28 @@ for (const settings of [{ merge: true, squash: true }, { merge: false, squash: f
     divergeOnMain(r, { 'gen.txt': 'base\n', 'app.txt': 'base\n', 'log.csv': 'id\na\nbase\n' });
     const head = r.run(r.work, 'rev-parse', 'HEAD');
     const args = { cwd: r.work, branch: 'feat', base: 'main', head, settings, union: ['*.csv'], generated: ['gen.txt'], regenerate: 'cp app.txt gen.txt', resume: true };
-    let v = syncBranch(args);
+    let v = await syncBranch(args);
     assert.equal(v.verdict, 'conflict', JSON.stringify(v));
     assert.deepEqual([v.conflicts, v.generated, v.inProgress], [['app.txt'], ['gen.txt'], true]);
-    v = syncBranch(args); // markers still there
+    v = await syncBranch(args); // markers still there
     assert.equal(v.verdict, 'conflict', JSON.stringify(v));
     assert.match(v.next, /conflict markers/);
-    assert.equal(syncBranch({ ...args, head: 'f'.repeat(40) }).verdict, 'error'); // not a sync of this head
+    assert.equal((await syncBranch({ ...args, head: 'f'.repeat(40) })).verdict, 'error'); // not a sync of this head
     writeFileSync(join(r.work, 'app.txt'), 'base and feature\n');
-    assert.match(syncBranch(args).next, /stage each resolution/); // resolved but not staged
+    assert.match((await syncBranch(args)).next, /stage each resolution/); // resolved but not staged
     r.run(r.work, 'add', 'app.txt');
     writeFileSync(join(r.work, 'log.csv'), 'unrelated edit\n');
     writeFileSync(join(r.work, 'scratch.txt'), 'secret\n');
-    v = syncBranch(args); // neither the unstaged edit nor the untracked file may be committed
+    v = await syncBranch(args); // neither the unstaged edit nor the untracked file may be committed
     assert.deepEqual([v.verdict, v.stray], ['conflict', ['log.csv', 'scratch.txt']], JSON.stringify(v));
     r.run(r.work, 'checkout', '--', 'log.csv');
     r.run(r.work, 'add', 'scratch.txt'); // staged is not a resolution either
-    v = syncBranch(args);
+    v = await syncBranch(args);
     assert.deepEqual([v.verdict, v.stray], ['conflict', ['scratch.txt']], JSON.stringify(v));
     assert.match(v.next, /outside the conflicted files/);
     r.run(r.work, 'rm', '-q', '--cached', 'scratch.txt');
     rmSync(join(r.work, 'scratch.txt'));
-    v = syncBranch(args);
+    v = await syncBranch(args);
     assert.equal(v.verdict, 'synced', JSON.stringify(v));
     assert.deepEqual([v.resumed, v.unchanged], [true, false]);
     assert.equal(r.run(r.work, 'cat-file', '-p', 'HEAD:gen.txt'), 'base and feature');
@@ -3156,7 +3156,7 @@ for (const settings of [{ merge: true, squash: true }, { merge: false, squash: f
 }
 
 for (const settings of [{ merge: true, squash: true }, { merge: false, squash: false }]) {
-  test(`sync --continue (${settings.merge ? 'merge' : 'rebase'}) refuses staged edits to files the step applied cleanly`, (t) => {
+  test(`sync --continue (${settings.merge ? 'merge' : 'rebase'}) refuses staged edits to files the step applied cleanly`, async (t) => {
     const r = gitRepo();
     t.after(() => rmSync(r.dir, { recursive: true, force: true }));
     r.commit('feature', { 'app.txt': 'feature\n', 'feat.txt': 'feature only\n' });
@@ -3164,23 +3164,23 @@ for (const settings of [{ merge: true, squash: true }, { merge: false, squash: f
     divergeOnMain(r, { 'app.txt': 'base\n', 'base.txt': 'base only\n' });
     const head = r.run(r.work, 'rev-parse', 'HEAD');
     const args = { cwd: r.work, branch: 'feat', base: 'main', head, settings, resume: true };
-    assert.equal(syncBranch(args).verdict, 'conflict');
+    assert.equal((await syncBranch(args)).verdict, 'conflict');
     writeFileSync(join(r.work, 'app.txt'), 'both\n');
     writeFileSync(join(r.work, 'feat.txt'), 'replaced\n');
     writeFileSync(join(r.work, 'base.txt'), 'replaced\n');
     r.run(r.work, 'add', 'app.txt', 'feat.txt', 'base.txt');
-    const v = syncBranch(args); // only the conflicted app.txt may differ from Git's own merge
+    const v = await syncBranch(args); // only the conflicted app.txt may differ from Git's own merge
     assert.deepEqual([v.verdict, v.stray], ['conflict', ['base.txt', 'feat.txt']], JSON.stringify(v));
     writeFileSync(join(r.work, 'feat.txt'), 'feature only\n');
     writeFileSync(join(r.work, 'base.txt'), 'base only\n');
     r.run(r.work, 'add', 'feat.txt', 'base.txt');
-    assert.equal(syncBranch(args).verdict, 'synced');
+    assert.equal((await syncBranch(args)).verdict, 'synced');
     assert.equal(r.run(r.work, 'cat-file', '-p', 'HEAD:base.txt'), 'base only');
     assert.equal(r.run(r.work, 'cat-file', '-p', 'HEAD:feat.txt'), 'feature only');
   });
 }
 
-test('sync fails closed when regenerate leaves uncommitted changes inside a submodule', (t) => {
+test('sync fails closed when regenerate leaves uncommitted changes inside a submodule', async (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   const sub = join(r.dir, 'sub');
@@ -3194,7 +3194,7 @@ test('sync fails closed when regenerate leaves uncommitted changes inside a subm
   divergeOnMain(r, { 'gen.txt': 'base\n' });
   r.run(r.work, '-c', 'protocol.file.allow=always', 'submodule', 'update', '-q', '--init');
   const head = r.run(r.work, 'rev-parse', 'HEAD');
-  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true }, generated: ['gen.txt'], regenerate: 'echo out > sub/out.txt; echo y > sub/x' });
+  const v = await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true }, generated: ['gen.txt'], regenerate: 'echo out > sub/out.txt; echo y > sub/x' });
   assert.equal(v.verdict, 'error', JSON.stringify(v));
   assert.match(v.error, /submodule sub/);
   // The rollback restores the submodule too, so the checkout is clean for the next sync.
@@ -3205,7 +3205,7 @@ test('sync fails closed when regenerate leaves uncommitted changes inside a subm
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
 });
 
-test('sync never runs a regenerate command the base introduced; it runs once the branch declares it', (t) => {
+test('sync never runs a regenerate command the base introduced; it runs once the branch declares it', async (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   r.commit('feature', { 'gen.txt': 'feature\n' });
@@ -3214,7 +3214,7 @@ test('sync never runs a regenerate command the base introduced; it runs once the
   divergeOnMain(r, { 'gen.txt': 'base\n', '.prloop.json': config });
   let head = r.run(r.work, 'rev-parse', 'HEAD');
   const args = { cwd: r.work, branch: 'feat', base: 'main', settings: { merge: true }, generated: ['gen.txt'], regenerate: 'echo stale > ran.txt' };
-  let v = syncBranch({ ...args, head });
+  let v = await syncBranch({ ...args, head });
   assert.equal(v.verdict, 'error', JSON.stringify(v));
   assert.match(v.error, /changed regenerate to .*echo synced.*not approved/);
   assert.ok(!existsSync(join(r.work, 'ran.txt')));
@@ -3225,21 +3225,21 @@ test('sync never runs a regenerate command the base introduced; it runs once the
   r.commit('adopt config', { '.prloop.json': config });
   r.run(r.work, 'push', '-q', 'origin', 'feat');
   head = r.run(r.work, 'rev-parse', 'HEAD');
-  v = syncBranch({ ...args, head });
+  v = await syncBranch({ ...args, head });
   assert.equal(v.verdict, 'synced', JSON.stringify(v));
   assert.equal(r.run(r.work, 'cat-file', '-p', 'HEAD:gen.txt'), 'synced');
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), v.head);
 });
 
 for (const [defaultBranch, approvedRegenerate, runs] of [['main', ['echo synced > gen.txt'], true], ['main', [], false], ['main', ['echo other'], false], ['trunk', ['echo synced > gen.txt'], false]]) {
-  test(`sync ${runs ? 'runs' : 'refuses'} a regenerate merged on a ${defaultBranch === 'main' ? 'default' : 'non-default'} base with approvedRegenerate ${JSON.stringify(approvedRegenerate)}`, (t) => {
+  test(`sync ${runs ? 'runs' : 'refuses'} a regenerate merged on a ${defaultBranch === 'main' ? 'default' : 'non-default'} base with approvedRegenerate ${JSON.stringify(approvedRegenerate)}`, async (t) => {
     const r = gitRepo();
     t.after(() => rmSync(r.dir, { recursive: true, force: true }));
     r.commit('feature', { 'gen.txt': 'feature\n' });
     r.run(r.work, 'push', '-q', 'origin', 'feat');
     divergeOnMain(r, { 'gen.txt': 'base\n', '.prloop.json': '{"generated":["gen.txt"],"regenerate":"echo synced > gen.txt"}\n' });
     const head = r.run(r.work, 'rev-parse', 'HEAD');
-    const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true, defaultBranch }, generated: ['gen.txt'], approvedRegenerate });
+    const v = await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true, defaultBranch }, generated: ['gen.txt'], approvedRegenerate });
     if (runs) {
       assert.equal(v.verdict, 'synced', JSON.stringify(v));
       assert.deepEqual(v.regenerated, ['gen.txt']);
@@ -3254,7 +3254,7 @@ for (const [defaultBranch, approvedRegenerate, runs] of [['main', ['echo synced 
   });
 }
 
-test('sync never treats a source conflict as generated because the base broadened generated', (t) => {
+test('sync never treats a source conflict as generated because the base broadened generated', async (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   const config = (globs) => `{"generated":${JSON.stringify(globs)},"regenerate":"echo regen > gen.txt"}\n`;
@@ -3267,21 +3267,21 @@ test('sync never treats a source conflict as generated because the base broadene
   r.run(r.work, 'push', '-q', 'origin', 'feat');
   divergeOnMain(r, { 'gen.txt': 'base\n', 'src.txt': 'base\n', '.prloop.json': config(['gen.txt', 'src*']) });
   const head = r.run(r.work, 'rev-parse', 'HEAD');
-  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true } });
+  const v = await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true } });
   assert.equal(v.verdict, 'conflict', JSON.stringify(v));
   assert.deepEqual([v.conflicts, v.generated], [['src.txt'], ['gen.txt']]);
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
   assert.equal(r.run(r.work, 'status', '--porcelain'), '');
 });
 
-test('sync never pushes an invalid synced .prloop.json, even without regenerate', (t) => {
+test('sync never pushes an invalid synced .prloop.json, even without regenerate', async (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   r.commit('feature', { 'app.txt': 'feature\n' });
   r.run(r.work, 'push', '-q', 'origin', 'feat');
   divergeOnMain(r, { 'base.txt': 'base\n', '.prloop.json': '{"bogus":1}\n' });
   const head = r.run(r.work, 'rev-parse', 'HEAD');
-  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true } });
+  const v = await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true } });
   assert.equal(v.verdict, 'error', JSON.stringify(v));
   assert.match(v.error, /synced \.prloop\.json is invalid/);
   assert.equal(r.run(r.work, 'rev-parse', 'HEAD'), head);
@@ -3289,7 +3289,7 @@ test('sync never pushes an invalid synced .prloop.json, even without regenerate'
   assert.equal(r.run(r.work, 'status', '--porcelain'), '');
 });
 
-test('sync never regenerates with the branch\'s command once the base deleted .prloop.json', (t) => {
+test('sync never regenerates with the branch\'s command once the base deleted .prloop.json', async (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   r.run(r.work, 'switch', '-q', 'main');
@@ -3305,14 +3305,14 @@ test('sync never regenerates with the branch\'s command once the base deleted .p
   r.run(r.work, 'push', '-q', 'origin', 'main');
   r.run(r.work, 'switch', '-q', 'feat');
   const head = r.run(r.work, 'rev-parse', 'HEAD');
-  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true }, generated: ['gen.txt'], regenerate: 'echo stale > ran.txt' });
+  const v = await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true }, generated: ['gen.txt'], regenerate: 'echo stale > ran.txt' });
   assert.equal(v.verdict, 'conflict', JSON.stringify(v));
   assert.deepEqual(v.conflicts, ['gen.txt']);
   assert.ok(!existsSync(join(r.work, 'ran.txt')));
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
 });
 
-test('sync never classifies a conflict as generated with a generated list only the base changed', (t) => {
+test('sync never classifies a conflict as generated with a generated list only the base changed', async (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   r.run(r.work, 'switch', '-q', 'main');
@@ -3325,13 +3325,13 @@ test('sync never classifies a conflict as generated with a generated list only t
   divergeOnMain(r, { 'gen.txt': 'base\n', '.prloop.json': '{"generated":["gen.txt"],"regenerate":"cp app.txt gen.txt"}\n' });
   const head = r.run(r.work, 'rev-parse', 'HEAD');
   // The branch's approved configuration does not list gen.txt: it stays a manual conflict instead of taking the base side.
-  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true }, generated: ['other.txt'], regenerate: 'cp app.txt gen.txt' });
+  const v = await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true }, generated: ['other.txt'], regenerate: 'cp app.txt gen.txt' });
   assert.equal(v.verdict, 'conflict', JSON.stringify(v));
   assert.deepEqual([v.conflicts, v.generated], [['gen.txt'], []]);
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
 });
 
-test('a rejected regeneration commit rolls back like any other failed regeneration', (t) => {
+test('a rejected regeneration commit rolls back like any other failed regeneration', async (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   r.commit('feature', { 'gen.txt': 'feature\n' });
@@ -3339,7 +3339,7 @@ test('a rejected regeneration commit rolls back like any other failed regenerati
   divergeOnMain(r, { 'gen.txt': 'base\n' });
   const head = r.run(r.work, 'rev-parse', 'HEAD');
   writeFileSync(join(r.work, '.git', 'hooks', 'commit-msg'), '#!/bin/sh\n! grep -q "^Regenerate" "$1"\n', { mode: 0o755 }); // rejects only that commit
-  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true }, generated: ['gen.txt'], regenerate: 'echo new > gen.txt; echo x > made.txt' });
+  const v = await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true }, generated: ['gen.txt'], regenerate: 'echo new > gen.txt; echo x > made.txt' });
   assert.equal(v.verdict, 'error', JSON.stringify(v));
   assert.match(v.error, /committing the regenerated files failed/);
   assert.equal(r.run(r.work, 'rev-parse', 'HEAD'), head);
@@ -3348,7 +3348,8 @@ test('a rejected regeneration commit rolls back like any other failed regenerati
   assert.equal(spawnSync('git', ['rev-parse', '-q', '--verify', 'MERGE_HEAD'], { cwd: r.work }).status, 1);
 });
 
-test('sync runs the cached setup step before regenerate commands that need a dev dependency', (t) => {
+test('sync runs the cached setup step, in a gate slot, before regenerate commands that need a dev dependency', async (t) => {
+  tempState(t);
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   r.commit('feature', { 'gen.txt': 'feature\n' });
@@ -3359,28 +3360,33 @@ test('sync runs the cached setup step before regenerate commands that need a dev
   // The generator is a dev tool only setup installs (node_modules is ignored), as in a fresh worktree.
   const regenerate = 'node_modules/.bin/gen > gen.txt';
   const setup = 'mkdir -p node_modules/.bin && printf "#!/bin/sh\\necho generated\\n" > node_modules/.bin/gen && chmod +x node_modules/.bin/gen && echo run >> ../setup-runs';
-  const args = { cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true }, generated: ['gen.txt'], regenerate };
-  const failed = syncBranch({ ...args, setup: 'exit 5' });
+  // A light (docs-weight) gate config: setup is heavy work, so it still takes a slot, like before a gate.
+  const deps = { ...idle(), dir: join(r.dir, 'slots') };
+  const args = { cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true }, generated: ['gen.txt'], regenerate, deps };
+  const withSetup = (setup) => ({ ...args, cfg: { ...cfg, gateCost: 0, setup } });
+  const failed = await syncBranch(withSetup('exit 5'));
   assert.equal(failed.verdict, 'error');
   assert.match(failed.error, /setup command failed before regenerating .*exit 5/);
   assert.equal(r.run(r.work, 'rev-parse', 'HEAD'), head);
   // Setup output that is not ignored (a rewritten lockfile, a new file) never reaches the regeneration commit.
-  const dirty = syncBranch({ ...args, setup: `${setup} && echo lock > lock.txt && echo x >> app.txt` });
+  const dirty = await syncBranch(withSetup(`${setup} && echo lock > lock.txt && echo x >> app.txt`));
   assert.equal(dirty.verdict, 'error');
   assert.match(dirty.error, /setup command changed tracked or unignored files/);
   assert.equal(r.run(r.work, 'rev-parse', 'HEAD'), head);
   assert.equal(existsSync(join(r.work, 'lock.txt')), false);
   assert.equal(r.run(r.work, 'status', '--porcelain'), '');
   rmSync(join(r.dir, 'setup-runs'));
-  const v = syncBranch({ ...args, setup });
+  // A trailing comment cannot swallow the gate shell's closing parenthesis.
+  const v = await syncBranch(withSetup(`${setup} && ls ../slots | wc -l > ../setup-slots # install deps`));
   assert.equal(v.verdict, 'synced', JSON.stringify(v));
   assert.equal(r.run(r.work, 'show', 'HEAD:gen.txt'), 'generated');
   assert.equal(readFileSync(join(r.dir, 'setup-runs'), 'utf8'), 'run\n');
+  assert.notEqual(readFileSync(join(r.dir, 'setup-slots'), 'utf8').trim(), '0');
   // The gate shares the marker: the same command and lockfiles do not install again.
-  assert.equal(readFileSync(join(r.work, '.git', 'prloop-setup'), 'utf8'), setupKey(setup, r.work));
+  assert.equal(readFileSync(join(r.work, '.git', 'prloop-setup'), 'utf8'), setupKey(`${setup} && ls ../slots | wc -l > ../setup-slots # install deps`, r.work));
 });
 
-test('a failing regenerate command restores the old head and reports no output', (t) => {
+test('a failing regenerate command restores the old head and reports no output', async (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   r.commit('feature', { 'gen.txt': 'feature\n' });
@@ -3389,7 +3395,7 @@ test('a failing regenerate command restores the old head and reports no output',
   const head = r.run(r.work, 'rev-parse', 'HEAD');
   writeFileSync(join(r.work, '.git', 'info', 'exclude'), '*.out\n');
   writeFileSync(join(r.work, 'old.out'), 'kept\n');
-  const v = syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true }, generated: ['gen.txt'], regenerate: ['echo x > build.out', 'echo $((6 * 7)) > new.txt; exit 3'] });
+  const v = await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true }, generated: ['gen.txt'], regenerate: ['echo x > build.out', 'echo $((6 * 7)) > new.txt; exit 3'] });
   assert.equal(v.verdict, 'error');
   assert.match(v.error, /exit 3/);
   assert.doesNotMatch(v.error, /42/); // the output is not reported
@@ -3398,7 +3404,7 @@ test('a failing regenerate command restores the old head and reports no output',
   assert.equal(r.run(r.work, 'status', '--porcelain', '--ignored'), '!! old.out'); // new files are gone, ignored ones too
 });
 
-test('sync --continue refuses a markerless conflict until it is staged, also with the apply rebase backend', (t) => {
+test('sync --continue refuses a markerless conflict until it is staged, also with the apply rebase backend', async (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
   r.run(r.work, 'config', 'rebase.backend', 'apply');
@@ -3411,12 +3417,12 @@ test('sync --continue refuses a markerless conflict until it is staged, also wit
   r.run(r.work, 'switch', '-q', 'feat');
   const head = r.run(r.work, 'rev-parse', 'HEAD');
   const args = { cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: false, squash: false }, resume: true };
-  assert.equal(syncBranch(args).verdict, 'conflict');
-  const v = syncBranch(args); // modify/delete: no markers, still unresolved
+  assert.equal((await syncBranch(args)).verdict, 'conflict');
+  const v = await syncBranch(args); // modify/delete: no markers, still unresolved
   assert.deepEqual([v.verdict, v.conflicts], ['conflict', ['app.txt']], JSON.stringify(v));
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
   r.run(r.work, 'rm', '-q', 'app.txt');
-  assert.equal(syncBranch(args).verdict, 'synced');
+  assert.equal((await syncBranch(args)).verdict, 'synced');
   assert.equal(r.run(r.work, 'ls-tree', '--name-only', 'HEAD'), 'log.csv');
 });
 
