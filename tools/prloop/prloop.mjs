@@ -1038,13 +1038,12 @@ export async function readyGate(s, cfg, cwd, deps = {}) {
     const adopt = (pid) => { release.adopt?.(pid); deps.adopt?.(pid); };
     // The setup step runs in the gate shell, before the gate, unless it already passed in this worktree for the same
     // command and lockfiles. It is preparation, not validation: the gate cache stays keyed by the gate command alone.
-    const setup = cfg.setup && setupKey(cfg.setup, cwd), setupFile = setup && join(git(['rev-parse', '--absolute-git-dir'], cwd), 'prloop-setup');
-    const fresh = setup && !(existsSync(setupFile) && readFileSync(setupFile, 'utf8') === setup);
+    const setup = cfg.setup && setupState(cfg.setup, cwd), fresh = setup && setup.fresh;
     // Newlines end each part, so a trailing shell comment cannot swallow the closing parenthesis; a fresh setup is heavy
     // work, so even a light (docs) gate then takes a slot.
     const r = await runGate(fresh ? `(${cfg.setup}\n) && (${cfg.gate}\n)` : cfg.gate, cwd, fresh ? { ...cfg, gateCost: Math.max(1, cfg.gateCost ?? 1) } : cfg,
       { ...deps, logFile, adopt, admitted: () => markQueued(false) });
-    if (fresh && r.status === 0) writeFileSync(setupFile, setup);
+    if (fresh && r.status === 0) writeFileSync(setup.file, setup.key);
     const run = { head: s.head, gateKind: cfg.gateKind, gate: cfg.gate, source: 'prloop', status: r.status, ...pick(r, ['start', 'end', 'durationMs', 'peakLoad', 'peakRssMiB']), log: logFile };
     if (deps.repo && s.pr) recordGateRun(deps.repo, s.pr, run);
     if (r.status === 0) {
@@ -1066,6 +1065,12 @@ const DEPENDENCY_FILE = /^(package\.json|npm-shrinkwrap\.json|[\w.-]*[.-]lock(\.
 export function setupKey(setup, cwd) {
   const locks = git(['ls-tree', '-r', 'HEAD'], cwd).split('\n').filter((l) => DEPENDENCY_FILE.test(basename(l.split('\t')[1] ?? ''))).join('\n');
   return createHash('sha256').update(`${setup}\0${locks}`).digest('hex');
+}
+
+// The worktree's setup marker: fresh unless setup already passed here for this key (gates and sync regenerate share it).
+function setupState(setup, cwd) {
+  const key = setupKey(setup, cwd), file = join(git(['rev-parse', '--absolute-git-dir'], cwd), 'prloop-setup');
+  return { key, file, fresh: !(existsSync(file) && readFileSync(file, 'utf8') === key) };
 }
 
 // Single-flight per gate-cache key: concurrent `ready` runs for the same head and command check, run and record
@@ -1180,7 +1185,7 @@ const hasMarkers = (cwd, f) => { try { return MARKER.test(readFileSync(join(cwd,
 // With `regenerate`, conflicts limited to generated files take the base side and the command runs once at the end.
 // `resume` (`sync --continue`) leaves manual conflicts in the working tree instead of aborting, and on the next call
 // continues the sync in progress: the caller resolved them by hand.
-export function syncBranch({ cwd, branch, base, baseOid, head, settings, union = [], generated = [], regenerate, approvedRegenerate = [], remote = 'origin', rebase: forceRebase = false, resume = false }) {
+export function syncBranch({ cwd, branch, base, baseOid, head, settings, union = [], generated = [], regenerate, approvedRegenerate = [], setup, remote = 'origin', rebase: forceRebase = false, resume = false }) {
   // A fork PR's branch usually tracks its own remote; push there, not to the base repository.
   const headRemote = tryGit(['config', `branch.${branch}.remote`], cwd) || remote;
   // Sync to the fetched base branch: GitHub's baseRefOid can lag far behind it, and a branch that contains that
@@ -1425,7 +1430,7 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
     // Nested submodules too, which a top-level reset or listing does not descend into.
     const repos = ['', ...git(['submodule', 'foreach', '--quiet', '--recursive', 'echo "$displaypath"'], cwd).split('\n').filter(Boolean)];
     const untracked = () => repos.flatMap((p) => git(['ls-files', '-z', '--others'], join(cwd, p)).split('\0').filter(Boolean).map((f) => (p ? `${p}/${f}` : f)));
-    const before = new Set(untracked());
+    let before = new Set(untracked());
     const fail = (why) => {
       // A resumed sync holds a manual resolution: keep it locally instead of discarding it.
       if (resumed) return { verdict: 'error', error: `${why}; the synced branch is local only, at ${short(git(['rev-parse', 'HEAD'], cwd))}` };
@@ -1439,6 +1444,14 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
     const list = (c) => JSON.stringify([c ?? []].flat());
     if (list(approved.regenerate) !== list(final.regenerate) && (baseRegenerate === undefined || list(baseRegenerate) !== list(final.regenerate))) {
       return fail(`the synced .prloop.json changed regenerate to ${list(final.regenerate)}, which was not approved (neither the PR head declares it nor approvedRegenerate in the machine config lists it for this repository and a default-branch base): inspect it, then set the same regenerate in the branch's .prloop.json (commit and push) or add each command to this repository's approvedRegenerate entry, and rerun \`prloop sync\``);
+    }
+    // Regenerate commands often need the dependencies the setup step installs: run it first, cached like before a gate.
+    const prep = setup && setupState(setup, cwd);
+    if (prep?.fresh) {
+      const r = spawnSync('sh', ['-c', setup], { cwd, stdio: 'ignore' });
+      if (r.status !== 0) return fail(`setup command failed before regenerating (${setup}, exit ${r.status}); run it in the checkout to see why`);
+      writeFileSync(prep.file, prep.key);
+      before = new Set(untracked()); // a later failure keeps what setup installed, so its marker stays true
     }
     for (const cmd of [final.regenerate].flat()) {
       // Output is not reported: like gate output it may hold a secret, and the result reaches agents.
@@ -2348,7 +2361,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     const lock = takeLock(cwd, `sync of PR #${st.pr}`);
     if (lock.holder) return lockedOut(st, cwd, lock.holder);
     let v;
-    try { v = syncBranch({ cwd, branch: s.branch, base: s.base, baseOid: raw.baseRefOid, head: s.head, settings: raw.repoSettings, union: opts.union, generated: opts.generated, regenerate: opts.regenerate, approvedRegenerate: approvedFor(opts.approvedRegenerate, repo), rebase }); } finally { lock.release(); }
+    try { v = syncBranch({ cwd, branch: s.branch, base: s.base, baseOid: raw.baseRefOid, head: s.head, settings: raw.repoSettings, union: opts.union, generated: opts.generated, regenerate: opts.regenerate, approvedRegenerate: approvedFor(opts.approvedRegenerate, repo), setup: cfg.setup, rebase }); } finally { lock.release(); }
     if (v.verdict === 'error') return block(st, `sync failed: ${v.error}`);
     if (v.verdict === 'synced' && v.unchanged && s.verdict === 'clean') {
       st.carry = recordCarry(repo, st.pr, s.head, v);
@@ -2771,7 +2784,7 @@ export async function main(argv) {
       try {
         const pr = fetchPr(repo, prArg);
         const clean = classify(pr, cfg).verdict === 'clean';
-        const v = syncBranch({ cwd, branch: pr.headRefName, base: pr.baseRefName, baseOid: pr.baseRefOid, head: pr.headRefOid, settings: pr.repoSettings, union: opts.union, generated: opts.generated, regenerate: opts.regenerate, approvedRegenerate: approvedFor(opts.approvedRegenerate, repo), resume: !!opts.continue });
+        const v = syncBranch({ cwd, branch: pr.headRefName, base: pr.baseRefName, baseOid: pr.baseRefOid, head: pr.headRefOid, settings: pr.repoSettings, union: opts.union, generated: opts.generated, regenerate: opts.regenerate, approvedRegenerate: approvedFor(opts.approvedRegenerate, repo), setup: cfg.setup, resume: !!opts.continue });
         const carry = v.verdict === 'synced' && v.unchanged && clean ? recordCarry(repo, prArg, pr.headRefOid, v) : undefined;
         return out({ pr: Number(prArg), ...v, carry }, v.verdict === 'conflict' ? EXIT.conflict : v.verdict === 'error' ? EXIT.error : 0);
       } finally { lock.release(); }

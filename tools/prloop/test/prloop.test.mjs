@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import {
   EXIT, OUTPUT_TAIL, main, errorFrame, reviewerEvents, recordReviewerEvents, quotaResetHint, reviewerDecision, approvedFor, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, permissionDenied, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, sweepTmp, tmpLine, reclaimTmp, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, recordEvent, saveState, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, gateProvenance, treeRss, recordGatePass, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, reconcileStates, syncBranch, unionLines, unionResult, waitFor,
-  MERGEABILITY_WAIT, gateFor, limits, busyProcess, machineCpus, gateCpuSet, gateLauncher, cpusLine, parseCpuList, formatCpuList, lowImpactRound, severeFinding,
+  MERGEABILITY_WAIT, gateFor, limits, busyProcess, machineCpus, gateCpuSet, gateLauncher, cpusLine, parseCpuList, formatCpuList, lowImpactRound, severeFinding, setupKey,
 } from '../prloop.mjs';
 
 const pick = (o, keys) => Object.fromEntries(keys.map((k) => [k, o[k]]));
@@ -3346,6 +3346,30 @@ test('a rejected regeneration commit rolls back like any other failed regenerati
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head);
   assert.equal(r.run(r.work, 'status', '--porcelain'), ''); // no merge, staged output or new file left behind
   assert.equal(spawnSync('git', ['rev-parse', '-q', '--verify', 'MERGE_HEAD'], { cwd: r.work }).status, 1);
+});
+
+test('sync runs the cached setup step before regenerate commands that need a dev dependency', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.commit('feature', { 'gen.txt': 'feature\n' });
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  divergeOnMain(r, { 'gen.txt': 'base\n' });
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  writeFileSync(join(r.work, '.git', 'info', 'exclude'), 'node_modules/\n');
+  // The generator is a dev tool only setup installs (node_modules is ignored), as in a fresh worktree.
+  const regenerate = 'node_modules/.bin/gen > gen.txt';
+  const setup = 'mkdir -p node_modules/.bin && printf "#!/bin/sh\\necho generated\\n" > node_modules/.bin/gen && chmod +x node_modules/.bin/gen && echo run >> ../setup-runs';
+  const args = { cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: true }, generated: ['gen.txt'], regenerate };
+  const failed = syncBranch({ ...args, setup: 'exit 5' });
+  assert.equal(failed.verdict, 'error');
+  assert.match(failed.error, /setup command failed before regenerating .*exit 5/);
+  assert.equal(r.run(r.work, 'rev-parse', 'HEAD'), head);
+  const v = syncBranch({ ...args, setup });
+  assert.equal(v.verdict, 'synced', JSON.stringify(v));
+  assert.equal(r.run(r.work, 'show', 'HEAD:gen.txt'), 'generated');
+  assert.equal(readFileSync(join(r.dir, 'setup-runs'), 'utf8'), 'run\n');
+  // The gate shares the marker: the same command and lockfiles do not install again.
+  assert.equal(readFileSync(join(r.work, '.git', 'prloop-setup'), 'utf8'), setupKey(setup, r.work));
 });
 
 test('a failing regenerate command restores the old head and reports no output', (t) => {
