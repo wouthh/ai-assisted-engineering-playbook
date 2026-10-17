@@ -12,6 +12,8 @@ From a trusted checkout of this playbook, stop other repository writers and run 
 
 The helper reports the root, branch, HEAD, and upstream without printing a remote URL that could contain credentials in user information, a query, or a fragment. Confirm repository identity through a trusted host UI or authenticated metadata API when that evidence is required; never retain a raw credential-bearing remote URL in a prompt or log. Then read repository guidance and inspect relevant source, tests, and current pull-request state. The included [`repo-preflight.sh`](../scripts/repo-preflight.sh) fails if the working tree is dirty, detached, lacks an upstream, or cannot be inspected reliably. Do not substitute a raw `git status` command before the helper's configuration guards: repository configuration can make Git execute hooks or content filters.
 
+Under the prerequisites described below, preflight performs no mutation. Both repository helpers support `--help` outside a repository without invoking Git.
+
 ## Existing changes belong to someone
 
 Do not reset, clean, stash, amend, or overwrite unexplained changes. Determine whether they overlap the task. If they do, stop or create an isolated worktree or clone from a verified base. If they do not, leave them untouched.
@@ -21,6 +23,15 @@ An isolated worktree is not permission to ignore drift. Record the base SHA and 
 ## Bound the diff
 
 For sensitive or multi-repository work, define an allowlist of files or globs. Run the [change-scope utility](../scripts/check-change-scope.py) and inspect the complete diff, including deletions and generated files.
+
+```bash
+python3 scripts/check-change-scope.py \
+  --repository /path/to/repository \
+  --base origin/main \
+  --allowlist approved-paths.txt
+```
+
+The utility compares `BASE...HEAD` plus local changes and untracked files against newline-delimited path or glob rules. Empty lines are ignored; a `#` in column one starts a comment. All other whitespace is path-significant. A rule that begins with `#` or contains a line break can be written as a JSON string, keeping comment and path syntax unambiguous. A single `*` stays within one path segment; use `**` as its own segment for intentional recursive approval. Renames inspect both source and destination, and index flags that could hide changes fail closed. Repository-local clean/process filters also fail closed rather than executing, while ambient system and user Git configuration is isolated. The utility reports JSON-quoted path names and exits non-zero when anything is outside the approved scope.
 
 Check both content and shape:
 
@@ -34,7 +45,7 @@ Check both content and shape:
 
 The scope utility compares tracked and untracked file contents as well as Git state before and after inspection, including initialized submodules. Content digests stay in memory and are never reported. Both utilities reject submodules whose configured working directory differs from their actual checkout. These checks detect observed drift; they do not lock out concurrent writers, so stop other writers and revalidate before acting on the result.
 
-All tracked submodules must already be initialized; both tools fail closed otherwise and never initialize or fetch them. The scope check prefixes nested file paths so approving a gitlink alone does not approve edits to its files. A changed gitlink still needs its own approval. Preflight checks root and submodule operation markers again before reporting a clean result.
+All tracked submodules must already be initialized, through the repository's separately approved setup; both tools fail closed otherwise and never initialize or fetch them. The scope check prefixes nested file paths so approving a gitlink alone does not approve edits to its files. A changed gitlink still needs its own approval. Preflight checks root and submodule operation markers again before reporting a clean result.
 
 The root comparison uses one unambiguous merge base, including the gitlink baselines used to inspect nested changes. Porcelain status paths are included even when built-in text normalization makes a diff empty; an observed local edit still requires scope approval.
 
