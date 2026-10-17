@@ -4046,11 +4046,14 @@ test('quota cooldown: a reply blocks requests on that PR and every other PR unti
 test('quota cooldown: after expiry exactly one PR requests; a second quota reply starts a new cooldown', (t) => {
   const state = tempState(t);
   recordReviewerEvents([{ login: BOT.login, kind: 'quota', at: '2026-01-01T09:30:00.000Z' }], cfg, OWNER);
-  const a = noRequest(fixture()), b = otherPr(a), later = ms('09:30') + 7 * H, ttl = cfg.ackTimeout + cfg.timeout;
+  const a = noRequest(fixture()), b = otherPr(a), later = ms('09:30') + 7 * H, ttl = cfg.agentTimeout + cfg.ackTimeout + cfg.timeout;
   assert.deepEqual(decide(a, later), { action: 'none', probe: { at: new Date(later).toISOString(), from: a.url, for: '2026-01-01T09:30:00.000Z' } });
   const db = decide(b, later + 6e4);
   assert.deepEqual([db.action, db.until], ['local', new Date(later + ttl).toISOString()]); // b waits for a's probe
   assert.equal(decide(a, later + 6e4).action, 'none'); // a still holds it
+  // The probe outlives a full fix agent run (claimed when it starts) plus the request's wait, so a's ready still holds it.
+  assert.equal(decide(b, later + cfg.agentTimeout + cfg.ackTimeout).action, 'local');
+  assert.equal(decide(a, later + cfg.agentTimeout).probe?.from, a.url);
   assert.equal(decide(b, later + ttl + 1).probe?.from, b.url); // an unanswered probe expires and passes on
   // The probe's request gets another quota reply: every PR is blocked again for a new window, without a probe.
   const replied = structuredClone(a);
@@ -4069,7 +4072,7 @@ test('quota cooldown: run posts no request on another PR while a probe is out, a
   assert.equal(res.rounds ?? 0, 0);
 });
 
-test('ready while the cloud reviewer is out of quota: no deferred gate, trigger local, no request asked for', (t) => {
+const readyOutOfQuota = (t, mode) => {
   const state = tempState(t);
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
@@ -4082,13 +4085,26 @@ test('ready while the cloud reviewer is out of quota: no deferred gate, trigger 
   Object.assign(pr, { headRefName: 'feat', headRefOid: head, mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE' });
   const calls = fakeGh(t, r.dir, pr);
   const ran = join(r.dir, 'ran');
-  const res = spawnSync(process.execPath, [PRLOOP, 'ready', '7', '--repo', 'example-org/example-repo', '--gate', `touch "${ran}"`, '--review-before-gate', 'true'],
+  const res = spawnSync(process.execPath, [PRLOOP, 'ready', '7', '--repo', 'example-org/example-repo', '--gate', `touch "${ran}"`, '--review-before-gate', 'true', '--reviewer', mode],
     { cwd: r.work, encoding: 'utf8', env: { ...process.env, PRLOOP_LOCK_TOKEN: '', PRLOOP_GATE_WEIGHT: 'light', PRLOOP_MAX_LOAD: '100000', PRLOOP_MIN_FREE_MEM: '1K' } });
   const out = JSON.parse(res.stdout);
-  assert.deepEqual(pick(out, ['ready', 'gate', 'trigger', 'cloudReviewUntil']), { ready: true, gate: 'passed', trigger: 'local', cloudReviewUntil: new Date(Date.parse(blockedAt) + 6 * H).toISOString() });
+  assert.deepEqual(pick(out, ['ready', 'gate', 'cloudReviewUntil']), { ready: true, gate: 'passed', cloudReviewUntil: new Date(Date.parse(blockedAt) + 6 * H).toISOString() });
   assert.match(out.next, /do not post a review request/);
   assert.equal(existsSync(ran), true);
   assert.ok(!posted(calls()));
+  return out;
+};
+
+test('ready while the cloud reviewer is out of quota: no deferred gate, trigger local, no request asked for', (t) => {
+  const out = readyOutOfQuota(t, 'auto');
+  assert.equal(out.trigger, 'local');
+  assert.match(out.next, /reviews this head locally/);
+});
+
+test('ready under --reviewer cloud while out of quota promises no local review: trigger blocked', (t) => {
+  const out = readyOutOfQuota(t, 'cloud');
+  assert.equal(out.trigger, 'blocked');
+  assert.doesNotMatch(out.next, /locally/);
 });
 
 // Null or partial GraphQL nodes (a deleted comment, a review without a submitted time, a thread without comments).
