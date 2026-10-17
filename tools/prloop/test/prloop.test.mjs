@@ -3364,6 +3364,14 @@ test('sync runs the cached setup step before regenerate commands that need a dev
   assert.equal(failed.verdict, 'error');
   assert.match(failed.error, /setup command failed before regenerating .*exit 5/);
   assert.equal(r.run(r.work, 'rev-parse', 'HEAD'), head);
+  // Setup output that is not ignored (a rewritten lockfile, a new file) never reaches the regeneration commit.
+  const dirty = syncBranch({ ...args, setup: `${setup} && echo lock > lock.txt && echo x >> app.txt` });
+  assert.equal(dirty.verdict, 'error');
+  assert.match(dirty.error, /setup command changed tracked or unignored files/);
+  assert.equal(r.run(r.work, 'rev-parse', 'HEAD'), head);
+  assert.equal(existsSync(join(r.work, 'lock.txt')), false);
+  assert.equal(r.run(r.work, 'status', '--porcelain'), '');
+  rmSync(join(r.dir, 'setup-runs'));
   const v = syncBranch({ ...args, setup });
   assert.equal(v.verdict, 'synced', JSON.stringify(v));
   assert.equal(r.run(r.work, 'show', 'HEAD:gen.txt'), 'generated');
