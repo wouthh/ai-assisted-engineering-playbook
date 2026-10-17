@@ -5,7 +5,7 @@ import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { appendFileSync, chmodSync, closeSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { availableParallelism, constants as osConstants, freemem, homedir, loadavg, tmpdir, totalmem } from 'node:os';
-import { join, resolve } from 'node:path';
+import { basename, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 export const EXIT = { clean: 0, findings: 10, not_requested: 20, requested_while_unresolved: 21, not_tested: 22, timeout: 30, unavailable: 31, error: 40, conflict: 41, blocked: 50 };
@@ -59,7 +59,9 @@ Per repository: .prloop.json in the repository root may set gate, gateWeight, un
 for --merge repo), reviewBeforeGate, generated (globs), regenerate (a command or a list, which lets sync
 resolve conflicts limited to generated files itself) and gateIrrelevant (globs of paths whose changes need no
 new gate run before --merge), docsGate and docsPaths (globs: a head whose whole change since the merge base
-matches them runs docsGate instead of gate); flags and environment override it.
+matches them runs docsGate instead of gate), and setup (a command, such as a dependency install, that runs before
+any gate kind in a worktree where it has not yet passed for the same command and lockfiles); flags and environment
+override it.
 <state dir>/config.json may map approvedRegenerate: {"owner/name": [commands]}, the commands the operator approved
 to run in that repository when a default-branch base introduces them in regenerate.
 
@@ -168,7 +170,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const short = (sha) => (sha ?? '').slice(0, 7);
 
 // Values that one key of a config file may hold; anything else is a usage error, not a silent default.
-const REPO_KEYS = { gate: 'string', gateWeight: 'string|number', union: 'array', merge: 'string', reviewBeforeGate: 'boolean', regenerate: 'string|array', generated: 'array', gateIrrelevant: 'array', docsGate: 'string', docsPaths: 'array' };
+const REPO_KEYS = { gate: 'string', gateWeight: 'string|number', union: 'array', merge: 'string', reviewBeforeGate: 'boolean', regenerate: 'string|array', generated: 'array', gateIrrelevant: 'array', docsGate: 'string', docsPaths: 'array', setup: 'string' };
 const MACHINE_KEYS = { gateSlots: 'number|string', maxLoad: 'number|string', minFreeMem: 'number|string', resourceWait: 'string', gateTmpdir: 'string', busyProcessPatterns: 'array', gateSlotsWhenBusy: 'number|string', gateCpus: 'string', approvedRegenerate: 'object', quotaWindow: 'string', reviewerBackoff: 'string' };
 function readConfigFile(file, keys) {
   if (!file || !existsSync(file)) return {};
@@ -239,6 +241,8 @@ export function config(opts, env = process.env, { machine = {}, repo = {} } = {}
     gate: opts.gate ?? env.PRLOOP_GATE ?? repo.gate,
     // Docs-only gate: run instead of the full gate on a head whose whole change matches docsPaths (see gateFor).
     docsGate: repo.docsGate, docsPaths: repo.docsPaths,
+    // Prepares a worktree (installs dependencies) before any gate kind runs; see setupKey.
+    setup: repo.setup,
     forceGate: !!opts.forceGate,
     agentTimeout: parseDuration(opts.agentTimeout ?? env.PRLOOP_AGENT_TIMEOUT ?? '90m', 'agent-timeout'),
     trigger: String(opts.trigger ?? env.PRLOOP_TRIGGER ?? '@codex review'),
@@ -1027,7 +1031,12 @@ export async function readyGate(s, cfg, cwd, deps = {}) {
     const logFile = join(dir, `${(deps.repo ?? 'local').replace('/', '__')}__${s.pr ?? 'local'}__${s.head}__${new Date().toISOString().replace(/[:.]/g, '-')}.log`);
     // The gate shell keeps the key lock, and the caller's worktree lock (deps.adopt), if ready dies.
     const adopt = (pid) => { release.adopt?.(pid); deps.adopt?.(pid); };
-    const r = await runGate(cfg.gate, cwd, cfg, { ...deps, logFile, adopt, admitted: () => markQueued(false) });
+    // The setup step runs in the gate shell, before the gate, unless it already passed in this worktree for the same
+    // command and lockfiles. It is preparation, not validation: the gate cache stays keyed by the gate command alone.
+    const setup = cfg.setup && setupKey(cfg.setup, cwd), setupFile = setup && join(git(['rev-parse', '--absolute-git-dir'], cwd), 'prloop-setup');
+    const fresh = setup && !(existsSync(setupFile) && readFileSync(setupFile, 'utf8') === setup);
+    const r = await runGate(fresh ? `(${cfg.setup}) && (${cfg.gate})` : cfg.gate, cwd, cfg, { ...deps, logFile, adopt, admitted: () => markQueued(false) });
+    if (fresh && r.status === 0) writeFileSync(setupFile, setup);
     const run = { head: s.head, gateKind: cfg.gateKind, gate: cfg.gate, source: 'prloop', status: r.status, ...pick(r, ['start', 'end', 'durationMs', 'peakLoad', 'peakRssMiB']), log: logFile };
     if (deps.repo && s.pr) recordGateRun(deps.repo, s.pr, run);
     if (r.status === 0) {
@@ -1039,6 +1048,13 @@ export async function readyGate(s, cfg, cwd, deps = {}) {
     forgetGatePass(key);
     return { ok: false, status: r.status, run, tail: String(r.stdout || r.stderr).trimEnd().split('\n').slice(-60).join('\n') };
   } finally { markQueued(false); release(); }
+}
+
+// When setup must run again in a worktree: a change of the command or of any tracked file at HEAD whose name contains
+// "lock" (package-lock.json, yarn.lock, pnpm-lock.yaml, Cargo.lock, uv.lock and the like).
+export function setupKey(setup, cwd) {
+  const locks = git(['ls-tree', '-r', 'HEAD'], cwd).split('\n').filter((l) => /lock/i.test(basename(l.split('\t')[1] ?? ''))).join('\n');
+  return createHash('sha256').update(`${setup}\0${locks}`).digest('hex');
 }
 
 // Single-flight per gate-cache key: concurrent `ready` runs for the same head and command check, run and record

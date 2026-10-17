@@ -54,7 +54,7 @@ A repository declares its own gate in `.prloop.json` at its root, so a coordinat
 ```json
 { "gate": "npm run check", "gateWeight": "heavy", "union": ["CHANGELOG.md"], "merge": "squash", "reviewBeforeGate": true,
   "generated": ["src/generated/**"], "regenerate": "npm run generate",
-  "docsGate": "npm run check:docs", "docsPaths": ["docs/**", "*.md"] }
+  "docsGate": "npm run check:docs", "docsPaths": ["docs/**", "*.md"], "setup": "npm ci --ignore-scripts" }
 ```
 
 | Key | |
@@ -67,6 +67,7 @@ A repository declares its own gate in `.prloop.json` at its root, so a coordinat
 | `gateIrrelevant` | Globs of paths whose changes do not affect the gate (for example `["docs/**", "*.md"]`). `run --merge` accepts a [self-reported pass](#gate-logs-and-pass-provenance) only on a head whose diff from a prloop-run pass of the same gate touches nothing else; a changed submodule or `.prloop.json` never counts as irrelevant, and the list is read from the checked-out head each time. Unset means every path counts. |
 | `docsGate` | A cheaper command (`docsPaths` required too) that `prloop` runs instead of `gate` on a docs-only change. See [docs-only gate](#docs-only-gate). |
 | `docsPaths` | Globs of documentation paths (for example `["docs/**", "*.md"]`). |
+| `setup` | A command that prepares a worktree, such as a dependency install, run in the gate shell before any gate kind (full or docs). It runs again only when the command or a tracked file at HEAD whose name contains `lock` (`package-lock.json`, `yarn.lock`, `Cargo.lock`, ...) changed since it last passed in that worktree. A failing setup fails the gate. Cached gate passes skip it. |
 | `merge` | The merge method used by `run --merge repo`. Merging itself still needs that explicit flag. |
 | `reviewBeforeGate` | [Pipelined review](#pipelined-review); defaults to on for a declared heavy gate (`heavy` or a slot count of 1 or more), off otherwise. `--review-before-gate true\|false`, `PRLOOP_REVIEW_BEFORE_GATE`. |
 
