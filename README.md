@@ -6,17 +6,7 @@ Coding agents working on real repositories write code fast, but they also overwr
 I built this playbook to keep a human in charge of scope, validation and merging while the agent does the engineering.
 It gives you written rules an agent can follow, small read-only checks that enforce them, and a review loop that spends model tokens only when there is work.
 
-This playbook documents reusable AI-assisted software-engineering workflows for scoped coding-agent tasks, automated validation and pull-request review.
-
-> **Maintained**
->
-> The playbook is designed for reuse. Its examples are fictional, its utilities are read-only by default, and no private repository or workstation context is required.
-
-## What this repository is for
-
-AI coding tools can accelerate discovery, implementation, tests, and documentation. They do not remove the need to decide what should change, protect existing work, validate behavior, or control external side effects.
-
-This repository turns those responsibilities into a concrete workflow:
+Every task follows the same workflow:
 
 1. define intent, scope, authority, and acceptance;
 2. verify the actual repository and working state;
@@ -26,7 +16,7 @@ This repository turns those responsibilities into a concrete workflow:
 6. deliver only through an approved external-action boundary;
 7. verify the outcome and preserve a truthful handoff.
 
-It is useful for individual contributors, reviewers, and teams writing repository-level agent guidance. It is not tied to one AI vendor or one programming language.
+It is not tied to one AI vendor or programming language. Its examples are fictional, its utilities are read-only by default, and it needs no private repository or workstation context.
 
 ## Start here
 
