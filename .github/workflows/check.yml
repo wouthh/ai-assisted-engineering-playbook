@@ -10,6 +10,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -26,5 +28,13 @@ jobs:
       - run: node --test
       - run: ./bin/prloop --help
       - run: python3 scripts/git-identity-guard.py --help
-      - run: git diff --check
-      - run: git diff --cached --check
+      # A fresh checkout has no local or staged changes, so check the committed range instead.
+      - name: git diff --check (committed range)
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if [ -z "$BASE" ] || [ "$BASE" = 0000000000000000000000000000000000000000 ]; then
+            BASE=$(git merge-base "origin/$DEFAULT_BRANCH" HEAD)
+          fi
+          git diff --check "$BASE" HEAD
