@@ -1448,8 +1448,13 @@ export function syncBranch({ cwd, branch, base, baseOid, head, settings, union =
     // Regenerate commands often need the dependencies the setup step installs: run it first, cached like before a gate.
     const prep = setup && setupState(setup, cwd);
     if (prep?.fresh) {
+      // `add -A` below commits everything that is not ignored: setup output (a rewritten lockfile, an unignored
+      // virtualenv) must not ride along in the regeneration commit.
+      const status = () => git(['status', '--porcelain', '-z', '--untracked-files=all'], cwd);
+      const clean = status();
       const r = spawnSync('sh', ['-c', setup], { cwd, stdio: 'ignore' });
       if (r.status !== 0) return fail(`setup command failed before regenerating (${setup}, exit ${r.status}); run it in the checkout to see why`);
+      if (status() !== clean) return fail(`setup command changed tracked or unignored files before regenerating (${setup}); make it leave the tree clean (ignore its output, keep the lockfile current) and rerun \`prloop sync\``);
       writeFileSync(prep.file, prep.key);
       before = new Set(untracked()); // a later failure keeps what setup installed, so its marker stays true
     }
