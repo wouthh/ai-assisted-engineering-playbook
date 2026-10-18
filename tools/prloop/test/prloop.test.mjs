@@ -1062,11 +1062,11 @@ test('a local review diffs from the fetched base when the PR already merged a ba
   const old = process.env.PATH;
   t.after(() => { process.env.PATH = old; });
   mkdirSync(join(r.dir, 'bin'));
-  writeFileSync(join(r.dir, 'bin', 'claude'), `#!/bin/sh\nprintf '%s' "$2" > "${join(r.dir, 'prompt')}"\nexit 1\n`, { mode: 0o755 });
+  writeFileSync(join(r.dir, 'bin', 'claude'), `#!/bin/sh\nprintf '%s' "$2" > "${join(r.dir, 'prompt')}"\necho "$@" > "${join(r.dir, 'args')}"\nexit 1\n`, { mode: 0o755 });
   process.env.PATH = `${join(r.dir, 'bin')}:${old}`;
   await localReview('example-org/example-repo', { pr: 7, head, branch: 'feat', base: 'main', baseOid: stale, unresolvedThreads: [] }, cfg, r.work);
   const newBase = r.run(r.work, 'rev-parse', 'origin/main');
-  assert.match(readFileSync(join(r.dir, 'prompt'), 'utf8'), new RegExp(`git diff ${newBase}\\.\\.\\.HEAD`));
+  assert.match(readFileSync(join(r.dir, 'prompt'), 'utf8'), new RegExp(`git diff ${newBase}\\.\\.\\.HEAD`));  assert.match(readFileSync(join(r.dir, 'args'), 'utf8'), / --model claude-sonnet-5-5 /); // local reviewers default to Sonnet
 });
 
 const PRLOOP = join(import.meta.dirname, '..', 'prloop.mjs');
@@ -2670,10 +2670,12 @@ test('run counts a configured gate pass as progress when the head already had an
   const mod = fileURLToPath(new URL('../prloop.mjs', import.meta.url));
   writeFileSync(join(r.dir, 'bin', 'claude'), `#!/bin/sh
 node -e 'import(process.argv[1]).then((m) => m.recordGatePass("true", process.cwd()))' "${mod}"
+echo "$@" > "${join(r.dir, 'args')}"
 echo '{"status":"nothing_to_do","head":"${head}"}'
 `, { mode: 0o755 });
   const [res] = await runAll({ repo: 'example-org/example-repo', pr: '7', worktree: r.work, merge: 'rebase', deadline: '1h' }, { ...cfg, gate: 'true', gateCost: 0, interval: 1 }, { metrics: idle().metrics });
   assert.equal(res.verdict, 'merged', JSON.stringify(res));
+  assert.match(readFileSync(join(r.dir, 'args'), 'utf8'), / --model claude-sonnet-5-5 /); // fix agents default to Sonnet
 });
 
 test('run keeps finding PR worktrees after the directory it started in is removed', async (t) => {

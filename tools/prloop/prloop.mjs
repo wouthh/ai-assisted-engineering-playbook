@@ -367,6 +367,8 @@ export const fingerprint = (t) => `${t.path ?? ''}::${title(t.body).toLowerCase(
 
 // Local reviews are posted under the user's account; this prefix marks them as reviewer output.
 export const LOCAL = '[local review]';
+// Claude fix agents and local reviewers default to Sonnet; --model / PRLOOP_MODEL overrides it.
+const CLAUDE_MODEL = 'claude-sonnet-5-5';
 const isLocal = (body) => typeof body === 'string' && body.startsWith(LOCAL);
 export const localCleanBody = (head) => `${LOCAL} No issues found on ${head}.`;
 
@@ -1606,7 +1608,7 @@ async function runReviewer(cfg, prompt, cwd, keep) {
       if (r.status !== 0) throw new Error(`codex reviewer exited with ${r.status}: ${(r.stderr ?? '').slice(-300)}`);
       return parseReview(readFileSync(join(dir, 'out.json'), 'utf8'));
     }
-    const r = await spawnAgent('claude', ['-p', prompt, '--model', cfg.model ?? 'claude-opus-5-5', '--effort', cfg.effort ?? 'medium',
+    const r = await spawnAgent('claude', ['-p', prompt, '--model', cfg.model ?? CLAUDE_MODEL, '--effort', cfg.effort ?? 'medium',
       '--permission-mode', 'dontAsk', '--allowedTools', 'Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git show:*)',
       '--output-format', 'json', '--json-schema', JSON.stringify(REVIEW_SCHEMA)], cwd, cfg);
     keep({ ...r, final: r.stdout });
@@ -2240,7 +2242,7 @@ async function runFixAgent(cfg, prompt, cwd) {
       return { ...r, final: existsSync(join(dir, 'last.txt')) ? readFileSync(join(dir, 'last.txt'), 'utf8') : r.stdout };
     } finally { dropScratch(dir); }
   }
-  const r = await spawnAgent('claude', ['-p', prompt, '--model', cfg.model ?? 'claude-opus-5-5', '--effort', cfg.effort ?? 'medium',
+  const r = await spawnAgent('claude', ['-p', prompt, '--model', cfg.model ?? CLAUDE_MODEL, '--effort', cfg.effort ?? 'medium',
     '--permission-mode', 'auto', '--output-format', 'json'], cwd, cfg);
   return { ...r, final: r.stdout };
 }

@@ -141,11 +141,11 @@ Fix agents never wait for or poll reviews, merge, touch other PRs, rewrite histo
 | Option | Default | |
 |---|---|---|
 | `--gate "<cmd>"` | `PRLOOP_GATE` | The project's full validation command, run by `prloop ready`. Without it the agent passes the gate documented in AGENTS.md or README to `prloop ready --gate`. |
-| `--agent claude` | yes | `claude -p <prompt> --model claude-opus-5-5 --effort medium --permission-mode auto --output-format json`, run in the worktree so the CLI loads that project's instructions. |
+| `--agent claude` | yes | `claude -p <prompt> --model claude-sonnet-5-5 --effort medium --permission-mode auto --output-format json`, run in the worktree so the CLI loads that project's instructions. |
 | `--agent codex` | | `codex exec` with a workspace-write sandbox that allows network access. |
 | `--agent none` | | Stops the PR at `needs_agent` and saves the generated prompt owner-only as `<owner>__<name>__<pr>.prompt.md` next to its state file, named in the summary line, so the coordinator can spawn its own agent and rerun `run`. A needed local review stops the PR at `blocked` instead of running a reviewer. |
 | `--agent-timeout 90m` | 90m | `PRLOOP_AGENT_TIMEOUT`. Stops a fix agent or local reviewer (its whole process group: TERM, then KILL after 5 seconds) that works longer and records it `blocked` with `agent timed out after <budget> of work`, adding `with no output` when it printed nothing (the session was killed before its result; check its last command). Time its own `prloop ready` spends queued for the gate (the per-head gate lock, resource admission, a gate slot) is not counted: `run` passes `PRLOOP_QUEUE_FILE`, which `ready` holds while it waits, and the clock stops while that file names a live process. Claude agents also get `BASH_DEFAULT_TIMEOUT_MS` and `BASH_MAX_TIMEOUT_MS` set to this budget: Claude Code otherwise moves a long Bash command such as the gate to the background after its default timeout, and a `-p` session then ends before the gate completes. Codex has no such setting, so its prompt carries only the foreground rule. |
-| `--model`, `--effort` | | Override the agent model and effort (`PRLOOP_MODEL`, `PRLOOP_EFFORT`). |
+| `--model`, `--effort` | | Override the agent model and effort (`PRLOOP_MODEL`, `PRLOOP_EFFORT`). Claude fix agents and Claude local reviewers (`--reviewer local`, or `auto` falling back) default to `claude-sonnet-5-5`. |
 | `--max-agents 2` | 2 | Agents and local reviews running at the same time. |
 | `--max-rounds 6` | 6 | Fix-agent rounds per PR, across runs. |
 | `--low-impact-merge true\|false` | true | `PRLOOP_LOW_IMPACT_MERGE`. The [low-impact early merge](#low-impact-early-merge) under `--merge`. |
