@@ -275,7 +275,10 @@ class MessageTests(GuardFixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         for text in ("Contact someone@synthetic-mail.net", "Mail a.b@c.d.e",
                      "Co-authored-by: X <x@y.io>", "Split name @synthetic-mail.net",
-                     "Filter @service:abc@synthetic-mail.net", "Mail wrong@localhost"):
+                     "Filter @service:abc@synthetic-mail.net", "Mail wrong@localhost",
+                     "Co-authored-by: bot @synthetic-mail\u3002net",
+                     "Co-authored-by: bot @synthetic-mail\uff0enet",
+                     "Mail name @[IPv6:2001:db8::1]"):
             with self.subTest(text=text):
                 path = self.message(f"Add feature\n\n{text}\n")
                 self.assert_refused(self.guard("--commit-msg", path), "line 3")

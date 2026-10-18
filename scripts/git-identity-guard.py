@@ -91,9 +91,10 @@ ZERO_OID = re.compile(r"0+")
 # with < ( [ or a quote, and a domain never ends in punctuation.
 LEADING_EDGE = "<([\""
 TRAILING_EDGE = ">)]},;:!?'\"`."
-# A dot after the at-sign keeps a split address such as "name @domain.tld"
+# ASCII letters, digits and _ - : < > only, so a split address such as
+# "name @domain.tld", "name @domain\u3002tld" or "name @[IPv6:...]" stays
 # refused; an optional backtick allows a Markdown code span.
-MENTION = re.compile(r"`?@[^\s@.]+")
+MENTION = re.compile(r"`?@[A-Za-z0-9_:<>-]+")
 SCOPED_PACKAGE = re.compile(r"@[A-Za-z0-9][\w.-]*/[\w./-]*")
 # A whole word such as name@1.2.3, name@v1.2.3-beta.1 or @scope/name@1.2.
 PACKAGE_VERSION = re.compile(
