@@ -4506,7 +4506,7 @@ test('a run that handles a quota reply prints no quota text: the quota handling 
 
 // The identity guard refuses replayed Dependabot commits, so a conflicting Dependabot PR is rebuilt by Dependabot.
 test('run asks Dependabot to recreate a conflicting PR once, and syncs other PRs normally', async (t) => {
-  assert.equal(isDependabot({ headRefName: 'dependabot/npm_and_yarn/x-1.2.3' }), true);
+  assert.equal(isDependabot({ author: { login: 'example-dev' }, headRefName: 'dependabot/npm_and_yarn/x-1.2.3' }), false);
   assert.equal(isDependabot({ author: { login: 'app/dependabot' }, headRefName: 'feat' }), true);
   assert.equal(isDependabot({ author: { login: 'example-dev' }, headRefName: 'feat' }), false);
   const state = tempState(t);
