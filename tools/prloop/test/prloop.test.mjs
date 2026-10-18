@@ -1471,6 +1471,29 @@ test('self-check warns about a dirty, off-branch or behind prloop checkout, and 
   assert.equal(selfCheck(plainDir), null);
 });
 
+test('self-check only counts changes under the prloop directory', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.run(r.work, 'switch', '-q', 'main');
+  mkdirSync(join(r.work, 'tool'));
+  r.commit('tool', { 'tool/prloop.mjs': 'run\n' });
+  const tool = join(r.work, 'tool');
+  mkdirSync(join(r.work, '.claude'));
+  writeFileSync(join(r.work, '.claude', 'settings.json'), '{}\n');
+  mkdirSync(join(r.work, '.trail', 'cache'), { recursive: true });
+  writeFileSync(join(r.work, '.trail', 'hook.cjs'), 'hook\n');
+  writeFileSync(join(r.work, '.trail', 'cache', 'INDEX.md'), 'map\n');
+  mkdirSync(join(r.work, 'graft'));
+  writeFileSync(join(r.work, 'graft', 'card.md'), 'card\n');
+  writeFileSync(join(r.work, 'app.txt'), 'edited outside the tool\n');
+  assert.equal(selfCheck(tool), null);
+  writeFileSync(join(tool, 'stray.mjs'), 'local\n');
+  assert.match(selfCheck(tool).warning, /has uncommitted changes/);
+  rmSync(join(tool, 'stray.mjs'));
+  writeFileSync(join(tool, 'prloop.mjs'), 'edited\n');
+  assert.match(selfCheck(tool).warning, /has uncommitted changes/);
+});
+
 test('agent result: the last JSON line, also inside a JSON wrapper', () => {
   const line = '{"status":"requested","head":"abc","fixed":["T1"],"disputed":[],"reason":"fixed"}';
   assert.equal(parseAgentResult(`work done\n${line}`).status, 'requested');

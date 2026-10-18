@@ -165,7 +165,8 @@ const tryGit = (args, cwd) => { try { return git(args, cwd); } catch { return nu
 const tryGitRaw = (args, cwd) => { try { return execFileSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 64 << 20, stdio: ['ignore', 'pipe', 'pipe'] }); } catch { return null; } };
 // Explicit flags so user or repository config cannot hide untracked files or dirty submodules.
 // --no-optional-locks: a status check must not refresh and rewrite the index (see git-status "Background refresh").
-const dirty = (cwd) => git(['--no-optional-locks', 'status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none'], cwd) !== '';
+// paths limits the check to those pathspecs (relative to cwd); none checks the whole worktree.
+const dirty = (cwd, paths = []) => git(['--no-optional-locks', 'status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none', '--', ...paths], cwd) !== '';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const short = (sha) => (sha ?? '').slice(0, 7);
 
@@ -2726,7 +2727,8 @@ export function selfCheck(dir) {
   if (tryGit(['rev-parse', '--is-inside-work-tree'], dir) !== 'true') return null;
   const branch = (tryGit(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], dir) ?? 'origin/main').replace(/^origin\//, '');
   const problems = [];
-  if (dirty(dir)) problems.push('has uncommitted changes');
+  // Only files under prloop's own directory can change what runs; other files in the clone (agent settings) cannot.
+  if (dirty(dir, ['.'])) problems.push('has uncommitted changes');
   const current = tryGit(['branch', '--show-current'], dir);
   if (current !== branch) problems.push(`is on ${current || 'a detached HEAD'}, not ${branch}`);
   let note;
