@@ -281,12 +281,14 @@ export function config(opts, env = process.env, { machine = {}, repo = {} } = {}
 
 const PR_QUERY = `query($owner:String!,$name:String!,$pr:Int!){viewer{login} repository(owner:$owner,name:$name){defaultBranchRef{name}
   mergeCommitAllowed squashMergeAllowed rebaseMergeAllowed
-  pullRequest(number:$pr){number url state headRefName reactions(last:50){pageInfo{hasPreviousPage} nodes{content createdAt user{login}}} baseRefName baseRefOid headRefOid mergeable mergeStateStatus mergeCommit{oid}
+  pullRequest(number:$pr){number url state headRefName author{login} reactions(last:50){pageInfo{hasPreviousPage} nodes{content createdAt user{login}}} baseRefName baseRefOid headRefOid mergeable mergeStateStatus mergeCommit{oid}
     timelineItems(last:1,itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT]){nodes{... on HeadRefForcePushedEvent{createdAt}}}
     commits(last:1){nodes{commit{oid committedDate}}}
     reviewThreads(first:100){pageInfo{hasNextPage} nodes{id isResolved isOutdated path line comments(first:100){pageInfo{hasNextPage} nodes{body createdAt author{login} pullRequestReview{state}}}}}
     comments(last:100){pageInfo{hasPreviousPage} nodes{id databaseId body createdAt author{login} reactions(last:50){nodes{content createdAt user{login}}}}}
     reviews(last:50){pageInfo{hasPreviousPage} nodes{id body state submittedAt author{login} commit{oid} comments{totalCount}}}}}}`;
+
+export const isDependabot = (pr) => ['dependabot', 'dependabot[bot]', 'app/dependabot'].includes(pr.author?.login ?? '') || /^dependabot\//.test(pr.headRefName ?? '');
 
 export function resolveRepo(opts) {
   if (opts.repo) return opts.repo;
@@ -2379,6 +2381,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
   // Locked like a standalone sync, so two supervisors never fetch, merge or push in one checkout at once.
   // Returns the sync result only when the branch was already up to date; otherwise it handled the outcome.
   async function syncPr(st, s, raw, cwd, slot, rebase = opts.merge === 'rebase') {
+    if (isDependabot(raw)) return recreatePr(st, s, raw, cwd);
     const lock = takeLock(cwd, `sync of PR #${st.pr}`);
     if (lock.holder) return lockedOut(st, cwd, lock.holder);
     let v;
@@ -2392,6 +2395,19 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     if (v.verdict === 'synced') return event(st, 'polling', { verdict: 'synced', head: v.head });
     if (v.verdict === 'conflict') return slot() && fix(st, s, cwd, { verdict: 'conflict', trigger: 'conflict', conflicts: v.conflicts, generated: v.generated });
     return v;
+  }
+
+  // The identity guard refuses to replay Dependabot's commits in a local rebase, so Dependabot rebuilds the branch
+  // itself: one `@dependabot recreate` per base (or head), then a quiet wait for its force-push or for the PR to be superseded.
+  async function recreatePr(st, s, raw, cwd) {
+    const err = fetchBase(cwd, s.base, raw.baseRefOid);
+    if (err) return block(st, `sync failed: ${err}`);
+    const onto = git(['rev-parse', `origin/${s.base}`], cwd);
+    if (tryGit(['merge-base', '--is-ancestor', onto, s.head], cwd) !== null) return { verdict: 'up_to_date', head: s.head };
+    if (st.recreate && (st.recreate.base === onto || st.recreate.head === s.head)) return st.phase === 'waiting' ? undefined : event(st, 'waiting', { verdict: 'recreate_requested' });
+    sh('gh', ['pr', 'comment', String(st.pr), '--repo', repo, '--body', '@dependabot recreate']);
+    st.recreate = { head: s.head, base: onto, at: new Date().toISOString() };
+    return event(st, 'waiting', { verdict: 'recreate_requested', reason: `asked Dependabot to recreate the branch on ${s.base} ${short(onto)}` });
   }
 
   // Merges a head that passed every merge check (a clean review, or a low-impact early merge `low`).
@@ -2440,7 +2456,11 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     if (st.head !== s.head) st.gateFailure = undefined;
     st.head = s.head;
     if (s.state === 'MERGED') return event(st, 'merged', { mergeCommit: s.mergeCommit });
-    if (s.state === 'CLOSED') return event(st, 'closed', { reason: 'the PR is closed', next: undefined });
+    if (s.state === 'CLOSED') {
+      // Dependabot closes a PR it replaced with a "Superseded by #N" comment; the coordinator starts a run for #N.
+      const by = isDependabot(raw) && (raw.comments?.nodes ?? []).map((c) => /superseded by #(\d+)/i.exec(c.body ?? '')?.[1]).filter(Boolean).at(-1);
+      return event(st, 'closed', by ? { reason: `superseded by #${by}`, next: `start a new run for #${by}` } : { reason: 'the PR is closed', next: undefined });
+    }
     // The holder check comes first: a locked fix agent's uncommitted edit or local commit is not a bad checkout.
     const holder = cwd && lockHolder(cwd, null);
     if (holder) return lockedOut(st, cwd, holder);

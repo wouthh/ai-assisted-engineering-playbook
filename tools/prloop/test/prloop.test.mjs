@@ -6,7 +6,7 @@ import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import {
-  EXIT, OUTPUT_TAIL, main, errorFrame, reviewerEvents, recordReviewerEvents, quotaResetHint, reviewerDecision, approvedFor, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, permissionDenied, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, sweepTmp, tmpLine, reclaimTmp, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, recordEvent, saveState, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, gateProvenance, treeRss, recordGatePass, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, reconcileStates, syncBranch, unionLines, unionResult, waitFor,
+  EXIT, OUTPUT_TAIL, main, errorFrame, reviewerEvents, recordReviewerEvents, quotaResetHint, reviewerDecision, approvedFor, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, permissionDenied, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, sweepTmp, tmpLine, reclaimTmp, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, recordEvent, saveState, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, gateProvenance, treeRss, recordGatePass, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, reconcileStates, syncBranch, isDependabot, unionLines, unionResult, waitFor,
   MERGEABILITY_WAIT, gateFor, limits, busyProcess, machineCpus, gateCpuSet, gateLauncher, cpusLine, parseCpuList, formatCpuList, lowImpactRound, severeFinding, setupKey,
 } from '../prloop.mjs';
 
@@ -4502,4 +4502,45 @@ test('a run that handles a quota reply prints no quota text: the quota handling 
   assert.match(res.stdout, /^example-org\/example-repo#7 blocked at \w{7}: --agent none runs no local reviewer/);
   assert.doesNotMatch(res.stdout, /quota|usage/i);
   assert.match(readFileSync(logs[0], 'utf8'), /"phase":"reviewer_quota"/);
+});
+
+// The identity guard refuses replayed Dependabot commits, so a conflicting Dependabot PR is rebuilt by Dependabot.
+test('run asks Dependabot to recreate a conflicting PR once, and syncs other PRs normally', async (t) => {
+  assert.equal(isDependabot({ headRefName: 'dependabot/npm_and_yarn/x-1.2.3' }), true);
+  assert.equal(isDependabot({ author: { login: 'app/dependabot' }, headRefName: 'feat' }), true);
+  assert.equal(isDependabot({ author: { login: 'example-dev' }, headRefName: 'feat' }), false);
+  const state = tempState(t);
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.commit('feature', { 'app.txt': 'feature\n' });
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  divergeOnMain(r, { 'app.txt': 'base\n' });
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  writeFileSync(join(state, 'heads.json'), JSON.stringify({ 'example-org/example-repo#7': { sha: head, at: at('09:00') } }));
+  const pr = fixture();
+  Object.assign(pr, { headRefName: 'feat', headRefOid: head, mergeStateStatus: 'DIRTY', mergeable: 'CONFLICTING' });
+  const calls = fakeGh(t, r.dir, { ...pr, author: { login: 'dependabot' } });
+  const go = () => runAll({ repo: 'example-org/example-repo', pr: '7', worktree: r.work }, { ...cfg, agent: 'none', interval: 1, deadline: 300 }, { metrics: idle().metrics });
+  const comments = () => calls().filter((c) => c.startsWith('pr comment'));
+  const [res] = await go();
+  assert.equal(res.verdict, 'deadline', JSON.stringify(res)); // it waits quietly for Dependabot's force-push
+  const saved = JSON.parse(readFileSync(join(state, 'example-org__example-repo__7.json'), 'utf8'));
+  assert.deepEqual([saved.phase, saved.recreate.head], ['deadline', head]);
+  assert.deepEqual(comments(), ['pr comment 7 --repo example-org/example-repo --body @dependabot recreate']);
+  assert.equal(r.run(r.work, 'rev-parse', 'HEAD'), head, 'no local rebase');
+  assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head, 'nothing pushed');
+  await go();
+  assert.equal(comments().length, 1, 'a rerun does not post again');
+  // Dependabot closes the PR when it opens a replacement: the loop ends naming it.
+  const reply = (p) => JSON.stringify({ data: { viewer: { login: 'example-dev' }, repository: { mergeCommitAllowed: true, squashMergeAllowed: true, rebaseMergeAllowed: true, pullRequest: p } } });
+  const closed = { ...pr, author: { login: 'dependabot' }, state: 'CLOSED', comments: { nodes: [...pr.comments.nodes, { id: 'IC_sup', body: 'Superseded by #8.', createdAt: at('11:00'), author: { login: 'dependabot' }, reactions: { nodes: [] } }] } };
+  writeFileSync(join(r.dir, 'pr.json'), reply(closed));
+  const [done] = await go();
+  assert.deepEqual([done.verdict, done.reason], ['closed', 'superseded by #8'], JSON.stringify(done));
+  // Any other author keeps the normal sync path: a local sync finds the conflict for a fix agent.
+  writeFileSync(join(r.dir, 'pr.json'), reply({ ...pr, number: 9 }));
+  const [other] = await runAll({ repo: 'example-org/example-repo', pr: '9', worktree: r.work }, { ...cfg, agent: 'none', interval: 1, deadline: 300 }, { metrics: idle().metrics });
+  assert.equal(other.verdict, 'conflict', JSON.stringify(other));
+  assert.match(other.reason, /conflicts with main: app\.txt/);
+  assert.equal(comments().length, 1);
 });
