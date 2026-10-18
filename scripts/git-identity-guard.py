@@ -82,7 +82,8 @@ ENV.update(GIT_OPTIONAL_LOCKS="0", GIT_NO_LAZY_FETCH="1", GIT_NO_REPLACE_OBJECTS
            GIT_TRACE2="0", GIT_TRACE2_EVENT="0", GIT_TRACE2_PERF="0")
 ZERO_OID = re.compile(r"0+")
 # Message checks fail closed: every whitespace-separated word containing "@"
-# is treated as an address unless the whole word is a mention such as @name, a
+# is treated as an address unless the whole word is a mention or filter token
+# such as @name or @service:id (no local part and no dot after the at-sign), a
 # package scope such as @scope/name, or a package version such as name@1.2.3. Unusual but valid address
 # syntax is therefore refused unless it is allowlisted.
 # Trim only characters that can never belong to an address at that end: an
@@ -90,7 +91,9 @@ ZERO_OID = re.compile(r"0+")
 # with < ( [ or a quote, and a domain never ends in punctuation.
 LEADING_EDGE = "<([\""
 TRAILING_EDGE = ">)]},;:!?'\"`."
-MENTION = re.compile(r"@[A-Za-z0-9_-]+")
+# A dot after the at-sign keeps a split address such as "name @domain.tld"
+# refused; an optional backtick allows a Markdown code span.
+MENTION = re.compile(r"`?@[^\s@.]+")
 SCOPED_PACKAGE = re.compile(r"@[A-Za-z0-9][\w.-]*/[\w./-]*")
 # A whole word such as name@1.2.3, name@v1.2.3-beta.1 or @scope/name@1.2.
 PACKAGE_VERSION = re.compile(
@@ -357,7 +360,7 @@ def message_addresses(text: str) -> list[tuple[int, str]]:
         # Anything else, including a split address such as "name @domain" or
         # "name@ domain", must match the allowlist and is refused otherwise.
         if MENTION.fullmatch(word) or SCOPED_PACKAGE.fullmatch(word):
-            continue  # A mention such as @name or a scope such as @scope/name.
+            continue  # A mention such as @name or @level:error, or a scope such as @scope/name.
         if PACKAGE_VERSION.fullmatch(word):
             continue  # A package version such as name@1.2.3 or @scope/name@1.2.3.
         found.append((number, word))

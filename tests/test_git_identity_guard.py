@@ -268,6 +268,18 @@ class MessageTests(GuardFixture):
         result = self.guard("--commit-msg", path)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_filter_tokens_without_local_part_are_not_email(self) -> None:
+        path = self.message("Filter logs\n\nUse @service:abc, @level:error and\n"
+                            "`@service:<serviceId>`: filter @service:123 and @level:warn.\n")
+        result = self.guard("--commit-msg", path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for text in ("Contact someone@synthetic-mail.net", "Mail a.b@c.d.e",
+                     "Co-authored-by: X <x@y.io>", "Split name @synthetic-mail.net",
+                     "Filter @service:abc@synthetic-mail.net", "Mail wrong@localhost"):
+            with self.subTest(text=text):
+                path = self.message(f"Add feature\n\n{text}\n")
+                self.assert_refused(self.guard("--commit-msg", path), "line 3")
+
     def test_comment_lines_are_checked(self) -> None:
         # `git commit -m` keeps comment-prefixed lines in the stored message.
         path = self.message(f"Add feature\n\n# Co-authored-by: Synthetic <{OTHER}>\n")
