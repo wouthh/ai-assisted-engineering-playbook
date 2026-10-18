@@ -4531,13 +4531,32 @@ test('run asks Dependabot to recreate a conflicting PR once, and syncs other PRs
   assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), head, 'nothing pushed');
   await go();
   assert.equal(comments().length, 1, 'a rerun does not post again');
+  // Dependabot force-pushes a rebuilt branch: the clean worktree follows it instead of ending blocked.
+  const bot = join(r.dir, 'bot');
+  r.run(r.dir, 'clone', '-q', join(r.dir, 'remote.git'), bot);
+  r.run(bot, 'switch', '-qc', 'feat', 'origin/main');
+  writeFileSync(join(bot, 'dep.txt'), 'bumped\n');
+  r.run(bot, 'add', '.');
+  r.run(bot, 'commit', '-qm', 'rebuilt');
+  r.run(bot, 'push', '-qf', 'origin', 'feat');
+  const rebuilt = r.run(bot, 'rev-parse', 'HEAD');
+  writeFileSync(join(r.dir, 'pr.json'), JSON.stringify({ data: { viewer: { login: 'example-dev' }, repository: { mergeCommitAllowed: true, squashMergeAllowed: true, rebaseMergeAllowed: true,
+    pullRequest: { ...pr, author: { login: 'dependabot' }, headRefOid: rebuilt, mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE' } } } }));
+  const [after] = await go();
+  assert.notEqual(after.verdict, 'blocked', JSON.stringify(after));
+  assert.equal(r.run(r.work, 'rev-parse', 'HEAD'), rebuilt, 'the worktree moved to the rebuilt head');
+  assert.equal(comments().length, 1);
   // Dependabot closes the PR when it opens a replacement: the loop ends naming it.
   const reply = (p) => JSON.stringify({ data: { viewer: { login: 'example-dev' }, repository: { mergeCommitAllowed: true, squashMergeAllowed: true, rebaseMergeAllowed: true, pullRequest: p } } });
-  const closed = { ...pr, author: { login: 'dependabot' }, state: 'CLOSED', comments: { nodes: [...pr.comments.nodes, { id: 'IC_sup', body: 'Superseded by #8.', createdAt: at('11:00'), author: { login: 'dependabot' }, reactions: { nodes: [] } }] } };
+  const closed = { ...pr, author: { login: 'dependabot' }, state: 'CLOSED', comments: { nodes: [...pr.comments.nodes, { id: 'IC_sup', body: 'Superseded by #8.', createdAt: at('11:00'), author: { login: 'dependabot' }, reactions: { nodes: [] } },
+    // A person quoting the bot later never names the replacement.
+    { id: 'IC_quote', body: '> Superseded by #5.', createdAt: at('11:05'), author: { login: 'example-dev' }, reactions: { nodes: [] } }] } };
   writeFileSync(join(r.dir, 'pr.json'), reply(closed));
   const [done] = await go();
   assert.deepEqual([done.verdict, done.reason], ['closed', 'superseded by #8'], JSON.stringify(done));
   // Any other author keeps the normal sync path: a local sync finds the conflict for a fix agent.
+  r.run(r.work, 'reset', '-q', '--hard', head);
+  r.run(r.work, 'push', '-qf', 'origin', 'feat');
   writeFileSync(join(r.dir, 'pr.json'), reply({ ...pr, number: 9 }));
   const [other] = await runAll({ repo: 'example-org/example-repo', pr: '9', worktree: r.work }, { ...cfg, agent: 'none', interval: 1, deadline: 300 }, { metrics: idle().metrics });
   assert.equal(other.verdict, 'conflict', JSON.stringify(other));

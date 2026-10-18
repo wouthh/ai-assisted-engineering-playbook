@@ -288,7 +288,8 @@ const PR_QUERY = `query($owner:String!,$name:String!,$pr:Int!){viewer{login} rep
     comments(last:100){pageInfo{hasPreviousPage} nodes{id databaseId body createdAt author{login} reactions(last:50){nodes{content createdAt user{login}}}}}
     reviews(last:50){pageInfo{hasPreviousPage} nodes{id body state submittedAt author{login} commit{oid} comments{totalCount}}}}}}`;
 
-export const isDependabot = (pr) => ['dependabot', 'dependabot[bot]', 'app/dependabot'].includes(pr.author?.login ?? '') || /^dependabot\//.test(pr.headRefName ?? '');
+const DEPENDABOT = new Set(['dependabot', 'dependabot[bot]', 'app/dependabot']);
+export const isDependabot = (pr) => DEPENDABOT.has(pr.author?.login ?? '') || /^dependabot\//.test(pr.headRefName ?? '');
 
 export function resolveRepo(opts) {
   if (opts.repo) return opts.repo;
@@ -2410,6 +2411,15 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     return event(st, 'waiting', { verdict: 'recreate_requested', reason: `asked Dependabot to recreate the branch on ${s.base} ${short(onto)}` });
   }
 
+  // Dependabot's recreate force-pushes a replaced history: move a clean worktree still at the head it was asked to
+  // recreate onto the new head (a pull would merge the old history). Anything else is left for checkWorktree to report.
+  function followRecreate(cwd, s, old) {
+    if (tryGit(['branch', '--show-current'], cwd) !== s.branch || tryGit(['rev-parse', 'HEAD'], cwd) !== old) return;
+    if (tryGit(['status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none'], cwd) !== '') return;
+    if (tryGit(['fetch', '--quiet', 'origin', `+refs/heads/${s.branch}:refs/remotes/origin/${s.branch}`], cwd) === null) return;
+    if (tryGit(['rev-parse', `origin/${s.branch}`], cwd) === s.head) tryGit(['reset', '--quiet', '--keep', s.head], cwd);
+  }
+
   // Merges a head that passed every merge check (a clean review, or a low-impact early merge `low`).
   async function mergeNow(st, s, raw, cwd, slot, low) {
     if (s.mergeable !== 'MERGEABLE') return s.mergeable === 'UNKNOWN' ? undefined : block(st, `GitHub reports mergeable=${s.mergeable}`);
@@ -2458,12 +2468,15 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     if (s.state === 'MERGED') return event(st, 'merged', { mergeCommit: s.mergeCommit });
     if (s.state === 'CLOSED') {
       // Dependabot closes a PR it replaced with a "Superseded by #N" comment; the coordinator starts a run for #N.
-      const by = isDependabot(raw) && (raw.comments?.nodes ?? []).map((c) => /superseded by #(\d+)/i.exec(c.body ?? '')?.[1]).filter(Boolean).at(-1);
+      // Only Dependabot's own comments count: a person quoting or correcting it must not name the replacement.
+      const by = isDependabot(raw) && (raw.comments?.nodes ?? []).filter((c) => DEPENDABOT.has(c.author?.login ?? ''))
+        .map((c) => /superseded by #(\d+)/i.exec(c.body ?? '')?.[1]).filter(Boolean).at(-1);
       return event(st, 'closed', by ? { reason: `superseded by #${by}`, next: `start a new run for #${by}` } : { reason: 'the PR is closed', next: undefined });
     }
     // The holder check comes first: a locked fix agent's uncommitted edit or local commit is not a bad checkout.
     const holder = cwd && lockHolder(cwd, null);
     if (holder) return lockedOut(st, cwd, holder);
+    if (cwd && st.recreate && s.head !== st.recreate.head && isDependabot(raw)) followRecreate(cwd, s, st.recreate.head);
     const wrong = cwd && checkWorktree(cwd, s);
     if (wrong) return block(st, wrong);
     const slot = () => busy.size < maxAgents && resourcesAllow(st);
