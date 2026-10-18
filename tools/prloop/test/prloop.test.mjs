@@ -4522,6 +4522,9 @@ test('run asks Dependabot to recreate a conflicting PR once, and syncs other PRs
   const calls = fakeGh(t, r.dir, { ...pr, author: { login: 'dependabot' } });
   const go = () => runAll({ repo: 'example-org/example-repo', pr: '7', worktree: r.work }, { ...cfg, agent: 'none', interval: 1, deadline: 300 }, { metrics: idle().metrics });
   const comments = () => calls().filter((c) => c.startsWith('pr comment'));
+  // Every ref update prloop makes in the worktree (base fetch, follow fetch and reset) happens under its worktree lock.
+  const refLog = join(r.dir, 'refs.log');
+  writeFileSync(join(r.work, '.git', 'hooks', 'reference-transaction'), `#!/bin/sh\n[ "$1" = committed ] && ls "${join(r.work, '.git', 'prloop-lock')}" 2>/dev/null | grep -c . >> "${refLog}"\nexit 0\n`, { mode: 0o755 });
   const [res] = await go();
   assert.equal(res.verdict, 'deadline', JSON.stringify(res)); // it waits quietly for Dependabot's force-push
   const saved = JSON.parse(readFileSync(join(state, 'example-org__example-repo__7.json'), 'utf8'));
@@ -4546,6 +4549,9 @@ test('run asks Dependabot to recreate a conflicting PR once, and syncs other PRs
   assert.notEqual(after.verdict, 'blocked', JSON.stringify(after));
   assert.equal(r.run(r.work, 'rev-parse', 'HEAD'), rebuilt, 'the worktree moved to the rebuilt head');
   assert.equal(comments().length, 1);
+  const locked = readFileSync(refLog, 'utf8').trim().split('\n');
+  assert.ok(locked.length >= 2 && locked.every((n) => n === '1'), `ref updates outside the lock: ${locked}`);
+  rmSync(join(r.work, '.git', 'hooks', 'reference-transaction'));
   // Dependabot closes the PR when it opens a replacement: the loop ends naming it.
   const reply = (p) => JSON.stringify({ data: { viewer: { login: 'example-dev' }, repository: { mergeCommitAllowed: true, squashMergeAllowed: true, rebaseMergeAllowed: true, pullRequest: p } } });
   const closed = { ...pr, author: { login: 'dependabot' }, state: 'CLOSED', comments: { nodes: [...pr.comments.nodes, { id: 'IC_sup', body: 'Superseded by #8.', createdAt: at('11:00'), author: { login: 'dependabot' }, reactions: { nodes: [] } },

@@ -2383,9 +2383,9 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
   // Locked like a standalone sync, so two supervisors never fetch, merge or push in one checkout at once.
   // Returns the sync result only when the branch was already up to date; otherwise it handled the outcome.
   async function syncPr(st, s, raw, cwd, slot, rebase = opts.merge === 'rebase') {
-    if (isDependabot(raw)) return recreatePr(st, s, raw, cwd);
     const lock = takeLock(cwd, `sync of PR #${st.pr}`);
     if (lock.holder) return lockedOut(st, cwd, lock.holder);
+    if (isDependabot(raw)) { try { return recreatePr(st, s, raw, cwd); } finally { lock.release(); } }
     let v;
     try { v = await syncBranch({ cwd, branch: s.branch, base: s.base, baseOid: raw.baseRefOid, head: s.head, settings: raw.repoSettings, union: opts.union, generated: opts.generated, regenerate: opts.regenerate, approvedRegenerate: approvedFor(opts.approvedRegenerate, repo), cfg, deps: { metrics, now, log: ({ event: phase, ...e }) => logEvent(st, { phase, ...e }) }, rebase }); } finally { lock.release(); }
     if (v.verdict === 'error') return block(st, `sync failed: ${v.error}`);
@@ -2401,7 +2401,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
 
   // The identity guard refuses to replay Dependabot's commits in a local rebase, so Dependabot rebuilds the branch
   // itself: one `@dependabot recreate` per base (or head), then a quiet wait for its force-push or for the PR to be superseded.
-  async function recreatePr(st, s, raw, cwd) {
+  function recreatePr(st, s, raw, cwd) {
     const err = fetchBase(cwd, s.base, raw.baseRefOid);
     if (err) return block(st, `sync failed: ${err}`);
     const onto = git(['rev-parse', `origin/${s.base}`], cwd);
@@ -2414,11 +2414,16 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
 
   // Dependabot's recreate force-pushes a replaced history: move a clean worktree still at the head it was asked to
   // recreate onto the new head (a pull would merge the old history). Anything else is left for checkWorktree to report.
-  function followRecreate(cwd, s, old) {
-    if (tryGit(['branch', '--show-current'], cwd) !== s.branch || tryGit(['rev-parse', 'HEAD'], cwd) !== old) return;
-    if (tryGit(['status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none'], cwd) !== '') return;
-    if (tryGit(['fetch', '--quiet', 'origin', `+refs/heads/${s.branch}:refs/remotes/origin/${s.branch}`], cwd) === null) return;
-    if (tryGit(['rev-parse', `origin/${s.branch}`], cwd) === s.head) tryGit(['reset', '--quiet', '--keep', s.head], cwd);
+  // Locked like syncPr; returns the lock holder when another process took the worktree first.
+  function followRecreate(st, cwd, s, old) {
+    const lock = takeLock(cwd, `follow of PR #${st.pr}`);
+    if (lock.holder) return lock.holder;
+    try {
+      if (tryGit(['branch', '--show-current'], cwd) !== s.branch || tryGit(['rev-parse', 'HEAD'], cwd) !== old) return;
+      if (tryGit(['status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none'], cwd) !== '') return;
+      if (tryGit(['fetch', '--quiet', 'origin', `+refs/heads/${s.branch}:refs/remotes/origin/${s.branch}`], cwd) === null) return;
+      if (tryGit(['rev-parse', `origin/${s.branch}`], cwd) === s.head) tryGit(['reset', '--quiet', '--keep', s.head], cwd);
+    } finally { lock.release(); }
   }
 
   // Merges a head that passed every merge check (a clean review, or a low-impact early merge `low`).
@@ -2477,7 +2482,8 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     // The holder check comes first: a locked fix agent's uncommitted edit or local commit is not a bad checkout.
     const holder = cwd && lockHolder(cwd, null);
     if (holder) return lockedOut(st, cwd, holder);
-    if (cwd && st.recreate && s.head !== st.recreate.head && isDependabot(raw)) followRecreate(cwd, s, st.recreate.head);
+    const follower = cwd && st.recreate && s.head !== st.recreate.head && isDependabot(raw) && followRecreate(st, cwd, s, st.recreate.head);
+    if (follower) return lockedOut(st, cwd, follower);
     const wrong = cwd && checkWorktree(cwd, s);
     if (wrong) return block(st, wrong);
     const slot = () => busy.size < maxAgents && resourcesAllow(st);
