@@ -1782,6 +1782,14 @@ test('run --status hides PRs merged or closed over a day ago and keeps only the 
   assert.deepEqual(all.prs.find((p) => p.pr === 4).events.map((e) => e.phase), ['a', 'b', 'c']);
 });
 
+test('a stale in-memory save keeps a reconciled merge\'s time, so run --status still shows the newly merged PR', (t) => {
+  const dir = tempState(t);
+  const now = new Date().toISOString();
+  writeFileSync(join(dir, 'example-org__example-repo__7.json'), JSON.stringify({ repo: 'example-org/example-repo', pr: 7, phase: 'merged', updatedAt: now, reconciledAt: now }));
+  saveState({ repo: 'example-org/example-repo', pr: 7, phase: 'waiting', updatedAt: '2026-01-01T10:00:00.000Z' });
+  assert.deepEqual(runStatus('example-org/example-repo').prs.map((p) => [p.pr, p.phase, p.updatedAt]), [[7, 'merged', now]]);
+});
+
 test('run --status ignores repo-less lines in logs the state does not name', (t) => {
   const dir = tempState(t);
   writeFileSync(join(dir, 'example-org__example-repo__7.json'), JSON.stringify({ repo: 'example-org/example-repo', pr: 7, phase: 'waiting' })); // legacy: no log

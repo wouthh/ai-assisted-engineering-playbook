@@ -1826,13 +1826,13 @@ function withClaim(file, fn) {
 export const saveState = (st) => withStateLock(st.repo, st.pr, () => writeState(st));
 // `prloop sync` may record a carry-over, and an agent's `prloop ready` a gate run, while a run holds this PR's state in
 // memory: the newer carry and the newer gate run win. A phase that `run --status` reconciled (merged, closed or reopened)
-// after this copy was loaded wins too, with the phase it saved for a reopen (`beforeClose`), so a late agent or gate
+// after this copy was loaded wins too, with the phase it saved for a reopen (`beforeClose`) and its time, so a late agent or gate
 // result of that run cannot report the PR as blocked again, and a reopened PR still gets its prior phase back.
 const writeState = (st) => {
   const disk = loadState(st.repo, st.pr);
   if (disk.carry && !(st.carry?.at >= disk.carry.at)) st.carry = disk.carry;
   if (disk.lastGate && !(st.lastGate?.end >= disk.lastGate.end)) st.lastGate = disk.lastGate;
-  if (disk.reconciledAt && !(st.reconciledAt >= disk.reconciledAt)) for (const k of ['phase', 'reason', 'next', 'beforeClose', 'reconciledAt']) st[k] = disk[k];
+  if (disk.reconciledAt && !(st.reconciledAt >= disk.reconciledAt)) for (const k of ['phase', 'reason', 'next', 'beforeClose', 'reconciledAt', 'updatedAt']) st[k] = disk[k];
   mkdirSync(stateDir(), { recursive: true });
   // Owner-only, like the logs it points to.
   writeFileSync(statePath(st.repo, st.pr), JSON.stringify(st, null, 2), { mode: 0o600 });
