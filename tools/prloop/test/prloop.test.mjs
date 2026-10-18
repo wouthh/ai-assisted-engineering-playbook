@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import {
   EXIT, OUTPUT_TAIL, main, errorFrame, reviewerEvents, recordReviewerEvents, quotaResetHint, reviewerDecision, approvedFor, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, permissionDenied, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, sweepTmp, tmpLine, reclaimTmp, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, recordEvent, saveState, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, gateProvenance, treeRss, recordGatePass, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, reconcileStates, syncBranch, isDependabot, unionLines, unionResult, waitFor,
-  MERGEABILITY_WAIT, gateFor, limits, busyProcess, machineCpus, gateCpuSet, gateLauncher, cpusLine, parseCpuList, formatCpuList, lowImpactRound, severeFinding, setupKey,
+  MERGEABILITY_WAIT, gateFor, limits, busyProcess, machineCpus, gateCpuSet, gateLauncher, cpusLine, parseCpuList, formatCpuList, lowImpactRound, severeFinding, setupKey, excludeCodeMaps,
 } from '../prloop.mjs';
 
 const pick = (o, keys) => Object.fromEntries(keys.map((k) => [k, o[k]]));
@@ -1492,6 +1492,29 @@ test('self-check only counts changes under the prloop directory', (t) => {
   rmSync(join(tool, 'stray.mjs'));
   writeFileSync(join(tool, 'prloop.mjs'), 'edited\n');
   assert.match(selfCheck(tool).warning, /has uncommitted changes/);
+});
+
+test('per-clone code maps are excluded locally, never committed, also in a linked worktree', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  const wt = join(r.dir, 'linked');
+  r.run(r.work, 'worktree', 'add', '-q', wt, '-b', 'other');
+  for (const cwd of [r.work, wt]) {
+    mkdirSync(join(cwd, 'graft', '.cache'), { recursive: true });
+    writeFileSync(join(cwd, 'graft', '.cache', 'card.md'), 'map\n');
+    mkdirSync(join(cwd, '.trail', 'cache'), { recursive: true });
+    writeFileSync(join(cwd, '.trail', 'cache', 'INDEX.md'), 'map\n');
+    writeFileSync(join(cwd, '.trail', 'hook.cjs'), 'setup\n');
+    excludeCodeMaps(cwd);
+    excludeCodeMaps(cwd);
+    // The trail setup stays visible so it is committed with the work; only the maps are hidden.
+    assert.equal(r.run(cwd, 'status', '--porcelain', '--untracked-files=all'), '?? .trail/hook.cjs');
+    r.run(cwd, 'add', '-A');
+    assert.equal(r.run(cwd, 'diff', '--cached', '--name-only'), '.trail/hook.cjs');
+  }
+  const exclude = readFileSync(join(r.work, '.git', 'info', 'exclude'), 'utf8');
+  assert.equal(exclude.split('\n').filter((l) => l === '/graft/').length, 1);
+  assert.equal(exclude.split('\n').filter((l) => l === '/.trail/cache/').length, 1);
 });
 
 test('agent result: the last JSON line, also inside a JSON wrapper', () => {
