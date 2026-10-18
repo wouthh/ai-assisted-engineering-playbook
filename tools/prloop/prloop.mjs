@@ -289,7 +289,8 @@ const PR_QUERY = `query($owner:String!,$name:String!,$pr:Int!){viewer{login} rep
     reviews(last:50){pageInfo{hasPreviousPage} nodes{id body state submittedAt author{login} commit{oid} comments{totalCount}}}}}}`;
 
 const DEPENDABOT = new Set(['dependabot', 'dependabot[bot]', 'app/dependabot']);
-export const isDependabot = (pr) => DEPENDABOT.has(pr.author?.login ?? '') || /^dependabot\//.test(pr.headRefName ?? '');
+// Author only: Dependabot ignores commands on a PR someone else opened from a copy of its dependabot/ branch.
+export const isDependabot = (pr) => DEPENDABOT.has(pr.author?.login ?? '');
 
 export function resolveRepo(opts) {
   if (opts.repo) return opts.repo;
