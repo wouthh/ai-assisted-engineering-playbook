@@ -163,10 +163,24 @@ const git = (args, cwd) => sh('git', args, { cwd });
 const tryGit = (args, cwd) => { try { return git(args, cwd); } catch { return null; } };
 // Verbatim output, for blob contents whose edge whitespace matters; null when git fails.
 const tryGitRaw = (args, cwd) => { try { return execFileSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 64 << 20, stdio: ['ignore', 'pipe', 'pipe'] }); } catch { return null; } };
+// Per-clone code maps (graft/, .trail/cache/) are local caches: excluded in the clone's own
+// info/exclude so they never count as local changes and `git add -A` never commits them.
+export const CODE_MAP_EXCLUDES = ['/graft/', '/.trail/cache/'];
+export const excludeCodeMaps = (cwd) => {
+  const file = resolve(cwd, git(['rev-parse', '--git-path', 'info/exclude'], cwd));
+  let text = '';
+  try { text = readFileSync(file, 'utf8'); } catch { mkdirSync(dirname(file), { recursive: true }); }
+  const have = new Set(text.split('\n').map((l) => l.trim()));
+  const missing = CODE_MAP_EXCLUDES.filter((e) => !have.has(e));
+  if (missing.length) appendFileSync(file, `${text && !text.endsWith('\n') ? '\n' : ''}${missing.join('\n')}\n`);
+};
 // Explicit flags so user or repository config cannot hide untracked files or dirty submodules.
 // --no-optional-locks: a status check must not refresh and rewrite the index (see git-status "Background refresh").
 // paths limits the check to those pathspecs (relative to cwd); none checks the whole worktree.
-const dirty = (cwd, paths = []) => git(['--no-optional-locks', 'status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none', '--', ...paths], cwd) !== '';
+const dirty = (cwd, paths = []) => {
+  excludeCodeMaps(cwd);
+  return git(['--no-optional-locks', 'status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none', '--', ...paths], cwd) !== '';
+};
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const short = (sha) => (sha ?? '').slice(0, 7);
 
@@ -1486,6 +1500,7 @@ export async function syncBranch({ cwd, branch, base, baseOid, head, settings, u
       const r = spawnSync('sh', ['-c', cmd], { cwd, stdio: 'ignore' });
       if (r.status !== 0) return fail(`regenerate command failed (${cmd}, exit ${r.status}); run it in the checkout to see why`);
     }
+    excludeCodeMaps(cwd);
     git(['add', '-A'], cwd);
     // `add -A` cannot stage uncommitted changes inside a submodule: pushing would omit that output.
     const nested = git(['diff', '--name-only', '--ignore-submodules=none'], cwd).split('\n').filter(Boolean);
