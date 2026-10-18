@@ -91,10 +91,11 @@ ZERO_OID = re.compile(r"0+")
 # with < ( [ or a quote, and a domain never ends in punctuation.
 LEADING_EDGE = "<([\""
 TRAILING_EDGE = ">)]},;:!?'\"`."
-# ASCII letters, digits and _ - : < > only, so a split address such as
-# "name @domain.tld", "name @domain\u3002tld" or "name @[IPv6:...]" stays
-# refused; an optional backtick allows a Markdown code span.
-MENTION = re.compile(r"`?@[A-Za-z0-9_:<>-]+")
+# @name, @name:value or @name:<placeholder> in ASCII letters, digits, _ and -
+# only, so a split address such as "name @domain.tld", "name @[IPv6:...]" or
+# "@x:<name @domain.tld>" stays refused; an optional backtick allows a
+# Markdown code span.
+MENTION = re.compile(r"`?@[A-Za-z0-9_-]+(?::(?:[A-Za-z0-9_-]+|<[A-Za-z0-9_-]+>?))?")
 SCOPED_PACKAGE = re.compile(r"@[A-Za-z0-9][\w.-]*/[\w./-]*")
 # A whole word such as name@1.2.3, name@v1.2.3-beta.1 or @scope/name@1.2.
 PACKAGE_VERSION = re.compile(
@@ -360,8 +361,11 @@ def message_addresses(text: str) -> list[tuple[int, str]]:
         # Exemptions apply only when the whole word has exactly that shape.
         # Anything else, including a split address such as "name @domain" or
         # "name@ domain", must match the allowlist and is refused otherwise.
-        if MENTION.fullmatch(word) or SCOPED_PACKAGE.fullmatch(word):
-            continue  # A mention such as @name or @level:error, or a scope such as @scope/name.
+        # A placeholder such as @name:<id> must close within the same token.
+        if MENTION.fullmatch(word) and ("<" not in word or ">" in token):
+            continue  # A mention such as @name, @level:error or @service:<id>.
+        if SCOPED_PACKAGE.fullmatch(word):
+            continue  # A scope such as @scope/name.
         if PACKAGE_VERSION.fullmatch(word):
             continue  # A package version such as name@1.2.3 or @scope/name@1.2.3.
         found.append((number, word))
