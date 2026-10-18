@@ -1118,6 +1118,21 @@ test('sync refuses a base ref that lacks the PR base commit', async (t) => {
   assert.match(v.error, /does not contain the PR base commit/);
 });
 
+test('sync takes a just-pushed head whose PR head lags, but refuses a remote that differs', async (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.commit('feature', { 'app.txt': 'feature\n' });
+  const stale = r.run(r.work, 'rev-parse', 'HEAD');
+  r.commit('fix', { 'app.txt': 'fixed\n' });
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  const v = await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head: stale, settings: { merge: true } });
+  assert.equal(v.verdict, 'up_to_date', JSON.stringify(v));
+  assert.equal(v.head, r.run(r.work, 'rev-parse', 'HEAD'));
+  r.commit('unpushed', { 'app.txt': 'local\n' });
+  const w = await syncBranch({ cwd: r.work, branch: 'feat', base: 'main', head: stale, settings: { merge: true } });
+  assert.match(w.error, /differs from remote PR head/);
+});
+
 test('sync fetches the base into its remote-tracking ref in a single-branch clone', async (t) => {
   const r = gitRepo();
   t.after(() => rmSync(r.dir, { recursive: true, force: true }));
