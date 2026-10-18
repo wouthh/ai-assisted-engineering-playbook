@@ -1197,7 +1197,13 @@ export async function syncBranch({ cwd, branch, base, baseOid, head, settings, u
   // commit may still conflict with the real base. fetchBase checked that the fetched branch contains it.
   const target = `${remote}/${base}`;
   const env = { ...process.env, GIT_EDITOR: 'true' };
-  const step = (args) => spawnSync('git', args, { cwd, env, encoding: 'utf8' }).status === 0;
+  // The last failed step's own message (a commit hook's refusal, say), without Git's hints, for the error verdict.
+  let stepError = '';
+  const step = (args) => {
+    const r = spawnSync('git', args, { cwd, env, encoding: 'utf8' });
+    if (r.status !== 0) stepError = `${r.stderr ?? ''}\n${r.stdout ?? ''}`.split('\n').filter((l) => l.trim() && !l.startsWith('hint:')).slice(-4).join(' ').slice(0, 400);
+    return r.status === 0;
+  };
   const rebaseDir = resolve(cwd, git(['rev-parse', '--git-path', 'rebase-merge'], cwd));
   const inRebase = existsSync(rebaseDir), inMerge = tryGit(['rev-parse', '-q', '--verify', 'MERGE_HEAD'], cwd) !== null;
   const resumed = resume && (inRebase || inMerge);
@@ -1319,8 +1325,9 @@ export async function syncBranch({ cwd, branch, base, baseOid, head, settings, u
     ok = step(rebase ? ['rebase', '--continue'] : ['commit', '--no-edit']);
   }
   if (!ok) {
+    const why = stepError;
     step([rebase ? 'rebase' : 'merge', '--abort']);
-    return { verdict: 'error', error: `${method} failed` };
+    return { verdict: 'error', error: `${method} failed${why ? `: ${why}` : ''}` };
   }
   rmSync(unionState, { force: true });
   // A rebase drops merge commits, including edits made only in them: push only when the result equals merging the base.

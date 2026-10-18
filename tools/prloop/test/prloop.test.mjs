@@ -3227,6 +3227,55 @@ for (const settings of [{ merge: true, squash: true }, { merge: false, squash: f
   });
 }
 
+test('sync --continue reports a conflict in a later rebased commit instead of aborting', async (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.commit('bump', { 'app.txt': 'bump\n', 'log.csv': 'id\nbump\n' });
+  r.commit('format', { 'app.txt': 'two\n', 'log.csv': 'id\ntwo\n' });
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  divergeOnMain(r, { 'app.txt': 'base\n', 'log.csv': 'id\nbase\n' });
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  const args = { cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: false, squash: false }, union: ['*.csv'], resume: true };
+  let v = await syncBranch(args);
+  assert.deepEqual([v.verdict, v.conflicts, v.inProgress], ['conflict', ['app.txt'], true], JSON.stringify(v));
+  writeFileSync(join(r.work, 'app.txt'), 'base bump\n');
+  r.run(r.work, 'add', 'app.txt');
+  v = await syncBranch(args); // the second commit conflicts too: report it, keep the rebase
+  assert.deepEqual([v.verdict, v.conflicts, v.inProgress], ['conflict', ['app.txt'], true], JSON.stringify(v));
+  assert.ok(existsSync(join(r.work, '.git', 'rebase-merge')));
+  writeFileSync(join(r.work, 'app.txt'), 'base two\n');
+  r.run(r.work, 'add', 'app.txt');
+  v = await syncBranch(args);
+  assert.equal(v.verdict, 'synced', JSON.stringify(v));
+  assert.equal(r.run(r.work, 'cat-file', '-p', 'HEAD:app.txt'), 'base two');
+  assert.equal(r.run(r.work, 'cat-file', '-p', 'HEAD:log.csv'), 'id\nbase\ntwo');
+  assert.equal(r.run(r.work, 'rev-parse', 'origin/feat'), v.head);
+});
+
+test('sync --continue reports why a non-conflict rebase step failed, then aborts', async (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.commit('feature', { 'app.txt': 'feature\n' });
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  divergeOnMain(r, { 'app.txt': 'base\n' });
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  const args = { cwd: r.work, branch: 'feat', base: 'main', head, settings: { merge: false, squash: false }, resume: true };
+  assert.equal((await syncBranch(args)).verdict, 'conflict');
+  // A hook that refuses the resolved commit (prepare-commit-msg runs even under --no-verify) leaves nothing unmerged: that is a failure, not a new conflict.
+  const hooks = join(r.dir, 'hooks');
+  mkdirSync(hooks);
+  writeFileSync(join(hooks, 'prepare-commit-msg'), '#!/bin/sh\necho "refusing this author" >&2\nexit 1\n');
+  chmodSync(join(hooks, 'prepare-commit-msg'), 0o755);
+  r.run(r.work, 'config', 'core.hooksPath', hooks);
+  writeFileSync(join(r.work, 'app.txt'), 'both\n');
+  r.run(r.work, 'add', 'app.txt');
+  const v = await syncBranch(args);
+  assert.equal(v.verdict, 'error', JSON.stringify(v));
+  assert.match(v.error, /^rebase failed: .*refusing this author/);
+  assert.equal(r.run(r.work, 'rev-parse', 'HEAD'), head);
+  assert.ok(!existsSync(join(r.work, '.git', 'rebase-merge')));
+});
+
 for (const settings of [{ merge: true, squash: true }, { merge: false, squash: false }]) {
   test(`sync --continue (${settings.merge ? 'merge' : 'rebase'}) refuses staged edits to files the step applied cleanly`, async (t) => {
     const r = gitRepo();
