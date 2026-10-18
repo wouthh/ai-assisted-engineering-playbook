@@ -1248,8 +1248,11 @@ export async function syncBranch({ cwd, branch, base, baseOid, head, settings, u
     if (dirty(cwd)) return { verdict: 'error', error: 'working tree is not clean' };
     const baseError = fetchBase(cwd, base, baseOid, remote);
     if (baseError) return { verdict: 'error', error: baseError };
-    tryGit(['fetch', '--quiet', headRemote, branch], cwd);
-    if (git(['rev-parse', 'HEAD'], cwd) !== head) return { verdict: 'error', error: `local HEAD differs from remote PR head ${short(head)}: push or pull first` };
+    // GitHub's PR head can lag a push by a few seconds: a fetched remote branch that already equals local HEAD is the head.
+    const fetched = tryGit(['fetch', '--quiet', headRemote, branch], cwd) !== null ? tryGit(['rev-parse', 'FETCH_HEAD'], cwd) : null;
+    const local = git(['rev-parse', 'HEAD'], cwd);
+    if (local !== head && local === fetched) head = local;
+    if (local !== head) return { verdict: 'error', error: `local HEAD differs from remote PR head ${short(head)}: push or pull first` };
     // ponytail: merge whenever merge or squash merges are allowed; rebase only for rebase-only repos.
     rebase = forceRebase || (!settings.merge && !settings.squash);
     // A rebase-only repository refuses a branch with merge commits even when it contains the base: linearize it.
@@ -2374,7 +2377,8 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     let v;
     try { v = await syncBranch({ cwd, branch: s.branch, base: s.base, baseOid: raw.baseRefOid, head: s.head, settings: raw.repoSettings, union: opts.union, generated: opts.generated, regenerate: opts.regenerate, approvedRegenerate: approvedFor(opts.approvedRegenerate, repo), cfg, deps: { metrics, now, log: ({ event: phase, ...e }) => logEvent(st, { phase, ...e }) }, rebase }); } finally { lock.release(); }
     if (v.verdict === 'error') return block(st, `sync failed: ${v.error}`);
-    if (v.verdict === 'synced' && v.unchanged && s.verdict === 'clean') {
+    // A clean verdict of a stale snapshot head never carries over to the newer head sync found on the remote.
+    if (v.verdict === 'synced' && v.unchanged && s.verdict === 'clean' && v.previousHead === s.head) {
       st.carry = recordCarry(repo, st.pr, s.head, v);
       return event(st, 'polling', { verdict: 'carried', head: v.head });
     }
@@ -2803,7 +2807,7 @@ export async function main(argv) {
         const pr = fetchPr(repo, prArg);
         const clean = classify(pr, cfg).verdict === 'clean';
         const v = await syncBranch({ cwd, branch: pr.headRefName, base: pr.baseRefName, baseOid: pr.baseRefOid, head: pr.headRefOid, settings: pr.repoSettings, union: opts.union, generated: opts.generated, regenerate: opts.regenerate, approvedRegenerate: approvedFor(opts.approvedRegenerate, repo), cfg, resume: !!opts.continue });
-        const carry = v.verdict === 'synced' && v.unchanged && clean ? recordCarry(repo, prArg, pr.headRefOid, v) : undefined;
+        const carry = v.verdict === 'synced' && v.unchanged && clean && v.previousHead === pr.headRefOid ? recordCarry(repo, prArg, pr.headRefOid, v) : undefined;
         return out({ pr: Number(prArg), ...v, carry }, v.verdict === 'conflict' ? EXIT.conflict : v.verdict === 'error' ? EXIT.error : 0);
       } finally { lock.release(); }
     }
