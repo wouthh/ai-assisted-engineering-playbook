@@ -1762,9 +1762,24 @@ test('run --status shows each PR\'s last events from its run log, also legacy li
   const lines = [{ pr: 7, phase: 'agent' }, { pr: 8, phase: 'agent' }, ...Array.from({ length: 6 }, (_, i) => ({ pr: 7, phase: `p${i}` }))];
   writeFileSync(log, `${lines.map((l) => JSON.stringify(l)).join('\n')}\n`); // written before events carried a repo
   writeFileSync(join(dir, 'run-2026-01-02T10-00-00-000Z.jsonl'), '{"repo":"example-org/other-repo","pr":7,"phase":"blocked"}\n');
-  const st = runStatus('example-org/example-repo');
+  const st = runStatus('example-org/example-repo', { all: true });
   assert.deepEqual(st.prs.map((p) => [p.pr, p.phase, p.head, p.rounds]), [[7, 'waiting', 'abcdef1', 2]]);
   assert.deepEqual(st.prs[0].events.map((e) => e.phase), ['p1', 'p2', 'p3', 'p4', 'p5']); // not PR 8, not the other repo
+});
+
+test('run --status hides PRs merged or closed over a day ago and keeps only the last event, unless --all', (t) => {
+  const dir = tempState(t);
+  const log = join(dir, 'run-2026-01-01T10-00-00-000Z.jsonl');
+  const old = '2026-01-01T10:00:00.000Z', now = new Date().toISOString();
+  const write = (pr, phase, updatedAt) => writeFileSync(join(dir, `example-org__example-repo__${pr}.json`), JSON.stringify({ repo: 'example-org/example-repo', pr, phase, updatedAt, log }));
+  write(1, 'merged', old); write(2, 'closed', old); write(3, 'merged', now); write(4, 'waiting', old); write(5, 'merged');
+  writeFileSync(log, `${['a', 'b', 'c'].map((phase) => JSON.stringify({ repo: 'example-org/example-repo', pr: 4, phase })).join('\n')}\n`);
+  const st = runStatus('example-org/example-repo');
+  assert.deepEqual(st.prs.map((p) => p.pr).sort(), [3, 4]);
+  assert.deepEqual(st.prs.find((p) => p.pr === 4).events.map((e) => e.phase), ['c']);
+  const all = runStatus('example-org/example-repo', { all: true });
+  assert.deepEqual(all.prs.map((p) => p.pr).sort(), [1, 2, 3, 4, 5]);
+  assert.deepEqual(all.prs.find((p) => p.pr === 4).events.map((e) => e.phase), ['a', 'b', 'c']);
 });
 
 test('run --status ignores repo-less lines in logs the state does not name', (t) => {
@@ -1772,7 +1787,7 @@ test('run --status ignores repo-less lines in logs the state does not name', (t)
   writeFileSync(join(dir, 'example-org__example-repo__7.json'), JSON.stringify({ repo: 'example-org/example-repo', pr: 7, phase: 'waiting' })); // legacy: no log
   writeFileSync(join(dir, 'run-2026-01-02T10-00-00-000Z.jsonl'), '{"pr":7,"phase":"other"}\n'); // could be any repo's PR 7
   writeFileSync(join(dir, 'run-2026-01-01T10-00-00-000Z.jsonl'), '{"repo":"example-org/example-repo","pr":7,"phase":"mine"}\n');
-  assert.deepEqual(runStatus('example-org/example-repo').prs[0].events.map((e) => e.phase), ['mine']);
+  assert.deepEqual(runStatus('example-org/example-repo', { all: true }).prs[0].events.map((e) => e.phase), ['mine']);
 });
 
 test('run --status marks PRs merged or closed outside a run, with one GitHub call per repo, and keeps live blockers', async (t) => {
@@ -1788,7 +1803,7 @@ test('run --status marks PRs merged or closed outside a run, with one GitHub cal
   write(9, 'waiting');
   write(10, 'merged');
   assert.equal(await main(['run', '--status', '--repo', 'example-org/example-repo']), 0);
-  const phases = Object.fromEntries(runStatus('example-org/example-repo').prs.map((p) => [p.pr, [p.phase, p.reason]]));
+  const phases = Object.fromEntries(runStatus('example-org/example-repo', { all: true }).prs.map((p) => [p.pr, [p.phase, p.reason]]));
   assert.deepEqual(phases, { 7: ['merged', 'the PR was merged on GitHub'], 8: ['blocked', 'agent made no progress'], 9: ['closed', 'the PR was closed on GitHub'], 10: ['merged', undefined] });
   const calls = readFileSync(join(bin, 'calls.log'), 'utf8').trim().split('\n');
   assert.equal(calls.length, 1);
@@ -1824,7 +1839,7 @@ test('run --status marks PRs merged or closed outside a run, with one GitHub cal
   writeFileSync(join(dir, 'example-org__example-repo__13.json'), JSON.stringify({ repo: 'example-org/example-repo', pr: 13, phase: 'closed' }));
   writeFileSync(join(bin, 'gh'), `#!/bin/sh\necho '{"data":{"repository":{"p9":{"state":"OPEN"},"p11":{"state":"CLOSED"},"p13":{"state":"OPEN"}}}}'\n`, { mode: 0o755 });
   reconcileStates('example-org/example-repo', [8]);
-  const reopenedPhases = Object.fromEntries(runStatus('example-org/example-repo').prs.map((p) => [p.pr, [p.phase, p.reason, p.events.at(-1)?.reason]]));
+  const reopenedPhases = Object.fromEntries(runStatus('example-org/example-repo', { all: true }).prs.map((p) => [p.pr, [p.phase, p.reason, p.events.at(-1)?.reason]]));
   assert.deepEqual(pick(reopenedPhases, [9, 11, 13]), {
     9: ['waiting', undefined, 'the PR was reopened on GitHub'], 11: ['closed', 'the PR was closed on GitHub', 'the PR was closed on GitHub'], 13: ['reopened', 'the PR was reopened on GitHub', 'the PR was reopened on GitHub'] });
   assert.equal(JSON.parse(readFileSync(join(dir, 'example-org__example-repo__9.json'), 'utf8')).beforeClose, undefined);
@@ -1855,7 +1870,7 @@ test('reset-rounds resets the counter once, logs it, and refuses a second reset'
   const dir = tempState(t);
   writeFileSync(join(dir, 'example-org__example-repo__7.json'), JSON.stringify({ repo: 'example-org/example-repo', pr: 7, phase: 'blocked', rounds: 7, seen: { a: ['T1'] } }));
   assert.deepEqual(pick(resetRounds('example-org/example-repo', 7), ['previousRounds', 'rounds']), { previousRounds: 7, rounds: 0 });
-  const [pr] = runStatus('example-org/example-repo').prs;
+  const [pr] = runStatus('example-org/example-repo', { all: true }).prs;
   assert.deepEqual([pr.rounds, pr.events.at(-1).phase], [0, 'rounds_reset']);
   assert.equal(JSON.parse(readFileSync(join(dir, 'example-org__example-repo__7.json'), 'utf8')).roundResets, 1);
   assert.throws(() => resetRounds('example-org/example-repo', 7), /already reset once/);
@@ -1992,7 +2007,7 @@ test('run logs a merged phase reconciled meanwhile instead of its own stale bloc
   writeFileSync(join(dir, 'gh'), `#!/bin/sh\n[ -e "${dir}/done" ] || { : > "${dir}/done"; printf '%s' '{"repo":"example-org/example-repo","pr":7,"phase":"merged","reason":"the PR was merged on GitHub","reconciledAt":"2026-01-01T00:00:00.000Z"}' > "${f}"; }\necho "{}"\n`, { mode: 0o755 });
   process.env.PATH = `${dir}:${old}`;
   await runAll({ repo: 'example-org/example-repo', pr: '7', deadline: '20s' }, { ...cfg, interval: 1 });
-  const [pr] = runStatus('example-org/example-repo').prs;
+  const [pr] = runStatus('example-org/example-repo', { all: true }).prs;
   assert.equal(pr.phase, 'merged');
   assert.deepEqual(pick(pr.events.at(-1), ['phase', 'reason']), { phase: 'merged', reason: 'the PR was merged on GitHub' });
 });
@@ -2157,7 +2172,7 @@ test('a recorded carry-over lands in the state file and the event log', (t) => {
   assert.deepEqual(pick(carry, ['from', 'to', 'patchId']), { from: 'a'.repeat(40), to: 'b'.repeat(40), patchId: 'p1' });
   const st = JSON.parse(readFileSync(join(dir, 'example-org__example-repo__7.json'), 'utf8'));
   assert.equal(st.carry.to, 'b'.repeat(40));
-  const [pr] = runStatus('example-org/example-repo').prs;
+  const [pr] = runStatus('example-org/example-repo', { all: true }).prs;
   assert.deepEqual(pick(pr.events.at(-1), ['phase', 'from', 'to', 'patchId']), { phase: 'carried', from: 'aaaaaaa', to: 'bbbbbbb', patchId: 'p1' });
 });
 
@@ -2359,13 +2374,13 @@ test('run counts an automatic review that started during the agent as progress',
   });
   assert.ok(existsSync(join(r.dir, 'token')), 'the agent ran');
   assert.notEqual(res.verdict, 'blocked', JSON.stringify(res));
-  assert.doesNotMatch(JSON.stringify(runStatus('example-org/example-repo')), /no progress/);
+  assert.doesNotMatch(JSON.stringify(runStatus('example-org/example-repo', { all: true })), /no progress/);
 });
 
 test('run keeps a successful agent\'s reason, such as a proposed prloop issue, in the run log', async (t) => {
   const { res } = await runNoResultAgent(t, true, { body: `echo '{"status":"requested","head":"x","fixed":["T1"],"disputed":[],"reason":"proposed prloop issue: status stale"}'` });
   assert.equal(res.verdict, 'clean', JSON.stringify(res));
-  const e = runStatus('example-org/example-repo').prs[0].events.find((x) => x.phase === 'agent_reason');
+  const e = runStatus('example-org/example-repo', { all: true }).prs[0].events.find((x) => x.phase === 'agent_reason');
   assert.equal(e?.reason, 'proposed prloop issue: status stale', JSON.stringify(e));
   assert.equal(e.status, 'requested');
 });
@@ -2611,7 +2626,7 @@ test('run keeps polling when an agent without a result line still made progress'
   const { res } = await runNoResultAgent(t, true);
   assert.equal(res.verdict, 'clean', JSON.stringify(res));
   assert.ok(existsSync(res.agentLog));
-  const events = runStatus('example-org/example-repo').prs[0].events.map((e) => e.phase);
+  const events = runStatus('example-org/example-repo', { all: true }).prs[0].events.map((e) => e.phase);
   assert.ok(events.includes('agent_no_result'), events.join(','));
   const log = readFileSync(join(process.env.XDG_STATE_HOME, 'prloop', readdirSync(join(process.env.XDG_STATE_HOME, 'prloop')).find((f) => f.startsWith('run-'))), 'utf8');
   assert.match(log, /agent made progress without a result line \(the agent session ended at its max-turns limit\)/);
@@ -2713,7 +2728,7 @@ echo "{\\"status\\":\\"fixed\\",\\"head\\":\\"$(git rev-parse --short HEAD)\\",\
   assert.ok(log.some((c) => c.startsWith('pr comment 7') && /low-impact early merge/.test(c)), 'the merge comment says the review was skipped');
   assert.ok(!log.some((c) => c.includes('@codex review')), 'no review request');
   assert.equal(gatePassed('true', r.work), fixed); // prloop gated the fixed head itself
-  const phases = runStatus('example-org/example-repo', 50).prs[0].events.map((e) => e.phase);
+  const phases = runStatus('example-org/example-repo', { all: true, last: 50 }).prs[0].events.map((e) => e.phase);
   assert.ok(phases.includes('merged_low_impact'), phases.join());
   if (docs) return;
   // A saved early merge is dropped when a later run turns the feature off: the head goes back to normal review.
@@ -2764,7 +2779,7 @@ test('run waits for a live lock holder without spawning an agent or charging a r
   assert.equal(held.verdict, 'deadline', JSON.stringify(held));
   assert.equal(existsSync(join(r.dir, 'spawned')), false);
   assert.equal(rounds(), 0);
-  assert.ok(runStatus('example-org/example-repo').prs[0].events.some((e) => e.phase === 'worktree_locked'));
+  assert.ok(runStatus('example-org/example-repo', { all: true }).prs[0].events.some((e) => e.phase === 'worktree_locked'));
   takeLock(r.work, 'ready of PR #7', deadPid()); // its process died without releasing the claim
   const [stale] = await go('1h');
   assert.equal(stale.verdict, 'blocked', JSON.stringify(stale));
@@ -3500,13 +3515,13 @@ test('a gate run writes its whole output to an owner-only gate log and records t
   assert.deepEqual(pick(run, ['head', 'source', 'status', 'peakLoad']), { head, source: 'prloop', status: 0, peakLoad: 1 });
   assert.ok(run.durationMs >= 0 && Date.parse(run.end) >= Date.parse(run.start));
   assert.deepEqual(pick(gateProvenance(gate, r.work), ['head', 'source', 'ok', 'log', 'durationMs']), { head, source: 'prloop', ok: true, log: run.log, durationMs: run.durationMs });
-  const [st] = runStatus('example-org/example-repo').prs;
+  const [st] = runStatus('example-org/example-repo', { all: true }).prs;
   assert.deepEqual(st.lastGate, { head: head.slice(0, 7), status: 0, log: run.log });
   assert.deepEqual(pick(st.events.at(-1), ['phase', 'status', 'durationMs', 'log']), { phase: 'gate_run', status: 0, durationMs: run.durationMs, log: run.log });
   const failed = await readyGate({ branch: 'feat', head, pr: 7 }, { ...cfg, gate: 'echo boom; exit 4', forceGate: true }, r.work, deps);
   assert.deepEqual([failed.ok, failed.run.status], [false, 4]);
   assert.match(readFileSync(failed.run.log, 'utf8'), /boom\n\n# prloop: exit status 4/);
-  assert.equal(runStatus('example-org/example-repo').prs[0].lastGate.status, 4);
+  assert.equal(runStatus('example-org/example-repo', { all: true }).prs[0].lastGate.status, 4);
   // A cached hit reports the pass it reused, with its provenance.
   const hit = await readyGate({ branch: 'feat', head, pr: 7 }, { ...cfg, gate }, r.work, deps);
   assert.deepEqual(pick(hit.run, ['cached', 'source', 'log']), { cached: true, source: 'prloop', log: run.log });
@@ -3699,7 +3714,7 @@ test('run --merge reruns a self-reported gate pass itself before merging', async
   assert.equal(readFileSync(runs, 'utf8'), 'run\n'); // prloop ran the gate once, then merged
   assert.equal(gateProvenance(gate, r.work).source, 'prloop');
   assert.ok(calls().some((c) => c.startsWith('pr merge 7')));
-  const events = runStatus('example-org/example-repo', 20).prs[0].events.map((e) => e.phase);
+  const events = runStatus('example-org/example-repo', { all: true, last: 20 }).prs[0].events.map((e) => e.phase);
   assert.ok(events.includes('gate_unverified') && events.includes('gate_run'), events.join());
 });
 
@@ -3748,7 +3763,7 @@ async function runQuotaReply(t, rounds) {
   const calls = fakeGh(t, r.dir, pr);
   writeFileSync(join(r.dir, 'bin', 'claude'), `#!/bin/sh\necho ran >> "${r.dir}/claude-runs"\necho '{"type":"result","subtype":"success","result":"no review"}'\n`, { mode: 0o755 });
   const [res] = await runAll({ repo: 'example-org/example-repo', pr: '7', worktree: r.work, deadline: '1h' }, { ...cfg, maxRounds: 6, interval: 1 }, { metrics: idle().metrics });
-  const phases = runStatus('example-org/example-repo').prs[0].events.map((e) => e.phase);
+  const phases = runStatus('example-org/example-repo', { all: true }).prs[0].events.map((e) => e.phase);
   const st = JSON.parse(readFileSync(join(state, 'example-org__example-repo__7.json'), 'utf8'));
   return { res, phases, st, calls: calls(), runs: readFileSync(join(r.dir, 'claude-runs'), 'utf8').trim().split('\n').length };
 }
@@ -3808,8 +3823,8 @@ esac
   }
   const [res] = await runAll({ repo: 'example-org/example-repo', pr: '7', worktree: r.work, deadline: '1h' },
     { ...cfg, agent: 'none', interval: 1, deadline: 3000, ...extra }, { metrics: idle().metrics, now: () => nowMs });
-  const phases = runStatus('example-org/example-repo').prs[0].events.map((e) => e.phase);
-  const events = runStatus('example-org/example-repo', 50).prs[0].events;
+  const phases = runStatus('example-org/example-repo', { all: true }).prs[0].events.map((e) => e.phase);
+  const events = runStatus('example-org/example-repo', { all: true, last: 50 }).prs[0].events;
   return { res, phases, calls: calls(), state, events, dir: r.dir };
 }
 const posted = (calls) => calls.some((c) => c.startsWith('pr comment'));

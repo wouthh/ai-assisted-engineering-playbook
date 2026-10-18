@@ -16,7 +16,7 @@ Recommended: start the supervisor once in the background, check in with --status
   prloop run --repo owner/name --pr N[,N...] [--gate "<cmd>"] [--max-agents 2] [--max-rounds 6]
              [--agent claude|codex|none] [--merge rebase|squash|merge|repo] [--worktree <path>]
              [--deadline 6h] [--model <m>] [--effort <e>] [--union <glob>]...
-  prloop run --status [--repo owner/name]   PR states plus one machine line (load, free memory, gate slots)
+  prloop run --status [--repo owner/name] [--all]   live PR states (--all: every state) plus machine, cpus and tmp lines
   prloop reset-rounds <pr> [--repo owner/name]   one explicit, logged reset of the round counter
   prloop lock-status [<dir>]              who holds the worktree lock of <dir> (default: .); exit 50 when held
 
@@ -89,7 +89,7 @@ Exit codes: 0 clean/ok/merged, 10 findings, 20 not_requested, 21 requested_while
 
 // ---------- small helpers ----------
 
-const FLAGS = new Set(['help', 'status', 'requireCurrent', 'forceGate', 'continue']);
+const FLAGS = new Set(['help', 'status', 'all', 'requireCurrent', 'forceGate', 'continue']);
 
 // Every option except FLAGS takes a value; a missing one fails instead of becoming `true`.
 export function parseArgs(argv) {
@@ -2588,13 +2588,17 @@ const lastGateSummary = (g) => g && { ...pick(g, ['gateKind', 'gate', 'source', 
 const pick = (o, keys) => Object.fromEntries(keys.filter((k) => o[k] !== undefined).map((k) => [k, o[k]]));
 
 // Cheap check-in for a coordinator: state files plus each PR's last few events, no GitHub calls (`main` reconciles first).
-export function runStatus(repoFilter, last = 5) {
+// By default only live PRs (not merged or closed, or changed in the last 24 hours) with their last event; `all` shows every
+// state with its last five events.
+export function runStatus(repoFilter, { all = false, last = all ? 5 : 1 } = {}) {
+  const since = Date.now() - 864e5;
   const dir = stateDir();
   const files = existsSync(dir) ? readdirSync(dir) : [];
   const logs = files.filter((x) => x.startsWith('run-')).sort().reverse().map((f) => join(dir, f));
   const read = (f) => { try { return readFileSync(f, 'utf8').split('\n').flatMap((l) => { try { return [JSON.parse(l)]; } catch { return []; } }); } catch { return []; } };
   const prs = files.filter((f) => /__\d+\.json$/.test(f)).map((f) => JSON.parse(readFileSync(join(dir, f), 'utf8')))
     .filter((st) => !repoFilter || st.repo === repoFilter)
+    .filter((st) => all || !['merged', 'closed'].includes(st.phase) || Date.parse(st.updatedAt) > since)
     .map((st) => {
       // The state names its run log; older log lines carry no repo, so trust them only within that log.
       const mine = (f) => (e) => e.pr === st.pr && (f === st.log ? (e.repo ?? st.repo) : e.repo) === st.repo;
@@ -2720,7 +2724,7 @@ export async function main(argv) {
     Object.assign(opts, { generated: repoFile.generated ?? [], regenerate: repoFile.regenerate, approvedRegenerate: machine.approvedRegenerate });
     // The repository file names the method; merging itself still needs an explicit --merge.
     if (opts.merge === 'repo') opts.merge = repoFile.merge ?? (() => { throw new Error('--merge repo needs "merge" in .prloop.json'); })();
-    if (cmd === 'run' && opts.status) { reconcileStates(opts.repo); return out({ machine: machineLine(cfg), cpus: cpusLine(cfg), tmp: tmpLine(cfg), ...runStatus(opts.repo) }, 0); }
+    if (cmd === 'run' && opts.status) { reconcileStates(opts.repo); return out({ machine: machineLine(cfg), cpus: cpusLine(cfg), tmp: tmpLine(cfg), ...runStatus(opts.repo, { all: opts.all }) }, 0); }
     if (cmd === 'run') {
       mkdirSync(stateDir(), { recursive: true });
       opts.log = noteLog = runLogPath();
