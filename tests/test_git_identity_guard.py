@@ -278,7 +278,9 @@ class MessageTests(GuardFixture):
                      "Filter @service:abc@synthetic-mail.net", "Mail wrong@localhost",
                      "Co-authored-by: bot @synthetic-mail\u3002net",
                      "Co-authored-by: bot @synthetic-mail\uff0enet",
-                     "Mail name @[IPv6:2001:db8::1]"):
+                     "Mail name @[IPv6:2001:db8::1]",
+                     "Co-authored-by: Bot @x:<bot @synthetic-mail.net>",
+                     "Co-authored-by: Bot @x:<bot\n @synthetic-mail.net>"):
             with self.subTest(text=text):
                 path = self.message(f"Add feature\n\n{text}\n")
                 self.assert_refused(self.guard("--commit-msg", path), "line 3")
