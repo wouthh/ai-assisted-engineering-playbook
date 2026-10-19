@@ -165,7 +165,7 @@ const tryGit = (args, cwd) => { try { return git(args, cwd); } catch { return nu
 const tryGitRaw = (args, cwd) => { try { return execFileSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 64 << 20, stdio: ['ignore', 'pipe', 'pipe'] }); } catch { return null; } };
 // Per-clone code maps (graft/, .trail/cache/) are local caches: excluded in the clone's own
 // info/exclude so they never count as local changes and `git add -A` never commits them.
-export const CODE_MAP_EXCLUDES = ['/graft/', '/.trail/cache/'];
+export const CODE_MAP_EXCLUDES = ['/graft/', '/.trail/cache/', '/.trail/statusline.cjs'];
 export const excludeCodeMaps = (cwd) => {
   const file = resolve(cwd, git(['rev-parse', '--git-path', 'info/exclude'], cwd));
   let text = '';

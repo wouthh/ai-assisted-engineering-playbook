@@ -1505,6 +1505,7 @@ test('per-clone code maps are excluded locally, never committed, also in a linke
     mkdirSync(join(cwd, '.trail', 'cache'), { recursive: true });
     writeFileSync(join(cwd, '.trail', 'cache', 'INDEX.md'), 'map\n');
     writeFileSync(join(cwd, '.trail', 'hook.cjs'), 'setup\n');
+    writeFileSync(join(cwd, '.trail', 'statusline.cjs'), 'per clone\n');
     excludeCodeMaps(cwd);
     excludeCodeMaps(cwd);
     // The trail setup stays visible so it is committed with the work; only the maps are hidden.
@@ -1515,6 +1516,7 @@ test('per-clone code maps are excluded locally, never committed, also in a linke
   const exclude = readFileSync(join(r.work, '.git', 'info', 'exclude'), 'utf8');
   assert.equal(exclude.split('\n').filter((l) => l === '/graft/').length, 1);
   assert.equal(exclude.split('\n').filter((l) => l === '/.trail/cache/').length, 1);
+  assert.equal(exclude.split('\n').filter((l) => l === '/.trail/statusline.cjs').length, 1);
 });
 
 test('agent result: the last JSON line, also inside a JSON wrapper', () => {
