@@ -1937,14 +1937,15 @@ test('a stale save after a reconciled close keeps beforeClose, so a reopen resto
   assert.deepEqual(pick(JSON.parse(readFileSync(f, 'utf8')), ['phase', 'reason', 'next']), { phase: 'waiting', reason: 'review requested', next: 'wait' });
 });
 
-test('reset-rounds resets the counter once, logs it, and refuses a second reset', (t) => {
+test('reset-rounds resets the counter, logs it, and counts every reset', (t) => {
   const dir = tempState(t);
   writeFileSync(join(dir, 'example-org__example-repo__7.json'), JSON.stringify({ repo: 'example-org/example-repo', pr: 7, phase: 'blocked', rounds: 7, seen: { a: ['T1'] } }));
   assert.deepEqual(pick(resetRounds('example-org/example-repo', 7), ['previousRounds', 'rounds']), { previousRounds: 7, rounds: 0 });
   const [pr] = runStatus('example-org/example-repo', { all: true }).prs;
   assert.deepEqual([pr.rounds, pr.events.at(-1).phase], [0, 'rounds_reset']);
   assert.equal(JSON.parse(readFileSync(join(dir, 'example-org__example-repo__7.json'), 'utf8')).roundResets, 1);
-  assert.throws(() => resetRounds('example-org/example-repo', 7), /already reset once/);
+  resetRounds('example-org/example-repo', 7);
+  assert.equal(JSON.parse(readFileSync(join(dir, 'example-org__example-repo__7.json'), 'utf8')).roundResets, 2);
 });
 
 test('configuration errors are one-line errors (JSON outside run), and an unknown --agent is rejected', async (t) => {

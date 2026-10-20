@@ -17,7 +17,7 @@ Recommended: start the supervisor once in the background, check in with --status
              [--agent claude|codex|none] [--merge rebase|squash|merge|repo] [--worktree <path>]
              [--deadline 6h] [--model <m>] [--effort <e>] [--union <glob>]...
   prloop run --status [--repo owner/name] [--all]   live PR states (--all: every state) plus machine, cpus and tmp lines
-  prloop reset-rounds <pr> [--repo owner/name]   one explicit, logged reset of the round counter
+  prloop reset-rounds <pr> [--repo owner/name]   explicit, logged reset of the round counter
   prloop lock-status [<dir>]              who holds the worktree lock of <dir> (default: .); exit 50 when held
 
 Agent-in-the-loop commands:
@@ -1909,12 +1909,11 @@ export function recordGateRun(repo, prNum, run) {
   saveState(st);
 }
 
-// The coordinator's one explicit reset of the round cap for a PR; a second one is refused.
+// The coordinator's explicit reset of the round cap for a PR, decided again at every cap and counted in roundResets.
 export function resetRounds(repo, prNum) {
   const st = { rounds: 0, seen: {}, ...loadState(repo, prNum), repo, pr: Number(prNum) };
-  if ((st.roundResets ?? 0) >= 1) throw new Error(`the rounds of ${repo}#${prNum} were already reset once: hand the PR over to a human`);
   const previous = st.rounds ?? 0;
-  Object.assign(st, { rounds: 0, roundResets: 1 });
+  Object.assign(st, { rounds: 0, roundResets: (st.roundResets ?? 0) + 1 });
   logEvent(st, { phase: 'rounds_reset', reason: `rounds ${previous} -> 0` });
   saveState(st);
   return { verdict: 'ok', pr: st.pr, previousRounds: previous, rounds: 0, next: 'rerun prloop run for this PR' };
@@ -2303,7 +2302,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
   pruneAgentLogs();
   const log = opts.log ?? runLogPath();
   reconcileStates(repo, prs); // this run's own PRs are read live below
-  // Rounds and seen findings persist across runs on purpose; `prloop reset-rounds` resets the rounds once.
+  // Rounds and seen findings persist across runs on purpose; `prloop reset-rounds` resets the rounds.
   const states = prs.map((n) => ({ ...loadState(repo, n), repo, pr: n, log, phase: 'polling', reason: undefined, next: undefined, agentLog: undefined, mergeRetried: undefined, unknownSince: undefined }));
   const busy = new Map();
   const event = recordEvent;
@@ -2332,7 +2331,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
 
   async function fixLocked(st, s, cwd, v, lock) {
     if (++st.rounds > maxRounds) return block(st, `max rounds (${maxRounds}) reached`,
-      'judge the remaining findings by real impact: merge low-risk ones as deferred, or `prloop reset-rounds` once for important defects');
+      'judge the remaining findings by real impact: merge as is with the leftovers deferred, or `prloop reset-rounds` for critical defects');
     if (v.findings?.length) {
       const repeated = recordFindings(st.seen, v.findings);
       if (repeated.length) return block(st, 'the same finding came back after two fixes', 'decide whether the finding is valid');
