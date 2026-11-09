@@ -8,6 +8,7 @@ import { test } from 'node:test';
 import {
   EXIT, OUTPUT_TAIL, main, errorFrame, reviewerEvents, recordReviewerEvents, quotaResetHint, reviewerDecision, approvedFor, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, permissionDenied, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, sweepTmp, tmpLine, reclaimTmp, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, recordEvent, saveState, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, gateProvenance, treeRss, recordGatePass, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, reconcileStates, syncBranch, isDependabot, unionLines, unionResult, waitFor,
   MERGEABILITY_WAIT, gateFor, limits, busyProcess, machineCpus, gateCpuSet, gateLauncher, cpusLine, parseCpuList, formatCpuList, lowImpactRound, severeFinding, setupKey, excludeCodeMaps,
+  codexFixAgentConfig,
 } from '../prloop.mjs';
 
 const pick = (o, keys) => Object.fromEntries(keys.map((k) => [k, o[k]]));
@@ -2397,6 +2398,22 @@ echo '{"status":"fixed","head":"x","fixed":["T1"],"disputed":[],"reason":"ok"}'`
   assert.match(readFileSync(join(r.dir, 'remove.err'), 'utf8'), /cannot remove a locked working tree/);
   assert.match(readFileSync(join(r.dir, 'remove.err'), 'utf8'), /prloop fix agent for PR #7 pid \d+/);
   r.run(r.main, 'worktree', 'remove', r.work); // unlocked once the agent ended
+});
+
+test('a codex fix agent may write both Git dirs of a linked worktree and the state dir, or it could not commit', async (t) => {
+  const { res, r } = await runNoResultAgent(t, true, { cmd: 'codex', linked: true, extra: { agent: 'codex' }, body: `printf '%s\\n' "$@" > "$(dirname "$PWD")/codex.args"
+echo '{"status":"fixed","head":"x","fixed":["T1"],"disputed":[],"reason":"ok"}'` });
+  assert.equal(res.verdict, 'clean', JSON.stringify(res));
+  const args = readFileSync(join(r.dir, 'codex.args'), 'utf8');
+  assert.ok(!args.includes('workspace-write'));
+  assert.match(args, /^default_permissions="prloop_fix"$/m);
+  const fs = args.match(/^permissions\.prloop_fix\.filesystem=\{(.*)\}$/m)[1];
+  const gitDir = r.run(r.work, 'rev-parse', '--absolute-git-dir');
+  for (const dir of [gitDir, dirname(dirname(gitDir)), join(process.env.XDG_STATE_HOME, 'prloop')]) assert.ok(fs.includes(`${JSON.stringify(dir)}="write"`), dir);
+  assert.ok(fs.startsWith('":root"="read"'));
+  // The main worktree has one Git dir: it is listed once, as a duplicate TOML key would make Codex refuse the profile.
+  const main = codexFixAgentConfig(r.main).find((a) => a.startsWith('permissions.prloop_fix.filesystem='));
+  assert.equal(main.split(JSON.stringify(join(r.main, '.git'))).length, 2);
 });
 
 test('the git worktree lock skips the main worktree and a lock someone else holds, and replaces a stale prloop one', (t) => {
