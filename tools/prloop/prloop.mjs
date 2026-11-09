@@ -2248,11 +2248,23 @@ const minutes = (ms) => (ms >= 6e4 ? `${Math.round(ms / 6e4)}m` : `${Math.ceil(m
 const timeoutReason = (r, cfg) => `agent timed out after ${minutes(cfg.agentTimeout)} of work${String(r.stdout).trim() || String(r.stderr).trim() ? ''
   : ' with no output: it was killed before printing its result, so check its last command (time its gate spent queued is not counted)'}`;
 
+// Codex's workspace-write sandbox keeps .git read-only even when it is listed in writable_roots, so a fix agent
+// could not commit. A permission profile can grant it: write on the worktree, temp, both Git dirs (a linked
+// worktree's own and the common one; Codex protects each unless named exactly) and prloop's state dir, which
+// `prloop ready` writes. The rest of the filesystem stays read-only; network stays on for push and gh.
+export function codexFixAgentConfig(cwd) {
+  const dirs = [':workspace_roots', ':tmpdir', '/tmp', stateDir(), git(['rev-parse', '--absolute-git-dir'], cwd),
+    resolve(cwd, git(['rev-parse', '--git-common-dir'], cwd))];
+  const fs = ['":root"="read"', ...new Set(dirs.map((d) => `${JSON.stringify(d)}="write"`))].join(', ');
+  return ['-c', 'default_permissions="prloop_fix"', '-c', `permissions.prloop_fix.filesystem={${fs}}`,
+    '-c', 'permissions.prloop_fix.network={enabled=true, mode="full"}'];
+}
+
 async function runFixAgent(cfg, prompt, cwd) {
   if (cfg.agent === 'codex') {
     const dir = scratch(cfg, 'prloop-agent-out-');
     try {
-      const r = await spawnAgent('codex', ['exec', '--sandbox', 'workspace-write', '-c', 'sandbox_workspace_write.network_access=true', '-o', join(dir, 'last.txt'),
+      const r = await spawnAgent('codex', ['exec', ...codexFixAgentConfig(cwd), '-o', join(dir, 'last.txt'),
         ...(cfg.model ? ['-m', cfg.model] : []), ...(cfg.effort ? ['-c', `model_reasoning_effort=${cfg.effort}`] : []), prompt], cwd, cfg);
       return { ...r, final: existsSync(join(dir, 'last.txt')) ? readFileSync(join(dir, 'last.txt'), 'utf8') : r.stdout };
     } finally { dropScratch(dir); }
