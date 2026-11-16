@@ -392,6 +392,17 @@ export const localCleanBody = (head) => `${LOCAL} No issues found on ${head}.`;
 export const disambiguate = (prefix, cwd) => (tryGit(['rev-parse', `--disambiguate=${prefix}`], cwd) ?? '').split('\n').filter(Boolean);
 const namesHead = (named, head, cfg) => (named.length === 40 ? named === head : (cfg.disambiguate ?? disambiguate)(named, cfg.cwd).join() === head);
 
+// The Codex summary comment, edited in place: `codex-review-state:v1 {...}` names the latest code review's commit and status,
+// and its Code Review row the completion time. Returns { commit, at } (at in whole seconds, like GitHub's timestamps) for a
+// completed code review without findings, else null.
+export function reviewSummary(body) {
+  const at = Date.parse(/Code Review\*\*[^\n]*?<relative-time datetime="([^"]+)"/.exec(body ?? '')?.[1]);
+  let review;
+  try { review = JSON.parse(/<!-- codex-review-state:v1 (.*?) -->/.exec(body ?? '')?.[1]).code_review; } catch { return null; }
+  if (review?.status !== 'completed' || review.has_any_findings !== false || !review.commit_sha || Number.isNaN(at)) return null;
+  return { commit: review.commit_sha, at: new Date(at).toISOString().replace(/\.\d+Z$/, 'Z') };
+}
+
 // Classifies one PR snapshot. Rules carried over from the earlier review queue:
 // - only signals newer than the head commit (or the current request) count;
 // - reactions on the request comment and on the PR body both count, and the latest one wins
@@ -451,20 +462,25 @@ export function classify(pr, cfg, nowMs = Date.now()) {
   // delayed comment about the previous head cannot clear this one, even after a new request. Local clean
   // bodies name the head.
   const started = current || bodyReactions.some((r) => r.content === 'EYES');
-  // An automatic review can start, and even finish, before prloop first sees a new head (a run started right after the PR
-  // was opened). Without a request, a bot comment from after the commit or force-push still counts when it names this
-  // exact head below: a review of this commit cannot belong to another head.
-  const early = (c) => !current && c.createdAt >= pushTime && c.createdAt < since;
-  const botComments = pr.comments.nodes.filter((c) => isBot(c) && ((c.createdAt >= since && (started || trusted(c))) || early(c)));
+  const botComments = pr.comments.nodes.filter((c) => isBot(c) && c.createdAt >= since && (started || trusted(c)));
   const summaries = [...botReviews.map((r) => ({ at: r.submittedAt, body: r.body, local: trusted(r), acked: true })),
-    ...botComments.map((c) => ({ at: c.createdAt, body: c.body, local: trusted(c), acked: !!ackAt && c.createdAt >= ackAt, early: early(c),
+    ...botComments.map((c) => ({ at: c.createdAt, body: c.body, local: trusted(c), acked: !!ackAt && c.createdAt >= ackAt,
       named: /Reviewed commit:\W*([0-9a-f]{7,40})/i.exec(c.body)?.[1] }))]
     .filter((s) => s.body);
-  // Without an acknowledgement, a clean comment after the current request (or an early one) counts only when it names this
-  // head. A comment naming another commit never clears this head.
-  const cleanOk = (s) => (s.named ? namesHead(s.named.toLowerCase(), head, cfg) && (s.acked || current || s.early) : s.acked);
+  // Without an acknowledgement, a clean comment after the current request counts only when it names this head.
+  // A comment naming another commit never clears this head.
+  const cleanOk = (s) => (s.named ? namesHead(s.named.toLowerCase(), head, cfg) && (s.acked || current) : s.acked);
   for (const s of summaries) {
     if (s.local ? s.body.includes(localCleanBody(head)) : cleanOk(s) && cfg.clean.test(s.body)) signals.push({ at: s.at, state: 'clean' });
+  }
+  // An automatic review on a just-opened PR can finish before prloop first sees the head, and posts no receipt comment: only
+  // the bot's summary comment records it, naming the full commit. A completed review of this exact head without findings counts
+  // from its completion on, even before headSeenAt, unless a newer request or a bot 👀 (a newer cycle) followed it.
+  const newerCycle = (when) => (!!triggerNode && triggerNode.createdAt > when)
+    || [...(pr.reactions?.nodes ?? []), ...(triggerNode?.reactions.nodes ?? [])].some((r) => isBot(r) && r.content === 'EYES' && r.createdAt > when);
+  for (const c of pr.comments.nodes) {
+    const done = cfg.reviewer.test(login(c)) && reviewSummary(c.body);
+    if (done && done.commit === head && done.at >= pushTime && !newerCycle(done.at)) signals.push({ at: done.at, state: 'clean' });
   }
   // The bot answers a request (or its automatic review of this head) it cannot run with a plain reply and no 👀, so an
   // unavailable reply after the request, or after the head without one, counts unacknowledged. At worst a late reply
@@ -2302,7 +2318,9 @@ export function pushLearnings(cwd, s) {
   if (!head || (head === s.head && !status.length)) return false;
   if (!status.every((l) => /^(\?\?|A ) /.test(l) && learning(l.slice(3)))) return false;
   if (tryGit(['merge-base', '--is-ancestor', s.head, 'HEAD'], cwd) === null) return false;
-  const committed = (tryGit(['diff', '--name-status', '--no-renames', s.head, 'HEAD'], cwd) ?? 'x').split('\n').filter(Boolean);
+  // Every outgoing commit, not just the end state: a code change reverted by a later commit would still be published.
+  if (tryGit(['rev-list', '--merges', `${s.head}..HEAD`], cwd) !== '') return false;
+  const committed = (tryGit(['log', '--no-renames', '--name-status', '--format=', `${s.head}..HEAD`], cwd) ?? 'x').split('\n').filter(Boolean);
   if (!committed.every((l) => /^A\t/.test(l) && learning(l.slice(2)))) return false;
   if (status.length) {
     git(['add', '--', ...status.map((l) => l.slice(3))], cwd);

@@ -6,7 +6,7 @@ import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import {
-  EXIT, OUTPUT_TAIL, main, errorFrame, reviewerEvents, recordReviewerEvents, quotaResetHint, reviewerDecision, approvedFor, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, permissionDenied, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, sweepTmp, tmpLine, reclaimTmp, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, recordEvent, saveState, checkWorktree, pushLearnings, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, gateProvenance, treeRss, recordGatePass, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, reconcileStates, syncBranch, isDependabot, unionLines, unionResult, waitFor,
+  EXIT, OUTPUT_TAIL, main, errorFrame, reviewerEvents, recordReviewerEvents, quotaResetHint, reviewerDecision, approvedFor, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, permissionDenied, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, sweepTmp, tmpLine, reclaimTmp, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, recordEvent, saveState, checkWorktree, pushLearnings, reviewSummary, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, gateProvenance, treeRss, recordGatePass, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, reconcileStates, syncBranch, isDependabot, unionLines, unionResult, waitFor,
   MERGEABILITY_WAIT, gateFor, limits, busyProcess, machineCpus, gateCpuSet, gateLauncher, cpusLine, parseCpuList, formatCpuList, lowImpactRound, severeFinding, setupKey, excludeCodeMaps,
   codexFixAgentConfig,
 } from '../prloop.mjs';
@@ -274,23 +274,39 @@ test('a lone PR-body thumbs-up after a head change does not clear the new head',
   assert.equal(classify(pr, cfg, NOW).verdict, 'not_requested');
 });
 
-test('an automatic review that finished before prloop first saw the head clears it only when its comment names the head', () => {
+// The reviewer's summary comment (edited in place) after a completed code review of `sha`.
+const summaryBody = (sha, { findings = false, status = 'completed', done = '2026-01-01T10:02:00.123456Z' } = {}) => `<!-- codex-pull-request-review-summary -->
+<!-- codex-review-state:v1 {"code_review":{"commit_sha":"${sha}","has_any_findings":${findings},"has_unresolved_findings":${findings},"status":"${status}"},"security_review":{"commit_sha":null,"has_any_findings":null,"has_unresolved_findings":null,"status":null}} -->
+
+| Review | Status | Commit | Review trigger |
+| --- | --- | --- | --- |
+| 📝 **Code Review** | ✅ **Completed** <relative-time datetime="${done}">${done}</relative-time> | \`${sha.slice(0, 7)}\` | Automatic |`;
+
+test('an automatic review that finished before prloop first saw the head clears it through the summary comment', () => {
   const head = fixture().headRefOid;
-  const early = (named) => {
+  const early = (body) => {
     const pr = fixture();
     pr.comments.nodes.pop(); // no request: the automatic review of a just-opened PR
     pr.headSeenAt = at('10:03'); // prloop's first poll came after that review
-    pr.reactions.nodes.push({ content: 'EYES', createdAt: at('10:01'), user: BOT }, { content: 'THUMBS_UP', createdAt: at('10:02'), user: BOT });
-    pr.comments.nodes.push({ id: 'IC_bot', databaseId: 102, author: BOT, reactions: { nodes: [] }, createdAt: at('10:01'),
-      body: `### Codex Review\n\nDidn't find any major issues. Keep it up!${named ? `\n\nReviewed commit: \`${named}\`` : ''}` });
+    pr.reactions.nodes.push({ content: 'THUMBS_UP', createdAt: at('10:02'), user: BOT }); // its 👀 is gone once it finished
+    pr.comments.nodes.push({ id: 'IC_sum', databaseId: 102, author: BOT, reactions: { nodes: [] }, createdAt: at('10:01'), body });
     return pr;
   };
-  assert.equal(classify(early(head), cfg, NOW).verdict, 'clean');
-  assert.equal(classify(early('2'.repeat(40)), cfg, NOW).verdict, 'not_requested'); // another commit
-  assert.equal(classify(early(null), cfg, NOW).verdict, 'not_requested'); // no commit named
-  const forced = early(head);
-  forced.timelineItems = { nodes: [{ createdAt: '2026-01-01T10:01:30Z' }] }; // the head came back by a later force-push
+  assert.deepEqual(reviewSummary(summaryBody(head)), { commit: head, at: at('10:02') });
+  assert.equal(classify(early(summaryBody(head)), cfg, NOW).verdict, 'clean');
+  assert.equal(classify(early(summaryBody('2'.repeat(40))), cfg, NOW).verdict, 'not_requested'); // another commit
+  assert.equal(classify(early(summaryBody(head, { findings: true })), cfg, NOW).verdict, 'not_requested');
+  assert.equal(classify(early(summaryBody(head, { status: 'in_progress' })), cfg, NOW).verdict, 'not_requested');
+  const forced = early(summaryBody(head));
+  forced.timelineItems = { nodes: [{ createdAt: '2026-01-01T10:02:30Z' }] }; // the head came back by a later force-push
   assert.equal(classify(forced, cfg, NOW).verdict, 'not_requested');
+  const rerequested = early(summaryBody(head)); // a newer request, acknowledged, before prloop saw the head
+  rerequested.comments.nodes.push({ id: 'IC_new', databaseId: 103, body: '@codex review', createdAt: '2026-01-01T10:02:30Z',
+    author: { login: 'example-dev' }, reactions: { nodes: [{ content: 'EYES', createdAt: '2026-01-01T10:02:40Z', user: BOT }] } });
+  assert.notEqual(classify(rerequested, cfg, NOW).verdict, 'clean');
+  const rerunning = early(summaryBody(head)); // a newer review cycle is running on the PR
+  rerunning.reactions.nodes.push({ content: 'EYES', createdAt: '2026-01-01T10:02:30Z', user: BOT });
+  assert.notEqual(classify(rerunning, cfg, NOW).verdict, 'clean');
 });
 
 test('more than one page of review threads fails closed', () => {
@@ -2103,6 +2119,8 @@ test('learning-only leftovers of a fix agent are committed and pushed; anything 
   r.run(r.work, 'checkout', '--', '.trail/learnings/a.md');
   r.commit('code', { 'app.txt': 'unpushed code\n' });
   assert.equal(pushLearnings(r.work, { branch: 'feat', head }), false); // an unpushed code commit
+  r.commit('restore the code, add a learning', { 'app.txt': 'one\n', '.trail/learnings/d.md': 'new\n' });
+  assert.equal(pushLearnings(r.work, { branch: 'feat', head }), false); // the end state hides the code commit
   assert.equal(remoteHead(), head);
 });
 
