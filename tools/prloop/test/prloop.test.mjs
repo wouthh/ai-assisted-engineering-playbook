@@ -6,7 +6,7 @@ import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import {
-  EXIT, OUTPUT_TAIL, main, errorFrame, reviewerEvents, recordReviewerEvents, quotaResetHint, reviewerDecision, approvedFor, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, permissionDenied, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, sweepTmp, tmpLine, reclaimTmp, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, recordEvent, saveState, checkWorktree, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, gateProvenance, treeRss, recordGatePass, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, reconcileStates, syncBranch, isDependabot, unionLines, unionResult, waitFor,
+  EXIT, OUTPUT_TAIL, main, errorFrame, reviewerEvents, recordReviewerEvents, quotaResetHint, reviewerDecision, approvedFor, disambiguate, acquireSlots, gateCost, machineConfig, repoConfig, markQueued, slotDir, agentFailure, permissionDenied, saveAgentLog, pruneAgentLogs, takeLock, procStart, lockHolder, sweepTmp, tmpLine, reclaimTmp, acquireSlot, admit, admitStep, machineLine, parseSize, runGate, selfCheck, slotsInUse, buildPrompt, patchId, recordCarry, resetRounds, recordEvent, saveState, checkWorktree, pushLearnings, classify, headSeenAt, localReviewPrompt, plain, config, globToRegex, isTested, parseAgentResult, readyGate, gatePassed, gateProvenance, treeRss, recordGatePass, unmarkTested, editLines, agentEnv, agentUsage, addUsage, runStatus, localCleanBody, localGate, localReview, markTested, localReviewPayload, parseArgs, parseReview, reviewPlan, runExitCode, parseDuration, recordFindings, runAll, reconcileStates, syncBranch, isDependabot, unionLines, unionResult, waitFor,
   MERGEABILITY_WAIT, gateFor, limits, busyProcess, machineCpus, gateCpuSet, gateLauncher, cpusLine, parseCpuList, formatCpuList, lowImpactRound, severeFinding, setupKey, excludeCodeMaps,
   codexFixAgentConfig,
 } from '../prloop.mjs';
@@ -272,6 +272,25 @@ test('a lone PR-body thumbs-up after a head change does not clear the new head',
   pr.comments.nodes.pop(); // no request for this head
   pr.reactions.nodes.push({ content: 'THUMBS_UP', createdAt: at('10:20'), user: BOT }); // late result of the previous head's review
   assert.equal(classify(pr, cfg, NOW).verdict, 'not_requested');
+});
+
+test('an automatic review that finished before prloop first saw the head clears it only when its comment names the head', () => {
+  const head = fixture().headRefOid;
+  const early = (named) => {
+    const pr = fixture();
+    pr.comments.nodes.pop(); // no request: the automatic review of a just-opened PR
+    pr.headSeenAt = at('10:03'); // prloop's first poll came after that review
+    pr.reactions.nodes.push({ content: 'EYES', createdAt: at('10:01'), user: BOT }, { content: 'THUMBS_UP', createdAt: at('10:02'), user: BOT });
+    pr.comments.nodes.push({ id: 'IC_bot', databaseId: 102, author: BOT, reactions: { nodes: [] }, createdAt: at('10:01'),
+      body: `### Codex Review\n\nDidn't find any major issues. Keep it up!${named ? `\n\nReviewed commit: \`${named}\`` : ''}` });
+    return pr;
+  };
+  assert.equal(classify(early(head), cfg, NOW).verdict, 'clean');
+  assert.equal(classify(early('2'.repeat(40)), cfg, NOW).verdict, 'not_requested'); // another commit
+  assert.equal(classify(early(null), cfg, NOW).verdict, 'not_requested'); // no commit named
+  const forced = early(head);
+  forced.timelineItems = { nodes: [{ createdAt: '2026-01-01T10:01:30Z' }] }; // the head came back by a later force-push
+  assert.equal(classify(forced, cfg, NOW).verdict, 'not_requested');
 });
 
 test('more than one page of review threads fails closed', () => {
@@ -2055,6 +2074,58 @@ test('worktree check: branch and PR head commit must match', (t) => {
   const now = r.run(r.work, 'rev-parse', 'HEAD');
   writeFileSync(join(r.work, 'stray.txt'), 'local\n'); // untracked work a fix agent must not commit
   assert.match(checkWorktree(r.work, { branch: 'feat', head: now }), /uncommitted changes/);
+});
+
+test('learning-only leftovers of a fix agent are committed and pushed; anything else is left for the worktree check', (t) => {
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  const remoteHead = () => r.run(join(r.dir, 'remote.git'), 'rev-parse', 'feat');
+  let head = r.run(r.work, 'rev-parse', 'HEAD');
+  assert.equal(pushLearnings(r.work, { branch: 'feat', head }), false); // clean and pushed
+  mkdirSync(join(r.work, '.trail', 'learnings'), { recursive: true });
+  writeFileSync(join(r.work, '.trail', 'learnings', 'a.md'), 'saved after the push\n'); // left uncommitted
+  assert.equal(pushLearnings(r.work, { branch: 'feat', head }), true);
+  head = r.run(r.work, 'rev-parse', 'HEAD');
+  assert.equal(remoteHead(), head);
+  assert.equal(checkWorktree(r.work, { branch: 'feat', head }), null);
+  r.commit('learning', { '.trail/learnings/b.md': 'committed after the push\n' }); // committed, never pushed
+  assert.equal(pushLearnings(r.work, { branch: 'feat', head }), true);
+  head = r.run(r.work, 'rev-parse', 'HEAD');
+  assert.equal(remoteHead(), head);
+  writeFileSync(join(r.work, '.trail', 'learnings', 'c.md'), 'new\n');
+  writeFileSync(join(r.work, 'stray.txt'), 'local\n');
+  assert.equal(pushLearnings(r.work, { branch: 'feat', head }), false); // not learning-only
+  rmSync(join(r.work, 'stray.txt'));
+  rmSync(join(r.work, '.trail', 'learnings', 'c.md'));
+  writeFileSync(join(r.work, '.trail', 'learnings', 'a.md'), 'edited\n'); // an edited learning is not a new one
+  assert.equal(pushLearnings(r.work, { branch: 'feat', head }), false);
+  r.run(r.work, 'checkout', '--', '.trail/learnings/a.md');
+  r.commit('code', { 'app.txt': 'unpushed code\n' });
+  assert.equal(pushLearnings(r.work, { branch: 'feat', head }), false); // an unpushed code commit
+  assert.equal(remoteHead(), head);
+});
+
+test('run re-requests a timed-out review on a tested head itself instead of spawning an agent', async (t) => {
+  const state = tempState(t);
+  const r = gitRepo();
+  t.after(() => rmSync(r.dir, { recursive: true, force: true }));
+  r.run(r.work, 'push', '-q', 'origin', 'feat');
+  const head = r.run(r.work, 'rev-parse', 'HEAD');
+  markTested(head, r.work);
+  writeFileSync(join(state, 'heads.json'), JSON.stringify({ 'example-org/example-repo#7': { sha: head, at: at('09:00') } }));
+  const pr = Object.assign(fixture(), { headRefName: 'feat', headRefOid: head }); // the request of 10:05 was never answered
+  const calls = fakeGh(t, r.dir, pr);
+  const done = structuredClone(pr);
+  request(done).reactions.nodes.push({ content: 'THUMBS_UP', createdAt: at('10:30'), user: BOT });
+  writeFileSync(join(r.dir, 'done.json'), JSON.stringify({ data: { viewer: { login: 'example-dev' }, repository: { mergeCommitAllowed: true, squashMergeAllowed: true, rebaseMergeAllowed: true, pullRequest: done } } }));
+  writeFileSync(join(r.dir, 'bin', 'gh'), `#!/bin/sh
+if [ "$1" = api ]; then echo "api $2"; else echo "$1 $2 $3"; fi >> "${r.dir}/calls.log"
+if [ "$1 $2" = "pr comment" ]; then cp "${r.dir}/done.json" "${r.dir}/pr.json"; else cat "${r.dir}/pr.json"; fi
+`, { mode: 0o755 });
+  const [res] = await runAll({ repo: 'example-org/example-repo', pr: '7', worktree: r.work, deadline: '1h' }, { ...cfg, agent: 'none', interval: 1 }, { metrics: idle().metrics });
+  assert.equal(res.verdict, 'clean', JSON.stringify(res)); // no needs_agent: prloop posted the request itself
+  assert.deepEqual(calls().filter((c) => c.startsWith('pr ')), ['pr comment 7']);
 });
 
 test('run blocks after three GitHub read failures on fresh state', async (t) => {

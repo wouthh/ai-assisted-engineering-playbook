@@ -408,8 +408,9 @@ export function classify(pr, cfg, nowMs = Date.now()) {
   const head = pr.headRefOid;
   // GitHub exposes no push time: take the latest of the commit date, the last force-push and when prloop
   // first saw this head, so an older commit that becomes the head cannot inherit earlier signals.
-  const headTime = [pr.commits.nodes[0]?.commit.committedDate, pr.timelineItems?.nodes[0]?.createdAt, pr.headSeenAt]
+  const pushTime = [pr.commits.nodes[0]?.commit.committedDate, pr.timelineItems?.nodes[0]?.createdAt]
     .filter(Boolean).sort().at(-1) ?? '1970-01-01T00:00:00Z';
+  const headTime = [pushTime, pr.headSeenAt].filter(Boolean).sort().at(-1);
   if (pr.reviewThreads.pageInfo?.hasNextPage) throw new Error('more than 100 review threads: prloop cannot see them all, so it fails closed');
   // Local review output counts only from the authenticated user who posts it; anyone can type the prefix.
   const trusted = (n) => isLocal(n.body) && !!pr.viewer?.login && login(n) === pr.viewer.login;
@@ -450,14 +451,18 @@ export function classify(pr, cfg, nowMs = Date.now()) {
   // delayed comment about the previous head cannot clear this one, even after a new request. Local clean
   // bodies name the head.
   const started = current || bodyReactions.some((r) => r.content === 'EYES');
-  const botComments = pr.comments.nodes.filter((c) => isBot(c) && c.createdAt >= since && (started || trusted(c)));
+  // An automatic review can start, and even finish, before prloop first sees a new head (a run started right after the PR
+  // was opened). Without a request, a bot comment from after the commit or force-push still counts when it names this
+  // exact head below: a review of this commit cannot belong to another head.
+  const early = (c) => !current && c.createdAt >= pushTime && c.createdAt < since;
+  const botComments = pr.comments.nodes.filter((c) => isBot(c) && ((c.createdAt >= since && (started || trusted(c))) || early(c)));
   const summaries = [...botReviews.map((r) => ({ at: r.submittedAt, body: r.body, local: trusted(r), acked: true })),
-    ...botComments.map((c) => ({ at: c.createdAt, body: c.body, local: trusted(c), acked: !!ackAt && c.createdAt >= ackAt,
+    ...botComments.map((c) => ({ at: c.createdAt, body: c.body, local: trusted(c), acked: !!ackAt && c.createdAt >= ackAt, early: early(c),
       named: /Reviewed commit:\W*([0-9a-f]{7,40})/i.exec(c.body)?.[1] }))]
     .filter((s) => s.body);
-  // Without an acknowledgement, a clean comment after the current request counts only when it names this head.
-  // A comment naming another commit never clears this head.
-  const cleanOk = (s) => (s.named ? namesHead(s.named.toLowerCase(), head, cfg) && (s.acked || current) : s.acked);
+  // Without an acknowledgement, a clean comment after the current request (or an early one) counts only when it names this
+  // head. A comment naming another commit never clears this head.
+  const cleanOk = (s) => (s.named ? namesHead(s.named.toLowerCase(), head, cfg) && (s.acked || current || s.early) : s.acked);
   for (const s of summaries) {
     if (s.local ? s.body.includes(localCleanBody(head)) : cleanOk(s) && cfg.clean.test(s.body)) signals.push({ at: s.at, state: 'clean' });
   }
@@ -1977,7 +1982,7 @@ ${data}${failure}${summary}
 Do these steps in order, in this session:
 1. Read only the referenced files plus every AGENTS.md that applies to them (root and nested).
 2. Fix each valid finding with a regression test. When a finding is about a pattern (a stale term, a renamed variable, a removed feature, a repeated mistake), fix every instance of it in the repository in this round, not only the flagged line, and say so in the thread reply. Reply with evidence on invalid findings and leave them unresolved, except a finding proven to misread AGENTS.md, which you resolve after the evidence reply once every AGENTS.md that applies to its path confirms it is invalid. Resolve conflicts.
-3. Run focused tests while fixing; never run the full project gate yourself: only \`prloop ready\` runs it, at most once per exact head. Use \`prloop mark-tested --gate "<cmd>"\` only immediately after that exact gate command passed on this exact head and clean tree, never for a later commit or another command: it records a self-reported pass, which a merge does not accept unless only gate-irrelevant files changed since a pass prloop ran. Commit and push with normal commits (run \`prloop sync ${t.pr}\` first if the base moved), as plain separate \`git add <paths>\`, \`git commit\` and \`git push\` commands, never chained into one command and never \`git add -A\`. Follow the repository's commit-message policy and never add co-author, generated-by or other attribution trailers.
+3. Run focused tests while fixing; never run the full project gate yourself: only \`prloop ready\` runs it, at most once per exact head. Use \`prloop mark-tested --gate "<cmd>"\` only immediately after that exact gate command passed on this exact head and clean tree, never for a later commit or another command: it records a self-reported pass, which a merge does not accept unless only gate-irrelevant files changed since a pass prloop ran. Commit and push with normal commits (run \`prloop sync ${t.pr}\` first if the base moved), as plain separate \`git add <paths>\`, \`git commit\` and \`git push\` commands, never chained into one command and never \`git add -A\`. Follow the repository's commit-message policy and never add co-author, generated-by or other attribution trailers. Save any learning the repository asks for (for example with \`trail note\`) now and commit it with the fix: after step 5 never create, commit or push anything, since that would leave the gated and requested head behind.
 4. Resolve the threads you fixed; reply on the disputed ones.
 5. Gate: ${gate}. If it reports a gate failure, do not rerun \`prloop ready\` straight away: rerun the failing tests or step with their focused command, fix them (including failures you did not cause when they block the gate), commit and push, and call \`prloop ready\` again only when you are confident the full gate passes. At most 5 \`prloop ready\` calls; stop as blocked only if the same failure persists after 3 consecutive fix attempts, or the failure is environmental (missing tool, no network, permission denied), and report the exact failing step. If \`prloop ready\` fails for another reason, make one repair attempt, then stop as blocked.
 6. ${request}
@@ -2284,6 +2289,29 @@ export function checkWorktree(cwd, s) {
   return null;
 }
 
+// A fix agent may save a trail learning after its push (repositories ask agents to save learnings), leaving it
+// uncommitted or committed but unpushed. Learning-only leftovers (new files under .trail/learnings/ on top of the PR
+// head) are committed and pushed as a coordinator would, instead of blocking the run; anything else is left for
+// checkWorktree to report. Returns whether it pushed.
+export function pushLearnings(cwd, s) {
+  if (tryGit(['branch', '--show-current'], cwd) !== s.branch) return false;
+  excludeCodeMaps(cwd);
+  const learning = (p) => /^\.trail\/learnings\/[^/]+\.md$/.test(p);
+  const status = (tryGit(['status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none'], cwd) ?? '').split('\n').filter(Boolean);
+  const head = tryGit(['rev-parse', 'HEAD'], cwd);
+  if (!head || (head === s.head && !status.length)) return false;
+  if (!status.every((l) => /^(\?\?|A ) /.test(l) && learning(l.slice(3)))) return false;
+  if (tryGit(['merge-base', '--is-ancestor', s.head, 'HEAD'], cwd) === null) return false;
+  const committed = (tryGit(['diff', '--name-status', '--no-renames', s.head, 'HEAD'], cwd) ?? 'x').split('\n').filter(Boolean);
+  if (!committed.every((l) => /^A\t/.test(l) && learning(l.slice(2)))) return false;
+  if (status.length) {
+    git(['add', '--', ...status.map((l) => l.slice(3))], cwd);
+    git(['commit', '-q', '-m', 'Save the fix agent\'s learning'], cwd);
+  }
+  git(['push', '-q', tryGit(['config', `branch.${s.branch}.remote`], cwd) || 'origin', `HEAD:${s.branch}`], cwd);
+  return true;
+}
+
 // `gitDir` is the repository's Git common directory, resolved once at startup, so a removed starting directory
 // (a merged PR's worktree cleaned up mid-batch) does not hide the other worktrees.
 export function findWorktree(branch, gitDir) {
@@ -2513,6 +2541,7 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
     if (holder) return lockedOut(st, cwd, holder);
     const follower = cwd && st.recreate && s.head !== st.recreate.head && isDependabot(raw) && followRecreate(st, cwd, s, st.recreate.head);
     if (follower) return lockedOut(st, cwd, follower);
+    if (cwd && pushLearnings(cwd, s)) return event(st, 'polling', { verdict: 'learning_pushed', reason: 'pushed a learning the fix agent left behind' });
     const wrong = cwd && checkWorktree(cwd, s);
     if (wrong) return block(st, wrong);
     const slot = () => busy.size < maxAgents && resourcesAllow(st);
@@ -2621,6 +2650,12 @@ export async function runAll(opts, cfg, { metrics = machineMetrics, now = Date.n
         return gateNow(st, s, cwd, true);
       }
       return mergeNow(st, s, raw, cwd, slot);
+    }
+    // A timed-out request on a gated head with nothing to fix only needs a new request: post it instead of spawning an agent,
+    // which may take the earlier request for one still running. A second timeout on this head makes the reviewer unavailable.
+    if (s.verdict === 'timeout' && cwd && rcfg.mode !== 'local' && !quotaLocal && !s.unresolvedThreads.length && !localGate(s, cwd, gate).length) {
+      sh('gh', ['pr', 'comment', String(st.pr), '--repo', repo, '--body', s.rerequestBody]);
+      return event(st, 'polling', { verdict: 'rerequested', reason: 'the review request timed out' });
     }
     if (!cwd) return block(st, `no worktree has ${s.branch} checked out; pass --worktree`);
     if (!slot()) return;
